@@ -13,12 +13,12 @@ else()
   target_compile_options(jdelphiast PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-add_executable(jdelphiast_cli src/main.cpp)
-target_link_libraries(jdelphiast_cli PRIVATE jdelphiast)
-add_custom_command(TARGET jdelphiast_cli POST_BUILD
+add_executable(DelphiAstTool src/main.cpp)
+target_link_libraries(DelphiAstTool PRIVATE jdelphiast)
+add_custom_command(TARGET DelphiAstTool POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory
           ${CMAKE_CURRENT_SOURCE_DIR}/indexes
-          $<TARGET_FILE_DIR:jdelphiast_cli>/indexes)
+          $<TARGET_FILE_DIR:DelphiAstTool>/indexes)
 
 if(JDELPHIAST_BUILD_TESTS)
   enable_testing()
@@ -29,7 +29,11 @@ if(JDELPHIAST_BUILD_TESTS)
   target_link_libraries(jdelphiast_project_tests PRIVATE jdelphiast)
   add_test(NAME jdelphiast_project_tests COMMAND jdelphiast_project_tests)
   add_test(NAME jdelphiast_cli_package
-    COMMAND jdelphiast_cli --json ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/DemoPackage.dpk)
+    COMMAND DelphiAstTool --project ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/DemoPackage.dpk
+            --output ${CMAKE_CURRENT_BINARY_DIR}/DemoPackage.ast.json)
   set_tests_properties(jdelphiast_cli_package PROPERTIES
-    PASS_REGULAR_EXPRESSION "SysUtils.*USED")
+    PASS_REGULAR_EXPRESSION "Wrote.*DemoPackage.ast.json")
+  add_test(NAME jdelphiast_cli_requires_output
+    COMMAND DelphiAstTool --project ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/DemoPackage.dpk)
+  set_tests_properties(jdelphiast_cli_requires_output PROPERTIES WILL_FAIL TRUE)
 endif()

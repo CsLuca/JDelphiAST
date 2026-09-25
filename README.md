@@ -127,7 +127,7 @@ ctest --test-dir build-ucrt64 --output-on-failure
 Generated programs:
 
 ```text
-build-ucrt64/jdelphiast_cli.exe
+build-ucrt64/DelphiAstTool.exe
 build-ucrt64/jdelphiast_tests.exe
 ```
 
@@ -154,7 +154,9 @@ cmake -S . -B build -DJDELPHIAST_BUILD_TESTS=OFF
 Analyze an entire package with one command:
 
 ```powershell
-build-ucrt64\jdelphiast_cli.exe MyPlugin.dpk
+DelphiAstTool.exe `
+  --project "C:\plugin\ActiveUp\source\PI_ActiveUp_BackOrd\PI_ActiveUp_BackOrd.dpk" `
+  --output "C:\temp\PI_ActiveUp_BackOrd.ast.json"
 ```
 
 When the input is a `.dpk`, JDelphiAST:
@@ -170,10 +172,10 @@ When the input is a `.dpk`, JDelphiAST:
 Additional search paths and symbol indexes can be supplied explicitly:
 
 ```powershell
-build-ucrt64\jdelphiast_cli.exe --json `
+build-ucrt64\DelphiAstTool.exe --project MyPlugin.dpk `
+  --output MyPlugin.ast.json `
   --search-path C:\Libraries\MyFramework\Source `
-  --index C:\Indexes\company-v600.jdi `
-  MyPlugin.dpk > analysis.json
+  --index C:\Indexes\company-v600.jdi
 ```
 
 Options can be repeated:
@@ -181,7 +183,9 @@ Options can be repeated:
 ```text
 --search-path <directory>   Add a Delphi unit search directory
 --index <file.jdi>          Add a pre-generated symbol index
---json                      Write the versioned JSON report
+--project <package.dpk>     Analyze the complete Delphi package
+--output <file.ast.json>    Write the project AST as JSON
+--json                      Write JSON to stdout in legacy direct-file mode
 ```
 
 Unknown DPROJ macros and unresolved source paths are emitted as warnings. A missing source unit remains `UNKNOWN` unless a loaded symbol index supplies it.
@@ -191,7 +195,7 @@ Unknown DPROJ macros and unresolved source paths are emitted as warnings. A miss
 Pass the unit to analyze together with all available source units needed to build the symbol index:
 
 ```powershell
-build-ucrt64\jdelphiast_cli.exe `
+build-ucrt64\DelphiAstTool.exe `
   MyPlugin.pas `
   System.SysUtils.pas `
   System.Classes.pas `
@@ -203,7 +207,7 @@ build-ucrt64\jdelphiast_cli.exe `
 Use `--json` for machine-readable output:
 
 ```powershell
-build-ucrt64\jdelphiast_cli.exe --json MyPlugin.pas System.SysUtils.pas
+build-ucrt64\DelphiAstTool.exe --json MyPlugin.pas System.SysUtils.pas
 ```
 
 Example text report:
@@ -228,7 +232,23 @@ The JSON report has a versioned top-level schema:
 ```json
 {
   "schemaVersion": 1,
-  "units": [],
+  "plugin": "PI_ActiveUp_BackOrd",
+  "sourceRoot": "C:\\plugin\\ActiveUp\\source\\PI_ActiveUp_BackOrd",
+  "generatedAt": "2026-09-25T22:30:00",
+  "units": [
+    {
+      "unit": "FViewBO",
+      "file": "FViewBO.pas",
+      "sourceHash": "sha256:...",
+      "uses": {
+        "interface": [],
+        "implementation": []
+      },
+      "declarations": [],
+      "calls": [],
+      "assignments": []
+    }
+  ],
   "graph": [],
   "cycles": []
 }
@@ -324,6 +344,8 @@ This release is a vertical slice, not a complete Delphi compiler frontend. It do
 - source encoding-aware Unicode columns;
 - persisted/versioned V600 reference indexes;
 - automatic source patch generation.
+- complete lexical-scope type inference for shadowed variables and parameters;
+- indexed/dereferenced assignment targets such as `Items[I]` and `P^`.
 
 Unsupported or ambiguous cases must remain `UNKNOWN`. Consumers must not reinterpret them as `REMOVE`.
 

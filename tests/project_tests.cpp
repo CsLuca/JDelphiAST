@@ -59,13 +59,21 @@ interface
 uses SysUtils, SharedUnit;
 procedure Run(E: Exception);
 implementation
-procedure Run(E: Exception); begin UseShared; end;
+procedure Run(E: Exception);
+var Worker: TWorker;
+begin
+  Worker := TWorker.Create(nil);
+  Worker.Value := MakeValue(E, '', True);
+end;
 end.)");
   write(sharedDir / "SharedUnit.pas", R"(unit SharedUnit;
 interface
 procedure UseShared;
+type TWorker = class end;
+function MakeValue(E: Exception; S: string; B: Boolean): string;
 implementation
 procedure UseShared; begin end;
+function MakeValue(E: Exception; S: string; B: Boolean): string; begin Result := S; end;
 end.)");
   write(root / "rtl.jdi", "System.SysUtils|Exception|initialization,finalization\n");
 
@@ -81,6 +89,15 @@ end.)");
           "DPROJ namespace alias resolves RTL symbol from pre-generated index");
   require(dependency(mainUnit, "SharedUnit").status == jdelphiast::DependencyStatus::Used,
           "search path resolves and loads local unit recursively");
+  require(!mainUnit.ast.calls.empty(), "calls are extracted from package units");
+  require(mainUnit.ast.assignments.size() == 2, "assignments are extracted from package units");
+  const auto json = jdelphiast::toProjectJson(result, "Demo", root, "2026-09-25T22:30:00");
+  require(json.find("\"plugin\":\"Demo\"") != std::string::npos, "project JSON contains plugin");
+  require(json.find("\"sourceHash\":\"sha256:") != std::string::npos, "project JSON contains SHA-256");
+  require(json.find("\"uses\":{\"interface\":[") != std::string::npos, "project JSON groups uses");
+  require(json.find("\"declarations\":[") != std::string::npos, "project JSON contains declarations");
+  require(json.find("\"calls\":[") != std::string::npos, "project JSON contains calls");
+  require(json.find("\"assignments\":[") != std::string::npos, "project JSON contains assignments");
 
   std::filesystem::remove_all(root);
   std::cout << "All project tests passed\n";

@@ -74,5 +74,8 @@ end.)");
   require(dependency(noiseResult.units[1], "Known").status == jdelphiast::DependencyStatus::Unused,
           "comments and strings do not create references");
 
+  const auto incomplete = jdelphiast::parseUnit("Incomplete.pas", "unit Incomplete; interface procedure P(A:");
+  require(!incomplete.complete, "truncated routine declaration is incomplete without crashing");
+
   std::cout << "All tests passed\n";
 }

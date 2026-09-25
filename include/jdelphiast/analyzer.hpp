@@ -37,6 +37,49 @@ struct SymbolDeclaration {
   SourceRange range;
 };
 
+struct AstParameter {
+  std::string name;
+  std::string type;
+  SourceRange range;
+};
+
+struct AstDeclaration {
+  std::string kind;
+  std::string name;
+  std::string visibility;
+  std::string type;
+  std::string scope;
+  SourceRange range;
+  std::vector<AstParameter> parameters;
+};
+
+struct CallArgument {
+  std::string kind;
+  std::string text;
+  std::string resolvedType;
+  SourceRange range;
+};
+
+struct AssignmentTarget {
+  std::string kind;
+  std::string text;
+  std::string resolvedType;
+};
+
+struct AstCall {
+  std::string name;
+  SourceRange range;
+  std::vector<CallArgument> arguments;
+  AssignmentTarget assignmentTarget;
+  std::string resolvedReturnType;
+};
+
+struct AstAssignment {
+  std::string left;
+  std::string right;
+  SourceRange range;
+};
+
 struct SymbolReference {
   std::string name;
   SourceRange range;
@@ -52,6 +95,10 @@ struct UnitAst {
   std::vector<UsesItem> uses;
   std::vector<SymbolDeclaration> exports;
   std::vector<SymbolReference> references;
+  std::vector<AstDeclaration> declarations;
+  std::vector<AstCall> calls;
+  std::vector<AstAssignment> assignments;
+  std::string sourceHash;
   bool hasInitialization{};
   bool hasFinalization{};
   bool complete{true};
@@ -116,6 +163,9 @@ class Analyzer {
 
 [[nodiscard]] std::string toText(const AnalysisResult& result);
 [[nodiscard]] std::string toJson(const AnalysisResult& result);
+[[nodiscard]] std::string toProjectJson(const AnalysisResult& result, std::string_view plugin,
+                                        const std::filesystem::path& sourceRoot,
+                                        std::string_view generatedAt);
 [[nodiscard]] const char* toString(DependencyStatus value);
 [[nodiscard]] const char* toString(Confidence value);
 

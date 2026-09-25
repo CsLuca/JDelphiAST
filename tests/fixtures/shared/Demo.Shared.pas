@@ -2,12 +2,24 @@ unit Demo.Shared;
 
 interface
 
-procedure UseShared;
+type
+  TSharedWorker = class
+  public
+    Value: string;
+    constructor Create(AOwner: TObject);
+  end;
+
+function MakeValue(AException: Exception; const S: string; Enabled: Boolean): string;
 
 implementation
 
-procedure UseShared;
+constructor TSharedWorker.Create(AOwner: TObject);
 begin
+end;
+
+function MakeValue(AException: Exception; const S: string; Enabled: Boolean): string;
+begin
+  Result := S;
 end;
 
 end.
