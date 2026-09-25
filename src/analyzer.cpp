@@ -153,7 +153,7 @@ std::string qualifiedName(const std::vector<Token>& tokens, std::size_t& index, 
   return result;
 }
 
-UnitAst parse(const std::filesystem::path& path, const std::string& source) {
+UnitAst parseSource(const std::filesystem::path& path, const std::string& source) {
   bool hasDirective = false;
   const auto tokens = Lexer(source).run(&hasDirective);
   UnitAst ast;
@@ -349,10 +349,34 @@ void Analyzer::addSource(std::filesystem::path path, std::string source) {
   inputs_.push_back({std::move(path), std::move(source)});
 }
 
+void Analyzer::addIndexedUnit(IndexedUnit unit) { indexedUnits_.push_back(std::move(unit)); }
+
+void Analyzer::addUnitAlias(std::string alias, std::string declaredName) {
+  unitAliases_[canonical(alias)] = canonical(declaredName);
+}
+
+void Analyzer::setEnvironmentComplete(bool complete) { environmentComplete_ = complete; }
+
+UnitAst parseUnit(std::filesystem::path path, const std::string& source) {
+  return parseSource(path, source);
+}
+
 AnalysisResult Analyzer::analyze() const {
   AnalysisResult result;
   result.units.reserve(inputs_.size());
-  for (const auto& input : inputs_) result.units.push_back({parse(input.path, input.source), {}});
+  for (const auto& input : inputs_) result.units.push_back({parseSource(input.path, input.source), {}});
+  for (const auto& indexed : indexedUnits_) {
+    UnitAst ast;
+    ast.name = indexed.name;
+    ast.file = "<index>";
+    ast.hasInitialization = indexed.hasInitialization;
+    ast.hasFinalization = indexed.hasFinalization;
+    ast.complete = indexed.complete;
+    ast.indexOnly = true;
+    for (const auto& symbol : indexed.symbols)
+      ast.exports.push_back({symbol, "indexed", {}});
+    result.units.push_back({std::move(ast), {}});
+  }
 
   std::unordered_map<std::string, std::vector<std::pair<std::size_t, const SymbolDeclaration*>>> symbols;
   std::unordered_map<std::string, std::size_t> units;
@@ -368,7 +392,9 @@ AnalysisResult Analyzer::analyze() const {
     auto& analyzed = result.units[sourceIndex];
     for (const auto& item : analyzed.ast.uses) {
       Dependency dependency{item.name, item.section, DependencyStatus::Unknown, Confidence::Low, {}, {}};
-      const auto targetIt = units.find(canonical(item.name));
+      auto targetName = canonical(item.name);
+      if (const auto alias = unitAliases_.find(targetName); alias != unitAliases_.end()) targetName = alias->second;
+      const auto targetIt = units.find(targetName);
       if (targetIt == units.end()) {
         dependency.status = DependencyStatus::Unknown;
         dependency.confidence = Confidence::Low;
@@ -376,7 +402,7 @@ AnalysisResult Analyzer::analyze() const {
         analyzed.dependencies.push_back(std::move(dependency));
         continue;
       }
-      if (duplicateUnits.contains(canonical(item.name))) {
+      if (duplicateUnits.contains(targetName)) {
         dependency.status = DependencyStatus::Unknown;
         dependency.confidence = Confidence::Low;
         dependency.reasons.push_back("DUPLICATE_UNIT_SOURCE");
@@ -410,7 +436,9 @@ AnalysisResult Analyzer::analyze() const {
         std::vector<std::size_t> visible;
         for (const auto& candidate : candidates->second) {
           const auto used = std::find_if(analyzed.ast.uses.begin(), analyzed.ast.uses.end(), [&](const UsesItem& usedItem) {
-            return canonical(usedItem.name) == canonical(result.units[candidate.first].ast.name) &&
+            auto usedName = canonical(usedItem.name);
+            if (const auto alias = unitAliases_.find(usedName); alias != unitAliases_.end()) usedName = alias->second;
+            return usedName == canonical(result.units[candidate.first].ast.name) &&
                    !(reference.section == UsesSection::Interface && usedItem.section == UsesSection::Implementation);
           });
           if (used != analyzed.ast.uses.end() &&
@@ -432,7 +460,8 @@ AnalysisResult Analyzer::analyze() const {
       if (!dependency.references.empty()) {
         dependency.status = DependencyStatus::Used;
         dependency.confidence = Confidence::High;
-      } else if (!dependency.reasons.empty() || !analyzed.ast.complete || !result.units[targetIndex].ast.complete) {
+      } else if (!dependency.reasons.empty() || !environmentComplete_ || !analyzed.ast.complete ||
+                 !result.units[targetIndex].ast.complete) {
         dependency.status = DependencyStatus::Unknown;
         dependency.confidence = Confidence::Low;
       } else if (result.units[targetIndex].ast.hasInitialization || result.units[targetIndex].ast.hasFinalization) {
@@ -502,6 +531,7 @@ const char* toString(Confidence value) {
 std::string toText(const AnalysisResult& result) {
   std::ostringstream output;
   for (const auto& unit : result.units) {
+    if (unit.ast.indexOnly) continue;
     output << unit.ast.file.string() << "\nUSES ANALYSIS\n";
     for (const auto& dependency : unit.dependencies) {
       output << dependency.unit << "\t" << toString(dependency.status) << "\t"
@@ -519,9 +549,11 @@ std::string toText(const AnalysisResult& result) {
 std::string toJson(const AnalysisResult& result) {
   std::ostringstream output;
   output << "{\"schemaVersion\":1,\"units\":[";
-  for (std::size_t i = 0; i < result.units.size(); ++i) {
-    if (i) output << ',';
-    const auto& unit = result.units[i];
+  bool firstUnit = true;
+  for (const auto& unit : result.units) {
+    if (unit.ast.indexOnly) continue;
+    if (!firstUnit) output << ',';
+    firstUnit = false;
     output << "{\"unit\":\"" << jsonEscape(unit.ast.name) << "\",\"file\":\""
            << jsonEscape(unit.ast.file.string()) << "\",\"dependencies\":[";
     for (std::size_t d = 0; d < unit.dependencies.size(); ++d) {

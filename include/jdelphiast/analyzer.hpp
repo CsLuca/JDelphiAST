@@ -55,6 +55,7 @@ struct UnitAst {
   bool hasInitialization{};
   bool hasFinalization{};
   bool complete{true};
+  bool indexOnly{};
 };
 
 struct Dependency {
@@ -84,9 +85,20 @@ struct AnalysisResult {
   std::vector<std::vector<std::string>> cycles;
 };
 
+struct IndexedUnit {
+  std::string name;
+  std::vector<std::string> symbols;
+  bool hasInitialization{};
+  bool hasFinalization{};
+  bool complete{};
+};
+
 class Analyzer {
  public:
   void addSource(std::filesystem::path path, std::string source);
+  void addIndexedUnit(IndexedUnit unit);
+  void addUnitAlias(std::string alias, std::string declaredName);
+  void setEnvironmentComplete(bool complete);
   [[nodiscard]] AnalysisResult analyze() const;
 
  private:
@@ -95,7 +107,12 @@ class Analyzer {
     std::string source;
   };
   std::vector<Input> inputs_;
+  std::vector<IndexedUnit> indexedUnits_;
+  std::unordered_map<std::string, std::string> unitAliases_;
+  bool environmentComplete_{true};
 };
+
+[[nodiscard]] UnitAst parseUnit(std::filesystem::path path, const std::string& source);
 
 [[nodiscard]] std::string toText(const AnalysisResult& result);
 [[nodiscard]] std::string toJson(const AnalysisResult& result);

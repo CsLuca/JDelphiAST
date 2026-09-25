@@ -1,0 +1,9 @@
+package DemoPackage;
+
+requires
+  rtl;
+
+contains
+  Demo.Main in 'package\Demo.Main.pas';
+
+end.
