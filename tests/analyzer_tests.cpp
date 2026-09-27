@@ -1,5 +1,6 @@
 #include "jdelphiast/analyzer.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -38,7 +39,7 @@ end.)");
 interface
 implementation
 initialization
-  RegisterHandlers;
+  RegisterClass(TRegisteredHandler);
 finalization
   UnregisterHandlers;
 end.)");
@@ -55,16 +56,26 @@ end.)");
           "unqualified Exception resolves to System.SysUtils");
   require(dependency(consumer, "System.Classes").status == jdelphiast::DependencyStatus::Used,
           "unqualified TStringList resolves to System.Classes");
-  require(dependency(consumer, "Registration").status == jdelphiast::DependencyStatus::SideEffect,
-          "initialization unit is protected");
+  require(dependency(consumer, "Registration").status == jdelphiast::DependencyStatus::Used,
+          "initialization unit is protected as used");
+  require(!dependency(consumer, "Registration").reasons.empty(), "side effect reasons are reported");
+  require(std::find(dependency(consumer, "Registration").reasons.begin(),
+                    dependency(consumer, "Registration").reasons.end(),
+                    "class_registration: TRegisteredHandler") != dependency(consumer, "Registration").reasons.end(),
+          "class registration reason is reported");
   require(dependency(consumer, "Unused").status == jdelphiast::DependencyStatus::Unused,
           "known empty unit is unused");
+  require(dependency(consumer, "Unused").reasons.size() == 1 &&
+              dependency(consumer, "Unused").reasons.front() == "no_references",
+          "unused dependency has only no_references reason");
   require(dependency(consumer, "Vendor.Secret").status == jdelphiast::DependencyStatus::Unknown,
           "missing source is unknown");
   require(dependency(consumer, "System.SysUtils").references.front().range.begin.line == 10,
           "CRLF line is preserved");
   require(jdelphiast::toJson(result).find("\"schemaVersion\":1") != std::string::npos,
           "JSON report has schema version");
+  require(jdelphiast::toJson(result).find("source_unit_not_indexed: Vendor.Secret") != std::string::npos,
+          "direct JSON contains dependency reasons");
   require(result.graph.size() == consumer.dependencies.size(), "dependency graph contains uses edges");
 
   jdelphiast::Analyzer noise;
@@ -73,6 +84,13 @@ end.)");
   const auto noiseResult = noise.analyze();
   require(dependency(noiseResult.units[1], "Known").status == jdelphiast::DependencyStatus::Unused,
           "comments and strings do not create references");
+
+  jdelphiast::Analyzer unresolved;
+  unresolved.addIndexedUnit({"Known", {}, {}, false, false, false});
+  unresolved.addSource("UsesUnknown.pas", "unit UsesUnknown; interface uses Known; procedure P; implementation procedure P; begin MissingCall; end; end.");
+  const auto unresolvedResult = unresolved.analyze();
+  require(dependency(unresolvedResult.units[0], "Known").status == jdelphiast::DependencyStatus::Unknown,
+          "unresolved symbols prevent unsafe unused classification");
 
   const auto incomplete = jdelphiast::parseUnit("Incomplete.pas", "unit Incomplete; interface procedure P(A:");
   require(!incomplete.complete, "truncated routine declaration is incomplete without crashing");

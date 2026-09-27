@@ -20,6 +20,12 @@ struct SourceRange {
   SourcePosition end;
 };
 
+struct InactiveRange {
+  std::filesystem::path file;
+  SourceRange range;
+  std::string condition;
+};
+
 enum class UsesSection { Interface, Implementation };
 enum class DependencyStatus { Used, Unused, SideEffect, Unknown };
 enum class Confidence { High, Medium, Low };
@@ -77,6 +83,10 @@ struct AstCall {
 struct AstAssignment {
   std::string left;
   std::string right;
+  std::string targetType;
+  std::string valueKind;
+  std::string resolvedReturnType;
+  std::vector<CallArgument> arguments;
   SourceRange range;
 };
 
@@ -99,6 +109,10 @@ struct UnitAst {
   std::vector<AstCall> calls;
   std::vector<AstAssignment> assignments;
   std::string sourceHash;
+  std::vector<std::filesystem::path> includesResolved;
+  std::vector<InactiveRange> inactiveRanges;
+  std::vector<std::string> preprocessorReasons;
+  std::vector<std::string> sideEffectReasons;
   bool hasInitialization{};
   bool hasFinalization{};
   bool complete{true};
@@ -130,11 +144,17 @@ struct AnalysisResult {
   std::vector<UnitAnalysis> units;
   std::vector<DependencyEdge> graph;
   std::vector<std::vector<std::string>> cycles;
+  std::string configuration;
+  std::string platform;
+  std::vector<std::string> defines;
+  std::vector<std::filesystem::path> includesResolved;
+  std::vector<InactiveRange> inactiveRanges;
 };
 
 struct IndexedUnit {
   std::string name;
   std::vector<std::string> symbols;
+  std::vector<AstDeclaration> declarations;
   bool hasInitialization{};
   bool hasFinalization{};
   bool complete{};
@@ -146,6 +166,9 @@ class Analyzer {
   void addIndexedUnit(IndexedUnit unit);
   void addUnitAlias(std::string alias, std::string declaredName);
   void setEnvironmentComplete(bool complete);
+  void setPreprocessor(std::vector<std::string> defines,
+                       std::vector<std::filesystem::path> includePaths);
+  void setBuildContext(std::string configuration, std::string platform);
   [[nodiscard]] AnalysisResult analyze() const;
 
  private:
@@ -157,6 +180,10 @@ class Analyzer {
   std::vector<IndexedUnit> indexedUnits_;
   std::unordered_map<std::string, std::string> unitAliases_;
   bool environmentComplete_{true};
+  std::vector<std::string> defines_;
+  std::vector<std::filesystem::path> includePaths_;
+  std::string configuration_;
+  std::string platform_;
 };
 
 [[nodiscard]] UnitAst parseUnit(std::filesystem::path path, const std::string& source);

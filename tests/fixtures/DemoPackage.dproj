@@ -2,6 +2,12 @@
   <PropertyGroup>
     <DCC_UnitSearchPath>$(PROJECTDIR)\shared</DCC_UnitSearchPath>
     <DCC_Namespace>System;Vcl</DCC_Namespace>
-    <DCC_Define>DEBUG;PACKAGE_TEST</DCC_Define>
+    <DCC_Define>PACKAGE_TEST</DCC_Define>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Debug'">
+    <DCC_Define>DEBUG;$(DCC_Define)</DCC_Define>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Release' and '$(Platform)'=='Win32'">
+    <DCC_Define>RELEASE;WIN32;$(DCC_Define)</DCC_Define>
   </PropertyGroup>
 </Project>

@@ -3,7 +3,7 @@ project(JDelphiAST VERSION 0.1.0 LANGUAGES CXX)
 
 option(JDELPHIAST_BUILD_TESTS "Build JDelphiAST tests" ON)
 
-add_library(jdelphiast src/analyzer.cpp src/project.cpp)
+add_library(jdelphiast src/analyzer.cpp src/project.cpp src/preprocessor.cpp)
 target_include_directories(jdelphiast PUBLIC include)
 target_compile_features(jdelphiast PUBLIC cxx_std_20)
 
@@ -28,6 +28,9 @@ if(JDELPHIAST_BUILD_TESTS)
   add_executable(jdelphiast_project_tests tests/project_tests.cpp)
   target_link_libraries(jdelphiast_project_tests PRIVATE jdelphiast)
   add_test(NAME jdelphiast_project_tests COMMAND jdelphiast_project_tests)
+  add_executable(jdelphiast_preprocessor_tests tests/preprocessor_tests.cpp)
+  target_link_libraries(jdelphiast_preprocessor_tests PRIVATE jdelphiast)
+  add_test(NAME jdelphiast_preprocessor_tests COMMAND jdelphiast_preprocessor_tests)
   add_test(NAME jdelphiast_cli_package
     COMMAND DelphiAstTool --project ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/DemoPackage.dpk
             --output ${CMAKE_CURRENT_BINARY_DIR}/DemoPackage.ast.json)
@@ -36,4 +39,8 @@ if(JDELPHIAST_BUILD_TESTS)
   add_test(NAME jdelphiast_cli_requires_output
     COMMAND DelphiAstTool --project ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/DemoPackage.dpk)
   set_tests_properties(jdelphiast_cli_requires_output PROPERTIES WILL_FAIL TRUE)
+  add_test(NAME jdelphiast_cli_index
+    COMMAND DelphiAstTool index --source ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/shared
+            --output ${CMAKE_CURRENT_BINARY_DIR}/generated-v600.jdi)
+  set_tests_properties(jdelphiast_cli_index PROPERTIES PASS_REGULAR_EXPRESSION "Wrote.*generated-v600.jdi")
 endif()

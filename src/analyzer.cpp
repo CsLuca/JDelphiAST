@@ -1,4 +1,5 @@
 #include "jdelphiast/analyzer.hpp"
+#include "jdelphiast/preprocessor.hpp"
 
 #include <algorithm>
 #include <array>
@@ -246,6 +247,7 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
   bool inImplementation = false;
   bool sawInterface = false;
   bool sawImplementation = false;
+  bool inInitialization = false;
   std::unordered_set<std::size_t> excluded;
   std::unordered_set<std::string> ownNames;
   std::unordered_map<std::string, std::string> variableTypes;
@@ -264,16 +266,32 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
       inInterface = false;
       inImplementation = true;
       section = UsesSection::Implementation;
+      inInitialization = false;
       continue;
     }
     if (word(tokens[i], "initialization")) {
       ast.hasInitialization = true;
       inImplementation = true;
+      inInitialization = true;
       continue;
+    }
+    if (inInitialization && tokens[i].kind == TokenKind::Identifier && tokens[i + 1].text == "(") {
+      const auto call = canonical(tokens[i].text);
+      const auto registration = call.starts_with("register") || call == "regcsproc" ||
+                                call.starts_with("addfactory") || call.starts_with("install");
+      if (registration) {
+        const auto argument = tokens[i + 2].kind == TokenKind::Identifier ? tokens[i + 2].text : std::string{};
+        if (call == "registerclass") ast.sideEffectReasons.push_back("class_registration: " + argument);
+        else if (call.find("factory") != std::string::npos)
+          ast.sideEffectReasons.push_back("factory_registration: " + argument);
+        else ast.sideEffectReasons.push_back("registration_call: " + tokens[i].text +
+                                             (argument.empty() ? "" : ": " + argument));
+      }
     }
     if (word(tokens[i], "finalization")) {
       ast.hasFinalization = true;
       inImplementation = true;
+      inInitialization = false;
       continue;
     }
     if (word(tokens[i], "uses") && (inInterface || inImplementation)) {
@@ -481,8 +499,11 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
         }
         if (end > assignmentOperator + 2) {
           const SourceRange rightRange{tokens[assignmentOperator + 2].range.begin, tokens[end - 1].range.end};
-          ast.assignments.push_back({left, sourceSlice(source, rightRange),
-                                     {leftRange.begin, rightRange.end}});
+          AstAssignment assignment;
+          assignment.left = left;
+          assignment.right = sourceSlice(source, rightRange);
+          assignment.range = {leftRange.begin, rightRange.end};
+          ast.assignments.push_back(std::move(assignment));
         }
       }
     }
@@ -544,6 +565,19 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
       call.resolvedReturnType = call.name.substr(0, firstDot);
     ast.calls.push_back(std::move(call));
   }
+  for (auto& assignment : ast.assignments) {
+    auto root = assignment.left.substr(0, assignment.left.find('.'));
+    if (const auto type = variableTypes.find(canonical(root)); type != variableTypes.end())
+      assignment.targetType = type->second;
+    for (const auto& call : ast.calls) {
+      if (call.range.begin.offset >= assignment.range.begin.offset && call.range.end.offset <= assignment.range.end.offset) {
+        assignment.valueKind = "call";
+        assignment.resolvedReturnType = call.resolvedReturnType;
+        assignment.arguments = call.arguments;
+        break;
+      }
+    }
+  }
   return ast;
 }
 
@@ -582,14 +616,42 @@ void Analyzer::addUnitAlias(std::string alias, std::string declaredName) {
 
 void Analyzer::setEnvironmentComplete(bool complete) { environmentComplete_ = complete; }
 
+void Analyzer::setPreprocessor(std::vector<std::string> defines,
+                               std::vector<std::filesystem::path> includePaths) {
+  defines_ = std::move(defines);
+  includePaths_ = std::move(includePaths);
+}
+
+void Analyzer::setBuildContext(std::string configuration, std::string platform) {
+  configuration_ = std::move(configuration);
+  platform_ = std::move(platform);
+}
+
 UnitAst parseUnit(std::filesystem::path path, const std::string& source) {
   return parseSource(path, source);
 }
 
 AnalysisResult Analyzer::analyze() const {
   AnalysisResult result;
+  result.configuration = configuration_;
+  result.platform = platform_;
+  result.defines = defines_;
   result.units.reserve(inputs_.size());
-  for (const auto& input : inputs_) result.units.push_back({parseSource(input.path, input.source), {}});
+  const PreprocessorOptions preprocessorOptions{defines_, includePaths_, 64};
+  for (const auto& input : inputs_) {
+    const auto preprocessed = preprocess(input.path, input.source, preprocessorOptions);
+    auto ast = parseSource(input.path, preprocessed.source);
+    ast.sourceHash = sha256(input.source);
+    ast.complete = ast.complete && preprocessed.complete;
+    ast.includesResolved = preprocessed.includesResolved;
+    ast.inactiveRanges = preprocessed.inactiveRanges;
+    ast.preprocessorReasons = preprocessed.reasons;
+    result.includesResolved.insert(result.includesResolved.end(), preprocessed.includesResolved.begin(),
+                                   preprocessed.includesResolved.end());
+    result.inactiveRanges.insert(result.inactiveRanges.end(), preprocessed.inactiveRanges.begin(),
+                                 preprocessed.inactiveRanges.end());
+    result.units.push_back({std::move(ast), {}});
+  }
   for (const auto& indexed : indexedUnits_) {
     UnitAst ast;
     ast.name = indexed.name;
@@ -600,6 +662,7 @@ AnalysisResult Analyzer::analyze() const {
     ast.indexOnly = true;
     for (const auto& symbol : indexed.symbols)
       ast.exports.push_back({symbol, "indexed", {}});
+    ast.declarations = indexed.declarations;
     result.units.push_back({std::move(ast), {}});
   }
 
@@ -613,6 +676,42 @@ AnalysisResult Analyzer::analyze() const {
       symbols[canonical(symbol.name)].push_back({i, &symbol});
   }
 
+  for (auto& analyzed : result.units) {
+    if (analyzed.ast.indexOnly) continue;
+    for (auto& call : analyzed.ast.calls) {
+      if (!call.resolvedReturnType.empty()) continue;
+      auto simple = call.name.substr(call.name.find_last_of('.') == std::string::npos
+                                         ? 0 : call.name.find_last_of('.') + 1);
+      std::vector<std::string> returnTypes;
+      for (const auto& candidateUnit : result.units) {
+        const auto visible = candidateUnit.ast.name == analyzed.ast.name ||
+            std::any_of(analyzed.ast.uses.begin(), analyzed.ast.uses.end(), [&](const UsesItem& use) {
+              auto usedName = canonical(use.name);
+              if (const auto alias = unitAliases_.find(usedName); alias != unitAliases_.end()) usedName = alias->second;
+              return usedName == canonical(candidateUnit.ast.name);
+            });
+        if (!visible) continue;
+        for (const auto& declaration : candidateUnit.ast.declarations)
+          if (canonical(declaration.name.substr(declaration.name.find_last_of('.') == std::string::npos
+                                                    ? 0 : declaration.name.find_last_of('.') + 1)) == canonical(simple) &&
+              !declaration.type.empty())
+            returnTypes.push_back(declaration.type);
+      }
+      std::sort(returnTypes.begin(), returnTypes.end());
+      returnTypes.erase(std::unique(returnTypes.begin(), returnTypes.end()), returnTypes.end());
+      if (returnTypes.size() == 1) call.resolvedReturnType = returnTypes.front();
+    }
+    for (auto& assignment : analyzed.ast.assignments) {
+      for (const auto& call : analyzed.ast.calls)
+        if (call.range.begin.offset >= assignment.range.begin.offset && call.range.end.offset <= assignment.range.end.offset) {
+          assignment.valueKind = "call";
+          assignment.resolvedReturnType = call.resolvedReturnType;
+          assignment.arguments = call.arguments;
+          break;
+        }
+    }
+  }
+
   for (std::size_t sourceIndex = 0; sourceIndex < result.units.size(); ++sourceIndex) {
     auto& analyzed = result.units[sourceIndex];
     for (const auto& item : analyzed.ast.uses) {
@@ -623,18 +722,19 @@ AnalysisResult Analyzer::analyze() const {
       if (targetIt == units.end()) {
         dependency.status = DependencyStatus::Unknown;
         dependency.confidence = Confidence::Low;
-        dependency.reasons.push_back("SOURCE_UNAVAILABLE");
+        dependency.reasons.push_back("source_unit_not_indexed: " + item.name);
         analyzed.dependencies.push_back(std::move(dependency));
         continue;
       }
       if (duplicateUnits.contains(targetName)) {
         dependency.status = DependencyStatus::Unknown;
         dependency.confidence = Confidence::Low;
-        dependency.reasons.push_back("DUPLICATE_UNIT_SOURCE");
+        dependency.reasons.push_back("duplicate_unit_source: " + item.name);
         analyzed.dependencies.push_back(std::move(dependency));
         continue;
       }
       const auto targetIndex = targetIt->second;
+      std::vector<std::string> unresolvedReferences;
       for (auto& reference : analyzed.ast.references) {
         if (reference.section == UsesSection::Interface && item.section == UsesSection::Implementation) continue;
         auto simple = reference.name;
@@ -657,7 +757,10 @@ AnalysisResult Analyzer::analyze() const {
           continue;
         }
         const auto candidates = symbols.find(canonical(simple));
-        if (candidates == symbols.end()) continue;
+        if (candidates == symbols.end()) {
+          unresolvedReferences.push_back(reference.name);
+          continue;
+        }
         std::vector<std::size_t> visible;
         for (const auto& candidate : candidates->second) {
           const auto used = std::find_if(analyzed.ast.uses.begin(), analyzed.ast.uses.end(), [&](const UsesItem& usedItem) {
@@ -679,24 +782,41 @@ AnalysisResult Analyzer::analyze() const {
         } else if (visible.size() > 1) {
           reference.status = ResolutionStatus::Ambiguous;
           if (std::find(visible.begin(), visible.end(), targetIndex) != visible.end())
-            dependency.reasons.push_back("AMBIGUOUS_REFERENCE:" + reference.name);
+            dependency.reasons.push_back("ambiguous_symbol: " + reference.name);
         }
       }
       if (!dependency.references.empty()) {
         dependency.status = DependencyStatus::Used;
         dependency.confidence = Confidence::High;
+      } else if (result.units[targetIndex].ast.hasInitialization || result.units[targetIndex].ast.hasFinalization) {
+        dependency.status = DependencyStatus::Used;
+        dependency.confidence = Confidence::High;
+        if (result.units[targetIndex].ast.hasInitialization) dependency.reasons.push_back("initialization_side_effect");
+        if (result.units[targetIndex].ast.hasFinalization) dependency.reasons.push_back("finalization_side_effect");
+        dependency.reasons.insert(dependency.reasons.end(), result.units[targetIndex].ast.sideEffectReasons.begin(),
+                                  result.units[targetIndex].ast.sideEffectReasons.end());
       } else if (!dependency.reasons.empty() || !environmentComplete_ || !analyzed.ast.complete ||
                  !result.units[targetIndex].ast.complete) {
         dependency.status = DependencyStatus::Unknown;
         dependency.confidence = Confidence::Low;
-      } else if (result.units[targetIndex].ast.hasInitialization || result.units[targetIndex].ast.hasFinalization) {
-        dependency.status = DependencyStatus::SideEffect;
-        dependency.confidence = Confidence::High;
-        if (result.units[targetIndex].ast.hasInitialization) dependency.reasons.push_back("INITIALIZATION_SECTION");
-        if (result.units[targetIndex].ast.hasFinalization) dependency.reasons.push_back("FINALIZATION_SECTION");
+        if (!environmentComplete_) dependency.reasons.push_back("build_environment_incomplete");
+        if (!analyzed.ast.complete) {
+          dependency.reasons.push_back("source_parse_incomplete: " + analyzed.ast.name);
+          dependency.reasons.insert(dependency.reasons.end(), analyzed.ast.preprocessorReasons.begin(),
+                                    analyzed.ast.preprocessorReasons.end());
+        }
+        if (!result.units[targetIndex].ast.complete)
+          dependency.reasons.push_back("source_unit_not_fully_indexed: " + item.name);
+        std::sort(unresolvedReferences.begin(), unresolvedReferences.end());
+        unresolvedReferences.erase(std::unique(unresolvedReferences.begin(), unresolvedReferences.end()),
+                                   unresolvedReferences.end());
+        if (!result.units[targetIndex].ast.complete)
+          for (const auto& reference : unresolvedReferences)
+            dependency.reasons.push_back("unresolved_symbol: " + reference);
       } else {
         dependency.status = DependencyStatus::Unused;
         dependency.confidence = Confidence::High;
+        dependency.reasons.push_back("no_references");
       }
       analyzed.dependencies.push_back(std::move(dependency));
     }
@@ -788,7 +908,12 @@ std::string toJson(const AnalysisResult& result) {
              << (dependency.section == UsesSection::Interface ? "interface" : "implementation")
              << "\",\"status\":\"" << toString(dependency.status) << "\",\"referenceCount\":"
              << dependency.references.size() << ",\"confidence\":\"" << toString(dependency.confidence)
-             << "\",\"references\":[";
+             << "\",\"reasons\":[";
+      for (std::size_t reason = 0; reason < dependency.reasons.size(); ++reason) {
+        if (reason) output << ',';
+        output << '"' << jsonEscape(dependency.reasons[reason]) << '"';
+      }
+      output << "],\"references\":[";
       for (std::size_t r = 0; r < dependency.references.size(); ++r) {
         if (r) output << ',';
         const auto& reference = dependency.references[r];
@@ -854,7 +979,12 @@ std::string toProjectJson(const AnalysisResult& result, std::string_view plugin,
         firstDependency = false;
         output << "{\"unit\":\"" << jsonEscape(dependency.unit) << "\",\"status\":\""
                << toString(dependency.status) << "\",\"confidence\":\""
-               << toString(dependency.confidence) << "\",\"references\":[";
+               << toString(dependency.confidence) << "\",\"reasons\":[";
+        for (std::size_t reason = 0; reason < dependency.reasons.size(); ++reason) {
+          if (reason) output << ',';
+          output << '"' << jsonEscape(dependency.reasons[reason]) << '"';
+        }
+        output << "],\"references\":[";
         for (std::size_t r = 0; r < dependency.references.size(); ++r) {
           if (r) output << ',';
           const auto& reference = dependency.references[r];
@@ -919,14 +1049,48 @@ std::string toProjectJson(const AnalysisResult& result, std::string_view plugin,
     for (std::size_t a = 0; a < unit.ast.assignments.size(); ++a) {
       if (a) output << ',';
       const auto& assignment = unit.ast.assignments[a];
-      output << "{\"left\":\"" << jsonEscape(assignment.left) << "\",\"right\":\""
-             << jsonEscape(assignment.right) << "\",";
+      output << "{\"kind\":\"assignment\",\"target\":{\"text\":\""
+             << jsonEscape(assignment.left) << "\"";
+      if (!assignment.targetType.empty()) output << ",\"resolvedType\":\"" << jsonEscape(assignment.targetType) << "\"";
+      output << "},\"value\":{\"kind\":\"" << jsonEscape(assignment.valueKind.empty() ? "expression" : assignment.valueKind)
+             << "\",\"text\":\"" << jsonEscape(assignment.right) << "\"";
+      if (!assignment.resolvedReturnType.empty())
+        output << ",\"resolvedReturnType\":\"" << jsonEscape(assignment.resolvedReturnType) << "\"";
+      output << ",\"arguments\":[";
+      for (std::size_t argumentIndex = 0; argumentIndex < assignment.arguments.size(); ++argumentIndex) {
+        if (argumentIndex) output << ',';
+        const auto& argument = assignment.arguments[argumentIndex];
+        output << "{\"text\":\"" << jsonEscape(argument.text) << "\"";
+        if (!argument.resolvedType.empty()) output << ",\"resolvedType\":\"" << jsonEscape(argument.resolvedType) << "\"";
+        output << '}';
+      }
+      output << "]},";
       writePosition(output, assignment.range);
       output << '}';
     }
     output << "]}";
   }
-  output << "],\"graph\":[";
+  output << "],\"preprocessor\":{\"configuration\":\"" << jsonEscape(result.configuration)
+         << "\",\"platform\":\"" << jsonEscape(result.platform) << "\",\"defines\":[";
+  for (std::size_t i = 0; i < result.defines.size(); ++i) {
+    if (i) output << ',';
+    output << '"' << jsonEscape(result.defines[i]) << '"';
+  }
+  output << "],\"includesResolved\":[";
+  for (std::size_t i = 0; i < result.includesResolved.size(); ++i) {
+    if (i) output << ',';
+    output << '"' << jsonEscape(result.includesResolved[i].generic_string()) << '"';
+  }
+  output << "],\"inactiveRanges\":[";
+  for (std::size_t i = 0; i < result.inactiveRanges.size(); ++i) {
+    if (i) output << ',';
+    const auto& range = result.inactiveRanges[i];
+    output << "{\"file\":\"" << jsonEscape(range.file.generic_string()) << "\",\"startLine\":"
+           << range.range.begin.line << ",\"endLine\":" << range.range.end.line
+           << ",\"startOffset\":" << range.range.begin.offset << ",\"endOffset\":"
+           << range.range.end.offset << ",\"condition\":\"" << jsonEscape(range.condition) << "\"}";
+  }
+  output << "]},\"graph\":[";
   for (std::size_t i = 0; i < result.graph.size(); ++i) {
     if (i) output << ',';
     const auto& edge = result.graph[i];

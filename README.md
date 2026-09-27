@@ -10,7 +10,7 @@ The first supported analysis classifies each declared dependency as:
 | --- | --- | --- |
 | `USED` | At least one symbol resolves to the unit | Keep |
 | `UNUSED` | The complete indexed unit has no resolved references or detected side effects | Remove candidate |
-| `SIDE-EFFECT` | The unit has initialization or finalization code | Keep |
+| `USED` with side-effect reasons | The unit has initialization, finalization, or registration code | Keep |
 | `UNKNOWN` | Source, syntax, or symbol ownership is incomplete or ambiguous | Review |
 
 JDelphiAST is deliberately conservative. It recommends removal only for `UNUSED` dependencies with `HIGH` confidence. Missing source, duplicate units, unsupported directives, incomplete syntax, and ambiguous symbols never become automatic removal recommendations.
@@ -47,7 +47,7 @@ initialization
 end.
 ```
 
-Such a dependency is reported as `SIDE-EFFECT`, not `UNUSED`.
+Such a dependency is reported as `USED` with `initialization_side_effect` and registration reasons, never as `UNUSED`.
 
 ## Architecture
 
@@ -73,7 +73,8 @@ Exported symbol index          |
                 |
        +--------+---------+-------------+
        |        |         |             |
-     USED    UNUSED   SIDE-EFFECT    UNKNOWN
+          USED          UNUSED       UNKNOWN
+     symbol/side effect          incomplete
 ```
 
 The graph records the source unit, target unit, `interface` or `implementation` section, classification, reference evidence, and confidence. Cycles are exposed in the JSON result.
@@ -156,6 +157,9 @@ Analyze an entire package with one command:
 ```powershell
 DelphiAstTool.exe `
   --project "C:\plugin\ActiveUp\source\PI_ActiveUp_BackOrd\PI_ActiveUp_BackOrd.dpk" `
+  --dproj "C:\plugin\ActiveUp\source\PI_ActiveUp_BackOrd\PI_ActiveUp_BackOrd.dproj" `
+  --config Release `
+  --platform Win32 `
   --output "C:\temp\PI_ActiveUp_BackOrd.ast.json"
 ```
 
@@ -163,11 +167,12 @@ When the input is a `.dpk`, JDelphiAST:
 
 1. Reads the package `contains` clause.
 2. Looks for a sibling project file with the same base name, such as `MyPlugin.dproj`.
-3. Reads every `DCC_UnitSearchPath`, `DCC_Namespace`, and `DCC_Define` value from the project file.
-4. Resolves the package source paths relative to the `.dpk`.
-5. Follows `uses` dependencies recursively through the configured search paths.
-6. Loads the bundled `indexes/delphi-v600.jdi` reference index when available.
-7. Analyzes all discovered source units in one run.
+3. Selects compatible DPROJ property groups for the requested configuration and platform.
+4. Resolves `DCC_UnitSearchPath`, `DCC_IncludePath`, `DCC_Namespace`, and `DCC_Define` property chains.
+5. Resolves the package source paths relative to the `.dpk`.
+6. Follows active `uses` dependencies recursively through the configured search paths.
+7. Loads the bundled `indexes/delphi-v600.jdi` reference index when available.
+8. Analyzes all discovered source units in one run.
 
 Additional search paths and symbol indexes can be supplied explicitly:
 
@@ -182,8 +187,12 @@ Options can be repeated:
 
 ```text
 --search-path <directory>   Add a Delphi unit search directory
+--include-path <directory>  Add a Delphi include search directory
 --index <file.jdi>          Add a pre-generated symbol index
 --project <package.dpk>     Analyze the complete Delphi package
+--dproj <project.dproj>     Select an explicit Delphi project file
+--config <name>             Select the DPROJ configuration (default: Release)
+--platform <name>           Select the DPROJ platform (default: Win32)
 --output <file.ast.json>    Write the project AST as JSON
 --json                      Write JSON to stdout in legacy direct-file mode
 ```
@@ -220,7 +229,7 @@ System.Classes        USED          2 references
 Vcl.Forms             USED          1 references
 MyPlugin.Core         USED          7 references
 MyPlugin.Database     UNUSED        0 references
-MyPlugin.Register     SIDE-EFFECT   0 references
+MyPlugin.Register     USED          0 references  initialization_side_effect
 Vendor.Secret         UNKNOWN       0 references
 
 Recommendation:
@@ -256,6 +265,55 @@ The JSON report has a versioned top-level schema:
 
 Resolved references include half-open byte offsets and one-based line and column positions. Offsets refer to the original input bytes, including CRLF line endings, so future transformations can create minimal patches without reformatting the Delphi source.
 
+Dependency objects include structured reasons. Automation should remove a unit only when `status` is `UNUSED`, confidence is `HIGH`, and reasons are empty or contain only `no_references`. A dependency with `UNKNOWN` must never be removed automatically.
+
+```json
+{
+  "unit": "UVariStd",
+  "status": "UNKNOWN",
+  "confidence": "LOW",
+  "reasons": [
+    "unresolved_symbol: PosValue",
+    "source_unit_not_indexed: UVariStd"
+  ],
+  "references": []
+}
+```
+
+Common reason values are:
+
+| Reason | Meaning |
+| --- | --- |
+| `no_references` | Complete unit with no resolved references; eligible for removal with `UNUSED/HIGH` |
+| `source_unit_not_indexed: UnitName` | Neither source nor an index entry was found |
+| `source_unit_not_fully_indexed: UnitName` | A partial index cannot prove that the dependency is unused |
+| `unresolved_symbol: SymbolName` | Symbol ownership could not be established |
+| `ambiguous_symbol: SymbolName` | More than one visible unit exports the symbol |
+| `duplicate_unit_source: UnitName` | More than one source declares the same unit |
+| `source_parse_incomplete: UnitName` | Parsing or preprocessing did not cover the complete source |
+| `build_environment_incomplete` | DPROJ properties or macros could not be evaluated safely |
+| `initialization_side_effect` | Importing the unit executes initialization code |
+| `finalization_side_effect` | Importing the unit executes finalization code |
+| `class_registration: TypeName` | Initialization registers a class |
+| `factory_registration: InterfaceName` | Initialization registers a factory |
+| `registration_call: Name` | Initialization invokes another recognized registration routine |
+
+The project report also records the selected preprocessing environment:
+
+```json
+{
+  "preprocessor": {
+    "configuration": "Release",
+    "platform": "Win32",
+    "defines": ["MSWINDOWS", "WIN32", "RELEASE"],
+    "includesResolved": ["Source/Common/Legacy.inc"],
+    "inactiveRanges": []
+  }
+}
+```
+
+Supported conditional directives include `IFDEF`, `IFNDEF`, `IF DEFINED`, `ELSEIF`, `ELSE`, `ENDIF`, `IFEND`, `DEFINE`, `UNDEF`, `I`, and `INCLUDE`. Inactive code is replaced with whitespace while line endings and byte offsets remain unchanged. Include files containing Pascal declarations are resolved and reported, but currently make removal analysis conservative because their declarations are not inserted into the parent AST.
+
 ## Pre-generated Symbol Index
 
 `indexes/delphi-v600.jdi` contains a compact starter index for common RTL, VCL, data, XML, and WinAPI symbols. Indexed units participate in symbol resolution and side-effect protection but are not printed as analyzed package source files. The bundled entries are intentionally incomplete, so an unmatched symbol keeps the corresponding dependency `UNKNOWN` rather than producing a removal recommendation.
@@ -272,6 +330,17 @@ Company.CompleteUnit|TCompleteType|complete
 Supported flags are `initialization`, `finalization`, and `complete`. `complete` certifies that the symbol list is exhaustive and therefore allows `UNUSED`; omit it for partial indexes. Blank lines and lines beginning with `#` are ignored. More than one index can be loaded; duplicate unit names are handled conservatively as `UNKNOWN`.
 
 The bundled index is a bootstrap index, not a complete declaration database for a specific Delphi installation. Production use should generate a project-specific index from the exact RTL/VCL and third-party sources used by the compiler.
+
+Generate an index recursively from one or more source trees:
+
+```powershell
+DelphiAstTool.exe index `
+  --source "K:\V0600" `
+  --source "C:\Program Files (x86)\Embarcadero\Studio\23.0\source" `
+  --output "K:\Conv5to6\ast-index\v600-win32-release.jdi"
+```
+
+Generated indexes contain exported units and symbols, available routine signatures, and initialization/finalization flags. They remain partial unless explicitly certified as `complete`, preventing unsafe `UNUSED` conclusions.
 
 ## Library API
 
@@ -309,6 +378,12 @@ Primary public data structures are declared in `include/jdelphiast/analyzer.hpp`
 - `interface` and `implementation` uses clauses.
 - Exported interface types, constants, variables, and routines.
 - Qualified and unqualified symbol references.
+- Build-specific `IFDEF`, `IFNDEF`, `IF DEFINED`, `ELSEIF`, `ELSE`, and `ENDIF` selection.
+- Include discovery using `DCC_IncludePath` and explicit include paths.
+- Selective DPROJ evaluation for configuration and platform.
+- Automatic recursive `.jdi` index generation.
+- Structured reasons for `UNKNOWN`, `UNUSED`, and side-effect dependencies.
+- Registration detection in initialization sections.
 - Visibility checks between interface and implementation sections.
 - Comments and string literals excluded at lexer level.
 - Exact source ranges over the original input.
@@ -337,12 +412,11 @@ This release is a vertical slice, not a complete Delphi compiler frontend. It do
 - inherited member lookup;
 - complete generics, helpers, anonymous methods, and attributes;
 - semantic handling of `with`;
-- evaluation of conditional compilation branches;
-- include-file expansion;
+- full Delphi conditional expressions beyond `DEFINED` and basic negation;
+- insertion of declaration-bearing `.inc` content into the parent AST;
 - project-specific unit scope names;
 - package, DCU, DCP, and BPL metadata;
 - source encoding-aware Unicode columns;
-- persisted/versioned V600 reference indexes;
 - automatic source patch generation.
 - complete lexical-scope type inference for shadowed variables and parameters;
 - indexed/dereferenced assignment targets such as `Items[I]` and `P^`.
@@ -353,8 +427,8 @@ Unsupported or ambiguous cases must remain `UNKNOWN`. Consumers must not reinter
 
 - Complete Delphi expression and declaration AST.
 - Lexical scopes and type-aware member resolution.
-- Configurable compiler defines and include paths.
-- Persisted AST/symbol indexes for Delphi reference libraries.
+- Richer compiler-defined symbols for additional target platforms.
+- JSON symbol indexes with full class members, overloads, properties, and deprecation metadata.
 - Public API and impact analysis.
 - Strongly connected component reports for circular dependencies.
 - Minimal, idempotent edits for safe `uses` cleanup.

@@ -30,6 +30,44 @@ std::string timestamp() {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc > 1 && std::string(argv[1]) == "index") {
+    std::vector<std::filesystem::path> sources;
+    std::filesystem::path indexOutput;
+    for (int i = 2; i < argc; ++i) {
+      const std::string argument = argv[i];
+      if ((argument == "--source" || argument == "--output") && i + 1 >= argc) {
+        std::cerr << "Missing value for " << argument << '\n';
+        return 2;
+      }
+      if (argument == "--source") sources.emplace_back(argv[++i]);
+      else if (argument == "--output") indexOutput = argv[++i];
+      else { std::cerr << "Unknown index option: " << argument << '\n'; return 2; }
+    }
+    if (sources.empty() || indexOutput.empty()) {
+      std::cerr << "Usage: DelphiAstTool index --source path [--source path ...] --output index.jdi\n";
+      return 2;
+    }
+    try {
+      const auto content = jdelphiast::createSymbolIndex(sources);
+      if (!indexOutput.parent_path().empty()) std::filesystem::create_directories(indexOutput.parent_path());
+      const auto temporary = indexOutput.string() + ".tmp";
+      {
+        std::ofstream output(temporary, std::ios::binary);
+        if (!output) throw std::runtime_error("Cannot write " + temporary);
+        output << content;
+        output.flush();
+        if (!output) throw std::runtime_error("Failed writing " + temporary);
+      }
+      std::error_code error;
+      std::filesystem::remove(indexOutput, error);
+      std::filesystem::rename(temporary, indexOutput);
+      std::cout << "Wrote " << indexOutput.string() << '\n';
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << "error: " << error.what() << '\n';
+      return 2;
+    }
+  }
   bool json = false;
   int fileCount = 0;
   int sourceFileCount = 0;
@@ -43,8 +81,9 @@ int main(int argc, char** argv) {
       json = true;
       continue;
     }
-    if ((argument == "--index" || argument == "--search-path" || argument == "--project" ||
-         argument == "--output") && i + 1 >= argc) {
+    if ((argument == "--index" || argument == "--search-path" || argument == "--include-path" ||
+         argument == "--project" || argument == "--output" || argument == "--config" ||
+         argument == "--platform" || argument == "--dproj") && i + 1 >= argc) {
       std::cerr << "Missing value for " << argument << '\n';
       return 2;
     }
@@ -54,6 +93,22 @@ int main(int argc, char** argv) {
     }
     if (argument == "--search-path") {
       projectOptions.searchPaths.emplace_back(argv[++i]);
+      continue;
+    }
+    if (argument == "--include-path") {
+      projectOptions.includePaths.emplace_back(argv[++i]);
+      continue;
+    }
+    if (argument == "--config") {
+      projectOptions.configuration = argv[++i];
+      continue;
+    }
+    if (argument == "--platform") {
+      projectOptions.platform = argv[++i];
+      continue;
+    }
+    if (argument == "--dproj") {
+      projectOptions.dprojFile = argv[++i];
       continue;
     }
     if (argument == "--project") {
@@ -91,7 +146,8 @@ int main(int argc, char** argv) {
   }
   if (fileCount == 0) {
     std::cerr << "Usage: DelphiAstTool --project package.dpk --output package.ast.json "
-                 "[--index file.jdi] [--search-path dir]\n"
+                 "[--config Release] [--platform Win32] [--dproj file.dproj] "
+                 "[--index file.jdi] [--search-path dir] [--include-path dir]\n"
                  "       DelphiAstTool [--json] unit1.pas [unit2.pas ...]\n";
     return 2;
   }
