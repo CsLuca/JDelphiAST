@@ -29,6 +29,7 @@ struct ProjectLoadResult {
 [[nodiscard]] ProjectLoadResult loadPackage(const std::filesystem::path& packageFile,
                                             ProjectOptions options = {});
 [[nodiscard]] std::vector<IndexedUnit> loadSymbolIndex(const std::filesystem::path& indexFile);
+[[nodiscard]] std::vector<IndexedUnit> bundledSymbolIndex();
 [[nodiscard]] std::string createSymbolIndex(const std::vector<std::filesystem::path>& sources);
 
 }  // namespace jdelphiast

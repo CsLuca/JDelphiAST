@@ -95,5 +95,20 @@ end.)");
   const auto incomplete = jdelphiast::parseUnit("Incomplete.pas", "unit Incomplete; interface procedure P(A:");
   require(!incomplete.complete, "truncated routine declaration is incomplete without crashing");
 
+  jdelphiast::Analyzer scoped;
+  scoped.addSource("ExternalUnit.pas", "unit ExternalUnit; interface procedure Open; implementation end.");
+  scoped.addSource("Scoped.pas", R"(unit Scoped;
+interface uses ExternalUnit;
+implementation
+procedure A;
+var Open: Boolean;
+begin Open := True; end;
+procedure B;
+begin Open; end;
+end.)");
+  const auto scopedResult = scoped.analyze();
+  require(dependency(scopedResult.units[1], "ExternalUnit").status == jdelphiast::DependencyStatus::Used,
+          "a local in one routine does not hide an imported symbol in another routine");
+
   std::cout << "All tests passed\n";
 }

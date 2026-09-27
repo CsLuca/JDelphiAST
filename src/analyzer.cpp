@@ -37,7 +37,7 @@ bool isKeyword(std::string_view text) {
       "function", "goto", "if", "implementation", "in", "inherited", "initialization",
       "inline", "interface", "is", "label", "library", "mod", "nil", "not", "object",
       "of", "on", "operator", "or", "out", "packed", "procedure", "program", "property",
-      "raise", "record", "repeat", "resourcestring", "set", "shl", "shr", "string",
+      "private", "protected", "public", "published", "raise", "record", "repeat", "resourcestring", "set", "shl", "shr", "string",
       "then", "threadvar", "to", "try", "type", "unit", "until", "uses", "var", "while",
       "with", "xor"};
   return words.contains(canonical(text));
@@ -250,6 +250,7 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
   bool inInitialization = false;
   std::unordered_set<std::size_t> excluded;
   std::unordered_set<std::string> ownNames;
+  std::unordered_set<std::string> lexicalNames;
   std::unordered_map<std::string, std::string> variableTypes;
   std::string currentRoutine;
 
@@ -348,6 +349,7 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
                                      {tokens[n].range.begin, tokens[n + 2].range.end}};
               declaration.parameters.push_back(parameter);
               variableTypes[canonical(parameter.name)] = parameter.type;
+              lexicalNames.insert(canonical(parameter.name));
             }
             ++n;
           }
@@ -413,6 +415,11 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
     if (tokens[i].kind == TokenKind::Identifier && tokens[i + 1].text == ":" &&
         (i == 0 || !word(tokens[i - 1], "on"))) {
       excluded.insert(i);
+      lexicalNames.insert(canonical(tokens[i].text));
+    }
+    if (word(tokens[i], "on") && tokens[i + 1].kind == TokenKind::Identifier && tokens[i + 2].text == ":") {
+      excluded.insert(i + 1);
+      lexicalNames.insert(canonical(tokens[i + 1].text));
     }
   }
 
@@ -437,11 +444,70 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
   }
   ast.complete = ast.complete && sawInterface && sawImplementation && hasTerminatingEnd;
 
+  struct LexicalScope {
+    std::size_t begin{};
+    std::size_t end{};
+    std::unordered_set<std::string> names;
+  };
+  std::vector<LexicalScope> lexicalScopes;
+  bool implementationScope = false;
+  for (std::size_t routine = 0; tokens[routine].kind != TokenKind::End; ++routine) {
+    if (word(tokens[routine], "implementation")) { implementationScope = true; continue; }
+    if (!implementationScope || !(word(tokens[routine], "procedure") || word(tokens[routine], "function") ||
+                                  word(tokens[routine], "constructor") || word(tokens[routine], "destructor"))) continue;
+    std::size_t end = routine + 1;
+    while (tokens[end].kind != TokenKind::End && !word(tokens[end], "initialization") &&
+           !word(tokens[end], "finalization") &&
+           !(end > routine + 1 && (word(tokens[end], "procedure") || word(tokens[end], "function") ||
+                                   word(tokens[end], "constructor") || word(tokens[end], "destructor")))) ++end;
+    LexicalScope scope{tokens[routine].range.begin.offset, tokens[end].range.begin.offset, {}};
+    std::size_t headerEnd = routine;
+    while (tokens[headerEnd].kind != TokenKind::End && tokens[headerEnd].text != ";") ++headerEnd;
+    for (std::size_t n = routine + 1; n < headerEnd; ++n) {
+      if (tokens[n].text != ":") continue;
+      std::size_t first = n;
+      while (first > routine + 1 && (tokens[first - 1].kind == TokenKind::Identifier || tokens[first - 1].text == ",")) --first;
+      for (auto name = first; name < n; ++name)
+        if (tokens[name].kind == TokenKind::Identifier && !isKeyword(tokens[name].text))
+          scope.names.insert(canonical(tokens[name].text));
+    }
+    bool inVars = false;
+    for (std::size_t n = headerEnd + 1; n < end; ++n) {
+      if (word(tokens[n], "var") || word(tokens[n], "threadvar")) { inVars = true; continue; }
+      if (word(tokens[n], "begin")) inVars = false;
+      if (inVars && tokens[n].text == ":") {
+        std::size_t first = n;
+        while (first > headerEnd + 1 && (tokens[first - 1].kind == TokenKind::Identifier || tokens[first - 1].text == ",")) --first;
+        for (auto name = first; name < n; ++name)
+          if (tokens[name].kind == TokenKind::Identifier && !isKeyword(tokens[name].text))
+            scope.names.insert(canonical(tokens[name].text));
+      }
+      if (word(tokens[n], "on") && tokens[n + 1].kind == TokenKind::Identifier && tokens[n + 2].text == ":")
+        scope.names.insert(canonical(tokens[n + 1].text));
+    }
+    lexicalScopes.push_back(std::move(scope));
+  }
+
+  for (i = 0; tokens[i].kind != TokenKind::End; ++i) {
+    const auto scope = std::find_if(lexicalScopes.begin(), lexicalScopes.end(), [&](const LexicalScope& candidate) {
+      return tokens[i].range.begin.offset >= candidate.begin && tokens[i].range.begin.offset < candidate.end;
+    });
+    if (scope == lexicalScopes.end() || !scope->names.contains(canonical(tokens[i].text))) continue;
+    excluded.insert(i);
+    std::size_t n = i + 1;
+    while (tokens[n].text == "." && tokens[n + 1].kind == TokenKind::Identifier) {
+      excluded.insert(n + 1);
+      n += 2;
+    }
+  }
+
   section = UsesSection::Interface;
   for (i = 0; tokens[i].kind != TokenKind::End; ++i) {
     if (word(tokens[i], "implementation")) section = UsesSection::Implementation;
     if (tokens[i].kind != TokenKind::Identifier || excluded.contains(i) || isKeyword(tokens[i].text)) continue;
     if (ownNames.contains(canonical(tokens[i].text))) continue;
+    // Scope-aware suppression is intentionally deferred; global suppression could hide a
+    // same-named imported symbol used by another routine and create an unsafe removal.
     std::size_t end = i + 1;
     std::string name = tokens[i].text;
     SourceRange range = tokens[i].range;
@@ -633,6 +699,7 @@ UnitAst parseUnit(std::filesystem::path path, const std::string& source) {
 
 AnalysisResult Analyzer::analyze() const {
   AnalysisResult result;
+  result.preprocessorComplete = environmentComplete_;
   result.configuration = configuration_;
   result.platform = platform_;
   result.defines = defines_;
@@ -650,9 +717,13 @@ AnalysisResult Analyzer::analyze() const {
                                    preprocessed.includesResolved.end());
     result.inactiveRanges.insert(result.inactiveRanges.end(), preprocessed.inactiveRanges.begin(),
                                  preprocessed.inactiveRanges.end());
+    result.preprocessorComplete = result.preprocessorComplete && preprocessed.complete;
     result.units.push_back({std::move(ast), {}});
   }
+  std::unordered_set<std::string> sourceUnitNames;
+  for (const auto& unit : result.units) sourceUnitNames.insert(canonical(unit.ast.name));
   for (const auto& indexed : indexedUnits_) {
+    if (sourceUnitNames.contains(canonical(indexed.name))) continue;
     UnitAst ast;
     ast.name = indexed.name;
     ast.file = "<index>";
@@ -1070,7 +1141,8 @@ std::string toProjectJson(const AnalysisResult& result, std::string_view plugin,
     }
     output << "]}";
   }
-  output << "],\"preprocessor\":{\"configuration\":\"" << jsonEscape(result.configuration)
+  output << "],\"preprocessor\":{\"complete\":" << (result.preprocessorComplete ? "true" : "false")
+         << ",\"configuration\":\"" << jsonEscape(result.configuration)
          << "\",\"platform\":\"" << jsonEscape(result.platform) << "\",\"defines\":[";
   for (std::size_t i = 0; i < result.defines.size(); ++i) {
     if (i) output << ',';
@@ -1089,6 +1161,62 @@ std::string toProjectJson(const AnalysisResult& result, std::string_view plugin,
            << range.range.begin.line << ",\"endLine\":" << range.range.end.line
            << ",\"startOffset\":" << range.range.begin.offset << ",\"endOffset\":"
            << range.range.end.offset << ",\"condition\":\"" << jsonEscape(range.condition) << "\"}";
+  }
+  output << "]},\"recommendations\":{\"safeRemoveUses\":[";
+  bool firstSafe = true;
+  for (const auto& unit : result.units) {
+    if (unit.ast.indexOnly) continue;
+    std::error_code error;
+    auto relative = std::filesystem::relative(unit.ast.file, sourceRoot, error);
+    if (error) relative = unit.ast.file.filename();
+    for (const auto& dependency : unit.dependencies) {
+      const auto safe = dependency.status == DependencyStatus::Unused &&
+                        dependency.confidence == Confidence::High &&
+                        dependency.reasons.size() == 1 && dependency.reasons.front() == "no_references";
+      if (!safe) continue;
+      if (!firstSafe) output << ',';
+      firstSafe = false;
+      output << "{\"file\":\"" << jsonEscape(relative.generic_string()) << "\",\"unit\":\""
+             << jsonEscape(dependency.unit) << "\",\"section\":\""
+             << (dependency.section == UsesSection::Interface ? "interface" : "implementation")
+             << "\",\"reason\":\"no_references\"}";
+    }
+  }
+  output << "],\"blockedRemovals\":[";
+  bool firstBlocked = true;
+  for (const auto& unit : result.units) {
+    if (unit.ast.indexOnly) continue;
+    std::error_code error;
+    auto relative = std::filesystem::relative(unit.ast.file, sourceRoot, error);
+    if (error) relative = unit.ast.file.filename();
+    for (const auto& dependency : unit.dependencies) {
+      const auto safe = dependency.status == DependencyStatus::Unused &&
+                        dependency.confidence == Confidence::High &&
+                        dependency.reasons.size() == 1 && dependency.reasons.front() == "no_references";
+      if (safe) continue;
+      if (!firstBlocked) output << ',';
+      firstBlocked = false;
+      output << "{\"file\":\"" << jsonEscape(relative.generic_string()) << "\",\"unit\":\""
+             << jsonEscape(dependency.unit) << "\",\"section\":\""
+             << (dependency.section == UsesSection::Interface ? "interface" : "implementation")
+             << "\",\"status\":\"" << toString(dependency.status) << "\",\"reasons\":[";
+      bool firstReason = true;
+      if (!dependency.references.empty()) {
+        output << "\"references: ";
+        for (std::size_t r = 0; r < dependency.references.size(); ++r) {
+          if (r) output << ", ";
+          output << jsonEscape(dependency.references[r].name);
+        }
+        output << '"';
+        firstReason = false;
+      }
+      for (const auto& reason : dependency.reasons) {
+        if (!firstReason) output << ',';
+        firstReason = false;
+        output << '"' << jsonEscape(reason) << '"';
+      }
+      output << "]}";
+    }
   }
   output << "]},\"graph\":[";
   for (std::size_t i = 0; i < result.graph.size(); ++i) {

@@ -1,13 +1,27 @@
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <PropertyGroup>
+    <Base>True</Base>
     <DCC_UnitSearchPath>$(PROJECTDIR)\shared</DCC_UnitSearchPath>
     <DCC_Namespace>System;Vcl</DCC_Namespace>
     <DCC_Define>PACKAGE_TEST</DCC_Define>
   </PropertyGroup>
-  <PropertyGroup Condition="'$(Config)'=='Debug'">
+  <PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''">
+    <Base>true</Base>
+  </PropertyGroup>
+  <PropertyGroup Condition="('$(Platform)'=='Win32' and '$(Base)'=='true') or '$(Base_Win32)'!=''">
+    <Base_Win32>true</Base_Win32>
+    <Base>true</Base>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Debug' or '$(Cfg_1)'!=''">
+    <Cfg_1>true</Cfg_1>
     <DCC_Define>DEBUG;$(DCC_Define)</DCC_Define>
   </PropertyGroup>
-  <PropertyGroup Condition="'$(Config)'=='Release' and '$(Platform)'=='Win32'">
-    <DCC_Define>RELEASE;WIN32;$(DCC_Define)</DCC_Define>
+  <PropertyGroup Condition="'$(Config)'=='Release' or '$(Cfg_2)'!=''">
+    <Cfg_2>true</Cfg_2>
+    <DCC_Define>RELEASE;$(DCC_Define)</DCC_Define>
+  </PropertyGroup>
+  <PropertyGroup Condition="('$(Platform)'=='Win32' and '$(Cfg_2)'=='true') or '$(Cfg_2_Win32)'!=''">
+    <Cfg_2_Win32>true</Cfg_2_Win32>
+    <DCC_Define>WIN32;$(DCC_Define)</DCC_Define>
   </PropertyGroup>
 </Project>

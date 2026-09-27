@@ -207,6 +207,12 @@ struct Processor {
         else if ((command == "I" || command == "INCLUDE") && active && !argument.empty() && argument != "+" && argument != "-") {
           if (argument.size() >= 2 && argument.front() == '\'' && argument.back() == '\'') argument = argument.substr(1, argument.size() - 2);
           processInclude(local, file, argument, depth);
+        } else if (command == "R" || command == "RESOURCE" || command == "WARN" || command == "HINTS" ||
+                   command == "WARNINGS" || command == "APPTYPE" || command == "ALIGN" ||
+                   command == "MINENUMSIZE" || command == "R+" || command == "R-" ||
+                   command == "Q+" || command == "Q-" || command == "O+" || command == "O-" ||
+                   command == "I+" || command == "I-" || command == "T+" || command == "T-") {
+          // Compiler/resource switches do not select active source ranges.
         } else if (command != "DEFINE" && command != "UNDEF" && command != "I") {
           local.complete = false;
           local.reasons.push_back("unsupported_directive: " + command);

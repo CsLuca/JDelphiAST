@@ -15,6 +15,8 @@ The first supported analysis classifies each declared dependency as:
 
 JDelphiAST is deliberately conservative. It recommends removal only for `UNUSED` dependencies with `HIGH` confidence. Missing source, duplicate units, unsupported directives, incomplete syntax, and ambiguous symbols never become automatic removal recommendations.
 
+For OneClick automation, consume `recommendations.safeRemoveUses` rather than deriving removal decisions from the complete AST. The analyzer emits every non-safe dependency under `recommendations.blockedRemovals` with references and structured reasons.
+
 ## Why AST Analysis
 
 A textual search for `System.SysUtils.` cannot detect normal unqualified Delphi references:
@@ -199,6 +201,8 @@ Options can be repeated:
 
 Unknown DPROJ macros and unresolved source paths are emitted as warnings. A missing source unit remains `UNKNOWN` unless a loaded symbol index supplies it.
 
+The DPROJ evaluator supports the standard Embarcadero configuration chain, including `Base`, `Base_Win32`, `Base_Win64`, `Cfg_1`, `Cfg_2`, and platform-specific `Cfg_N_<Platform>` properties. Conditions support nested parentheses, `and`, `or`, `==`, and `!=`; property groups and individual property conditions are evaluated in document order.
+
 ### Analyze Source Files Directly
 
 Pass the unit to analyze together with all available source units needed to build the symbol index:
@@ -303,6 +307,7 @@ The project report also records the selected preprocessing environment:
 ```json
 {
   "preprocessor": {
+    "complete": true,
     "configuration": "Release",
     "platform": "Win32",
     "defines": ["MSWINDOWS", "WIN32", "RELEASE"],
@@ -312,11 +317,42 @@ The project report also records the selected preprocessing environment:
 }
 ```
 
+The report contains an automation-oriented decision summary:
+
+```json
+{
+  "recommendations": {
+    "safeRemoveUses": [
+      {
+        "file": "UPlugin.pas",
+        "unit": "OLEDBComponents",
+        "section": "implementation",
+        "reason": "no_references"
+      }
+    ],
+    "blockedRemovals": [
+      {
+        "file": "FViewBO.pas",
+        "unit": "CSMail",
+        "status": "USED",
+        "reasons": ["references: TCSMail, SendMail"]
+      }
+    ]
+  }
+}
+```
+
+`safeRemoveUses` contains only dependencies satisfying all three conditions: `UNUSED`, `HIGH` confidence, and exactly `no_references`. Every other dependency is emitted under `blockedRemovals`.
+
 Supported conditional directives include `IFDEF`, `IFNDEF`, `IF DEFINED`, `ELSEIF`, `ELSE`, `ENDIF`, `IFEND`, `DEFINE`, `UNDEF`, `I`, and `INCLUDE`. Inactive code is replaced with whitespace while line endings and byte offsets remain unchanged. Include files containing Pascal declarations are resolved and reported, but currently make removal analysis conservative because their declarations are not inserted into the parent AST.
 
 ## Pre-generated Symbol Index
 
 `indexes/delphi-v600.jdi` contains a compact starter index for common RTL, VCL, data, XML, and WinAPI symbols. Indexed units participate in symbol resolution and side-effect protection but are not printed as analyzed package source files. The bundled entries are intentionally incomplete, so an unmatched symbol keeps the corresponding dependency `UNKNOWN` rather than producing a removal recommendation.
+
+The bootstrap index is also embedded in `DelphiAstTool.exe`. Therefore core entries remain available if the executable is copied without the adjacent `indexes` directory. An external index with the same unit name takes precedence over the embedded entry.
+
+The embedded V600 catalog includes common symbols from `System.SysUtils`, `System.Classes`, `System.Variants`, `System.Types`, `Vcl.Forms`, `Vcl.Controls`, `Vcl.Dialogs`, `Winapi.Windows`, `CSCore.Types`, `CSResources.Globals`, `RSql`, `UCoreDB`, and `CSCore.Note.Utils`.
 
 The line-oriented format is intentionally simple and version-control friendly:
 
@@ -381,6 +417,7 @@ Primary public data structures are declared in `include/jdelphiast/analyzer.hpp`
 - Build-specific `IFDEF`, `IFNDEF`, `IF DEFINED`, `ELSEIF`, `ELSE`, and `ENDIF` selection.
 - Include discovery using `DCC_IncludePath` and explicit include paths.
 - Selective DPROJ evaluation for configuration and platform.
+- Parenthesized DPROJ conditions with `and`, `or`, `==`, `!=`, and chained `Base`/`Cfg_N` properties.
 - Automatic recursive `.jdi` index generation.
 - Structured reasons for `UNKNOWN`, `UNUSED`, and side-effect dependencies.
 - Registration detection in initialization sections.

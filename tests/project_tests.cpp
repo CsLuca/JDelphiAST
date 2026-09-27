@@ -51,13 +51,17 @@ contains
   MainUnit in 'src\MainUnit.pas';
 end.)");
   write(root / "Demo.dproj", R"(<Project><PropertyGroup>
+<Base>True</Base>
 <DCC_UnitSearchPath>$(PROJECTDIR)\shared</DCC_UnitSearchPath>
 <DCC_IncludePath>$(PROJECTDIR)\include</DCC_IncludePath>
 <DCC_Namespace>System;Vcl</DCC_Namespace>
 <DCC_Define>PLUGIN</DCC_Define>
 </PropertyGroup>
-<PropertyGroup Condition="'$(Config)'=='Debug'"><DCC_Define>DEBUG;$(DCC_Define)</DCC_Define></PropertyGroup>
-<PropertyGroup Condition="'$(Config)'=='Release' and '$(Platform)'=='Win32'"><DCC_Define>RELEASE;WIN32;$(DCC_Define)</DCC_Define></PropertyGroup>
+<PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''"><Base>true</Base></PropertyGroup>
+<PropertyGroup Condition="('$(Platform)'=='Win32' and '$(Base)'=='true') or '$(Base_Win32)'!=''"><Base_Win32>true</Base_Win32><Base>true</Base></PropertyGroup>
+<PropertyGroup Condition="'$(Config)'=='Debug' or '$(Cfg_1)'!=''"><Cfg_1>true</Cfg_1><DCC_Define>DEBUG;$(DCC_Define)</DCC_Define></PropertyGroup>
+<PropertyGroup Condition="'$(Config)'=='Release' or '$(Cfg_2)'!=''"><Cfg_2>true</Cfg_2><DCC_Define>RELEASE;$(DCC_Define)</DCC_Define></PropertyGroup>
+<PropertyGroup Condition="('$(Platform)'=='Win32' and '$(Cfg_2)'=='true') or '$(Cfg_2_Win32)'!=''"><Cfg_2_Win32>true</Cfg_2_Win32><DCC_Define>WIN32;$(DCC_Define)</DCC_Define></PropertyGroup>
 </Project>)");
   write(sourceDir / "MainUnit.pas", R"(unit MainUnit;
 interface
@@ -89,6 +93,7 @@ end.)");
   jdelphiast::ProjectOptions options;
   options.indexFiles.push_back(root / "rtl.jdi");
   const auto loaded = jdelphiast::loadPackage(root / "Demo.dpk", options);
+  require(loaded.diagnostics.empty(), "realistic Release Win32 DPROJ conditions are fully evaluated");
   require(loaded.sourceFiles.size() == 2, "DPK and DPROJ discover package sources recursively");
   require(loaded.options.defines.size() == 5, "Release Win32 and predefined compiler symbols are loaded");
   require(std::find(loaded.options.defines.begin(), loaded.options.defines.end(), "DEBUG") == loaded.options.defines.end(),
@@ -116,8 +121,14 @@ end.)");
   require(json.find("\"calls\":[") != std::string::npos, "project JSON contains calls");
   require(json.find("\"assignments\":[") != std::string::npos, "project JSON contains assignments");
   require(json.find("\"reasons\":[") != std::string::npos, "dependency reasons are serialized");
-  require(json.find("\"preprocessor\":{\"configuration\":\"Release\",\"platform\":\"Win32\"") != std::string::npos,
+  require(json.find("\"configuration\":\"Release\",\"platform\":\"Win32\"") != std::string::npos,
           "selected build context is serialized");
+  require(json.find("\"preprocessor\":{\"complete\":true") != std::string::npos,
+          "preprocessor completeness is serialized");
+  require(json.find("\"recommendations\":{\"safeRemoveUses\":[") != std::string::npos,
+          "automation recommendations are serialized");
+  require(json.find("\"blockedRemovals\":[") != std::string::npos,
+          "blocked removals are serialized");
 
   const auto generatedIndex = jdelphiast::createSymbolIndex({sharedDir});
   require(generatedIndex.find("SharedUnit|") != std::string::npos, "automatic index contains unit");
@@ -131,6 +142,19 @@ end.)");
   for (const auto& declaration : roundTrip.front().declarations)
     if (declaration.name == "MakeValue" && declaration.type == "string") foundStringReturn = true;
   require(foundStringReturn, "index preserves function return type");
+  const auto bundled = jdelphiast::bundledSymbolIndex();
+  const auto hasBundledUnit = [&](const std::string& name) {
+    return std::any_of(bundled.begin(), bundled.end(), [&](const auto& item) { return item.name == name; });
+  };
+  require(hasBundledUnit("System.SysUtils") && hasBundledUnit("Winapi.Windows") &&
+              hasBundledUnit("CSCore.Types") && hasBundledUnit("CSCore.Note.Utils"),
+          "embedded index provides RTL WinAPI and V600 units without external files");
+  const auto noteUnit = std::find_if(bundled.begin(), bundled.end(), [](const auto& item) {
+    return item.name == "CSCore.Note.Utils";
+  });
+  require(noteUnit != bundled.end() && !noteUnit->declarations.empty() &&
+              noteUnit->declarations.front().type == "Integer",
+          "embedded V600 declarations preserve return types");
 
   std::filesystem::remove_all(root);
   std::cout << "All project tests passed\n";

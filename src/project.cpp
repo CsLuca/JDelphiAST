@@ -103,12 +103,11 @@ std::string expandProperties(std::string value, const std::unordered_map<std::st
     const auto end = value.find(')', begin + 2);
     if (end == std::string::npos) break;
     const auto name = lower(value.substr(begin + 2, end - begin - 2));
-    const auto found = properties.find(name);
-    if (found == properties.end()) {
-      if (!unknownAsEmpty) {
-        diagnostics.push_back("Unresolved MSBuild property $(" + name + ")");
-        return value;
-      }
+      const auto found = properties.find(name);
+      if (found == properties.end()) {
+        if (!unknownAsEmpty) {
+          return value;
+        }
       value.replace(begin, end - begin + 1, "");
     } else value.replace(begin, end - begin + 1, found->second);
   }
@@ -116,68 +115,129 @@ std::string expandProperties(std::string value, const std::unordered_map<std::st
   return value;
 }
 
-bool evaluateComparison(std::string expression, const std::unordered_map<std::string, std::string>& properties,
-                        bool& known, std::vector<std::string>& diagnostics) {
-  expression = trim(expression);
-  while (expression.size() >= 2 && expression.front() == '(' && expression.back() == ')')
-    expression = trim(expression.substr(1, expression.size() - 2));
-  std::size_t macro = 0;
-  while ((macro = expression.find("$(", macro)) != std::string::npos) {
-    const auto end = expression.find(')', macro + 2);
-    if (end == std::string::npos || !properties.contains(lower(expression.substr(macro + 2, end - macro - 2)))) {
-      known = false;
-      return false;
-    }
-    macro = end + 1;
-  }
-  expression = trim(expandProperties(std::move(expression), properties, false, diagnostics));
-  const auto equal = expression.find("==");
-  const auto unequal = expression.find("!=");
-  const auto op = equal != std::string::npos ? equal : unequal;
-  if (op == std::string::npos) { known = false; return false; }
-  auto left = trim(expression.substr(0, op));
-  auto right = trim(expression.substr(op + 2));
-  const auto unquote = [](std::string value) {
-    if (value.size() >= 2 && ((value.front() == '\'' && value.back() == '\'') ||
-                              (value.front() == '"' && value.back() == '"')))
-      return value.substr(1, value.size() - 2);
-    return value;
-  };
-  left = unquote(left);
-  right = unquote(right);
-  known = true;
-  const auto same = lower(left) == lower(right);
-  return equal != std::string::npos ? same : !same;
-}
+class ConditionParser {
+ public:
+  ConditionParser(std::string_view input, const std::unordered_map<std::string, std::string>& properties)
+      : input_(input), properties_(properties) {}
 
-bool evaluateCondition(std::string condition, const std::unordered_map<std::string, std::string>& properties,
-                       bool& known, std::vector<std::string>& diagnostics) {
-  condition = trim(condition);
-  if (condition.empty()) { known = true; return true; }
-  const auto lowerCondition = lower(condition);
-  const auto orAt = lowerCondition.find(" or ");
-  if (orAt != std::string::npos) {
-    bool leftKnown = true, rightKnown = true;
-    const auto left = evaluateCondition(condition.substr(0, orAt), properties, leftKnown, diagnostics);
-    const auto right = evaluateCondition(condition.substr(orAt + 4), properties, rightKnown, diagnostics);
-    known = leftKnown && rightKnown;
-    return left || right;
+  bool parse(bool& known) {
+    known = true;
+    skipSpaces();
+    if (atEnd()) return true;
+    const auto value = parseOr(known);
+    skipSpaces();
+    if (!atEnd()) known = false;
+    return value;
   }
-  const auto andAt = lowerCondition.find(" and ");
-  if (andAt != std::string::npos) {
-    bool leftKnown = true, rightKnown = true;
-    const auto left = evaluateCondition(condition.substr(0, andAt), properties, leftKnown, diagnostics);
-    const auto right = evaluateCondition(condition.substr(andAt + 5), properties, rightKnown, diagnostics);
-    known = leftKnown && rightKnown;
-    return left && right;
+
+ private:
+  bool parseOr(bool& known) {
+    auto value = parseAnd(known);
+    while (known && consumeWord("or")) value = parseAnd(known) || value;
+    return value;
   }
-  return evaluateComparison(condition, properties, known, diagnostics);
+
+  bool parseAnd(bool& known) {
+    auto value = parsePrimary(known);
+    while (known && consumeWord("and")) value = parsePrimary(known) && value;
+    return value;
+  }
+
+  bool parsePrimary(bool& known) {
+    skipSpaces();
+    if (consume('(')) {
+      const auto value = parseOr(known);
+      if (!consume(')')) known = false;
+      return value;
+    }
+    const auto left = parseOperand(known);
+    if (!known) return false;
+    skipSpaces();
+    const bool equal = consumeText("==");
+    const bool unequal = !equal && consumeText("!=");
+    if (!equal && !unequal) { known = false; return false; }
+    const auto right = parseOperand(known);
+    const auto same = lower(left) == lower(right);
+    return equal ? same : !same;
+  }
+
+  std::string parseOperand(bool& known) {
+    skipSpaces();
+    if (atEnd()) { known = false; return {}; }
+    if (input_[position_] == '\'' || input_[position_] == '"') {
+      const auto quote = input_[position_++];
+      std::string value;
+      while (!atEnd() && input_[position_] != quote) value += input_[position_++];
+      if (!consume(quote)) known = false;
+      return expand(value);
+    }
+    const auto start = position_;
+    while (!atEnd() && !std::isspace(static_cast<unsigned char>(input_[position_])) &&
+           input_[position_] != ')' && input_[position_] != '=' && input_[position_] != '!') ++position_;
+    return expand(std::string(input_.substr(start, position_ - start)));
+  }
+
+  std::string expand(std::string value) const {
+    std::size_t at = 0;
+    while ((at = value.find("$(", at)) != std::string::npos) {
+      const auto end = value.find(')', at + 2);
+      if (end == std::string::npos) return value;
+      const auto found = properties_.find(lower(value.substr(at + 2, end - at - 2)));
+      const auto replacement = found == properties_.end() ? std::string{} : found->second;
+      value.replace(at, end - at + 1, replacement);
+      at += replacement.size();
+    }
+    return value;
+  }
+
+  bool consumeWord(std::string_view word) {
+    skipSpaces();
+    if (position_ + word.size() > input_.size() ||
+        lower(std::string(input_.substr(position_, word.size()))) != word) return false;
+    const auto end = position_ + word.size();
+    if (end < input_.size() && std::isalnum(static_cast<unsigned char>(input_[end]))) return false;
+    position_ = end;
+    return true;
+  }
+
+  bool consumeText(std::string_view text) {
+    skipSpaces();
+    if (input_.substr(position_, text.size()) != text) return false;
+    position_ += text.size();
+    return true;
+  }
+
+  bool consume(char value) {
+    skipSpaces();
+    if (atEnd() || input_[position_] != value) return false;
+    ++position_;
+    return true;
+  }
+
+  void skipSpaces() {
+    while (!atEnd() && std::isspace(static_cast<unsigned char>(input_[position_]))) ++position_;
+  }
+  bool atEnd() const { return position_ >= input_.size(); }
+
+  std::string_view input_;
+  const std::unordered_map<std::string, std::string>& properties_;
+  std::size_t position_{};
+};
+
+bool evaluateCondition(const std::string& condition,
+                       const std::unordered_map<std::string, std::string>& properties,
+                       bool& known, std::vector<std::string>&) {
+  return ConditionParser(condition, properties).parse(known);
 }
 
 std::string attribute(std::string_view tag, std::string_view name) {
-  auto at = lower(std::string(tag)).find(lower(std::string(name)) + "=");
+  const auto lowered = lower(std::string(tag));
+  auto at = lowered.find(lower(std::string(name)));
   if (at == std::string::npos) return {};
-  at += name.size() + 1;
+  at += name.size();
+  while (at < tag.size() && std::isspace(static_cast<unsigned char>(tag[at]))) ++at;
+  if (at >= tag.size() || tag[at] != '=') return {};
+  ++at;
   while (at < tag.size() && std::isspace(static_cast<unsigned char>(tag[at]))) ++at;
   if (at >= tag.size() || (tag[at] != '\'' && tag[at] != '"')) return {};
   const auto quote = tag[at++];
@@ -238,9 +298,13 @@ void loadDproj(const std::filesystem::path& path, ProjectOptions& options,
         bool propertyKnown = true;
         if (evaluateCondition(attribute(tag, "Condition"), properties, propertyKnown, diagnostics)) {
           const auto key = lower(name);
-          if (key != "config" && key != "platform")
-            properties[key] = expandProperties(xmlDecode(body.substr(propertyTagEnd + 1, valueEnd - propertyTagEnd - 1)),
-                                               properties, false, diagnostics);
+          if (key != "config" && key != "platform") {
+            auto expansionProperties = properties;
+            if (!expansionProperties.contains(key)) expansionProperties[key] = "";
+            properties[key] = expandProperties(
+                xmlDecode(body.substr(propertyTagEnd + 1, valueEnd - propertyTagEnd - 1)),
+                expansionProperties, false, diagnostics);
+          }
         }
         if (!propertyKnown) diagnostics.push_back("Unsupported DPROJ property condition: " + attribute(tag, "Condition"));
         propertyAt = valueEnd + closeTag.size();
@@ -262,10 +326,14 @@ void loadDproj(const std::filesystem::path& path, ProjectOptions& options,
   addPaths("dcc_unitsearchpath", options.searchPaths);
   addPaths("dcc_includepath", options.includePaths);
   if (const auto found = properties.find("dcc_namespace"); found != properties.end()) {
+    if (found->second.find("$(") != std::string::npos)
+      diagnostics.push_back("Unresolved DPROJ macro in DCC_Namespace: " + found->second);
     const auto values = split(found->second, ';');
     options.namespaces.insert(options.namespaces.end(), values.begin(), values.end());
   }
   if (const auto found = properties.find("dcc_define"); found != properties.end()) {
+    if (found->second.find("$(") != std::string::npos)
+      diagnostics.push_back("Unresolved DPROJ macro in DCC_Define: " + found->second);
     const auto values = split(found->second, ';');
     options.defines.insert(options.defines.end(), values.begin(), values.end());
   }
@@ -429,6 +497,51 @@ std::vector<IndexedUnit> loadSymbolIndex(const std::filesystem::path& indexFile)
   return result;
 }
 
+std::vector<IndexedUnit> bundledSymbolIndex() {
+  static constexpr std::string_view data = R"(System|TObject,TClass,TInterfacedObject,IInterface,Exception,Integer,Boolean,String|
+System.SysUtils|Exception,EAbort,EConvertError,EStreamError,FreeAndNil,Format,IntToStr,StrToInt,SameText,UpperCase,LowerCase|initialization,finalization
+System.Classes|TStringList,TStrings,TStream,TFileStream,TMemoryStream,TComponent,TPersistent,TCollection,TList|initialization,finalization
+System.Types|TPoint,TRect,TSize|
+System.Variants|Variant,VarToStr,VarIsNull|initialization
+Vcl.Forms|TForm,TApplication,Application,Screen|initialization,finalization
+Vcl.Controls|TControl,TWinControl,TGraphicControl|initialization,finalization
+Vcl.Dialogs|TOpenDialog,TSaveDialog,TColorDialog,MessageDlg|initialization
+Winapi.Windows|HWND,HANDLE,DWORD,WPARAM,LPARAM,LRESULT,MessageBox|
+CSCore.Types|TParam,TCSParam,TCSDate,TCSAmount,CS_Pos_Value|
+CSResources.Globals|APPTITLE,CS_Pos_Value|initialization
+RSql|TDBExec,TQuery,TParam,ExecSql,OpenQuery|initialization
+UCoreDB|DBExec,GetConnection,StartTransaction,Commit,Rollback|initialization
+CSCore.Note.Utils|TNoteUtils,UpdateOrInsertSection,DeleteSection,AddSection||class_function,TNoteUtils.UpdateOrInsertSection,Integer,TNoteUtils.UpdateOrInsertSection;class_function,TNoteUtils.DeleteSection,Boolean,TNoteUtils.DeleteSection
+)";
+  std::vector<IndexedUnit> units;
+  std::istringstream input{std::string(data)};
+  std::string line;
+  while (std::getline(input, line)) {
+    const auto fields = splitFields(trim(line));
+    if (fields.empty() || fields[0].empty()) continue;
+    IndexedUnit unit;
+    unit.name = fields[0];
+    if (fields.size() > 1) unit.symbols = split(fields[1], ',');
+    if (fields.size() > 2) for (const auto& flag : split(fields[2], ',')) {
+      if (lower(flag) == "initialization") unit.hasInitialization = true;
+      if (lower(flag) == "finalization") unit.hasFinalization = true;
+      if (lower(flag) == "complete") unit.complete = true;
+    }
+    if (fields.size() > 3) for (const auto& encoded : split(fields[3], ';')) {
+      const auto parts = split(encoded, ',');
+      if (parts.size() < 2) continue;
+      AstDeclaration declaration;
+      declaration.kind = parts[0];
+      declaration.name = parts[1];
+      declaration.visibility = "public";
+      if (parts.size() > 2) declaration.type = parts[2];
+      unit.declarations.push_back(std::move(declaration));
+    }
+    units.push_back(std::move(unit));
+  }
+  return units;
+}
+
 std::string createSymbolIndex(const std::vector<std::filesystem::path>& sources) {
   std::vector<std::filesystem::path> files;
   for (const auto& source : sources) {
@@ -531,15 +644,29 @@ ProjectLoadResult loadPackage(const std::filesystem::path& packageFile, ProjectO
   result.analyzer.setPreprocessor(result.options.defines, result.options.includePaths);
   result.analyzer.setBuildContext(result.options.configuration, result.options.platform);
 
-  for (const auto& index : result.options.indexFiles) {
+  std::unordered_map<std::string, IndexedUnit> mergedIndex;
+  for (auto unit : bundledSymbolIndex()) mergedIndex[lower(unit.name)] = std::move(unit);
+  for (const auto& index : result.options.indexFiles)
     for (auto unit : loadSymbolIndex(index)) {
-      for (const auto& scope : result.options.namespaces) {
-        const auto prefix = scope + ".";
-        if (lower(unit.name).starts_with(lower(prefix)))
-          result.analyzer.addUnitAlias(unit.name.substr(prefix.size()), unit.name);
+      const auto key = lower(unit.name);
+      if (auto existing = mergedIndex.find(key); existing != mergedIndex.end()) {
+        unit.hasInitialization = unit.hasInitialization || existing->second.hasInitialization;
+        unit.hasFinalization = unit.hasFinalization || existing->second.hasFinalization;
       }
-      result.analyzer.addIndexedUnit(std::move(unit));
+      mergedIndex[key] = std::move(unit);
     }
+  std::vector<std::string> indexedNames;
+  indexedNames.reserve(mergedIndex.size());
+  for (const auto& [name, unit] : mergedIndex) indexedNames.push_back(name);
+  std::sort(indexedNames.begin(), indexedNames.end());
+  for (const auto& name : indexedNames) {
+    auto unit = std::move(mergedIndex[name]);
+    for (const auto& scope : result.options.namespaces) {
+      const auto prefix = scope + ".";
+      if (lower(unit.name).starts_with(lower(prefix)))
+        result.analyzer.addUnitAlias(unit.name.substr(prefix.size()), unit.name);
+    }
+    result.analyzer.addIndexedUnit(std::move(unit));
   }
 
   const auto dpkSource = readFile(package);

@@ -4,7 +4,8 @@ interface
 
 uses
   SysUtils,
-  Demo.Shared;
+  Demo.Shared,
+  Demo.Unused;
 
 procedure Run(E: Exception);
 

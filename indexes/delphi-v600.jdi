@@ -20,3 +20,8 @@ Xml.XMLIntf|IXMLNode,IXMLDocument,IXMLNodeList
 Xml.XMLDoc|TXMLDocument,NewXMLDocument,LoadXMLDocument|initialization
 Winapi.Windows|HWND,HANDLE,DWORD,WPARAM,LPARAM,LRESULT,MessageBox
 Winapi.ActiveX|IUnknown,IDispatch,CoInitialize,CoUninitialize|initialization
+CSCore.Types|TParam,TCSParam,TCSDate,TCSAmount,CS_Pos_Value
+CSResources.Globals|APPTITLE,CS_Pos_Value|initialization
+RSql|TDBExec,TQuery,TParam,ExecSql,OpenQuery|initialization
+UCoreDB|DBExec,GetConnection,StartTransaction,Commit,Rollback|initialization
+CSCore.Note.Utils|TNoteUtils,UpdateOrInsertSection,DeleteSection,AddSection||class_function,TNoteUtils.UpdateOrInsertSection,Integer,TNoteUtils.UpdateOrInsertSection;class_function,TNoteUtils.DeleteSection,Boolean,TNoteUtils.DeleteSection

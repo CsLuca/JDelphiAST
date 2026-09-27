@@ -149,6 +149,7 @@ struct AnalysisResult {
   std::vector<std::string> defines;
   std::vector<std::filesystem::path> includesResolved;
   std::vector<InactiveRange> inactiveRanges;
+  bool preprocessorComplete{true};
 };
 
 struct IndexedUnit {
