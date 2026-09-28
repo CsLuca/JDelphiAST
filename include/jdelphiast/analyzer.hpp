@@ -47,6 +47,7 @@ struct AstParameter {
   std::string name;
   std::string type;
   SourceRange range;
+  std::string modifier;
 };
 
 struct AstDeclaration {
@@ -57,6 +58,18 @@ struct AstDeclaration {
   std::string scope;
   SourceRange range;
   std::vector<AstParameter> parameters;
+  std::string signature;
+  std::string ownerType;
+  bool overload{};
+  bool isOverride{};
+  bool deprecated{};
+};
+
+struct InheritanceRelation {
+  std::string type;
+  std::string kind;
+  std::string baseType;
+  SourceRange range;
 };
 
 struct CallArgument {
@@ -96,6 +109,7 @@ struct SymbolReference {
   UsesSection section{UsesSection::Implementation};
   ResolutionStatus status{ResolutionStatus::Unresolved};
   std::string declaringUnit;
+  std::vector<std::string> candidates;
 };
 
 struct UnitAst {
@@ -117,6 +131,8 @@ struct UnitAst {
   bool hasFinalization{};
   bool complete{true};
   bool indexOnly{};
+  std::vector<InheritanceRelation> inheritance;
+  std::string sourceIndex{"project"};
 };
 
 struct Dependency {
@@ -150,6 +166,7 @@ struct AnalysisResult {
   std::vector<std::filesystem::path> includesResolved;
   std::vector<InactiveRange> inactiveRanges;
   bool preprocessorComplete{true};
+  std::vector<std::string> diagnostics;
 };
 
 struct IndexedUnit {
@@ -159,6 +176,14 @@ struct IndexedUnit {
   bool hasInitialization{};
   bool hasFinalization{};
   bool complete{};
+  std::vector<InheritanceRelation> inheritance;
+  std::filesystem::path sourceFile;
+  std::string indexVersion{"unknown"};
+  std::string packageName;
+  std::string packageDcp;
+  std::string packageBpl;
+  std::filesystem::path sourceProject;
+  std::vector<std::string> dependencies;
 };
 
 class Analyzer {
@@ -170,6 +195,7 @@ class Analyzer {
   void setPreprocessor(std::vector<std::string> defines,
                        std::vector<std::filesystem::path> includePaths);
   void setBuildContext(std::string configuration, std::string platform);
+  void addDiagnostic(std::string diagnostic);
   [[nodiscard]] AnalysisResult analyze() const;
 
  private:
@@ -185,6 +211,7 @@ class Analyzer {
   std::vector<std::filesystem::path> includePaths_;
   std::string configuration_;
   std::string platform_;
+  std::vector<std::string> diagnostics_;
 };
 
 [[nodiscard]] UnitAst parseUnit(std::filesystem::path path, const std::string& source);

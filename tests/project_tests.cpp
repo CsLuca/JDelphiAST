@@ -83,10 +83,10 @@ end.)");
 interface
 procedure UseShared;
 type TWorker = class end;
-function MakeValue(E: Exception; S: string; B: Boolean): string;
+function MakeValue(E: Exception; const S: string; B: Boolean): string;
 implementation
 procedure UseShared; begin end;
-function MakeValue(E: Exception; S: string; B: Boolean): string; begin Result := S; end;
+function MakeValue(E: Exception; const S: string; B: Boolean): string; begin Result := S; end;
 end.)");
   write(root / "rtl.jdi", "System.SysUtils|Exception|initialization,finalization\n");
 
@@ -115,6 +115,8 @@ end.)");
   require(mainUnit.ast.assignments.size() == 2, "assignments are extracted from package units");
   const auto json = jdelphiast::toProjectJson(result, "Demo", root, "2026-09-25T22:30:00");
   require(json.find("\"plugin\":\"Demo\"") != std::string::npos, "project JSON contains plugin");
+  require(json.find("\"schemaVersion\":1,\"schema_version\":\"2.0\"") != std::string::npos,
+          "project JSON preserves legacy schema marker and adds v2 marker");
   require(json.find("\"sourceHash\":\"sha256:") != std::string::npos, "project JSON contains SHA-256");
   require(json.find("\"uses\":{\"interface\":[") != std::string::npos, "project JSON groups uses");
   require(json.find("\"declarations\":[") != std::string::npos, "project JSON contains declarations");
@@ -129,19 +131,35 @@ end.)");
           "automation recommendations are serialized");
   require(json.find("\"blockedRemovals\":[") != std::string::npos,
           "blocked removals are serialized");
+  require(json.find("\"uses\":[") != std::string::npos && json.find("\"references\":[") != std::string::npos &&
+              json.find("\"symbols\":[") != std::string::npos && json.find("\"inheritance\":[") != std::string::npos &&
+              json.find("\"dependencies\":[") != std::string::npos && json.find("\"diagnostics\":[") != std::string::npos,
+          "v2 additive report sections are serialized");
 
-  const auto generatedIndex = jdelphiast::createSymbolIndex({sharedDir});
+  const auto generatedIndex = jdelphiast::createSymbolIndex({root}, "v600");
   require(generatedIndex.find("SharedUnit|") != std::string::npos, "automatic index contains unit");
   require(generatedIndex.find("MakeValue") != std::string::npos, "automatic index contains exported symbol");
   require(generatedIndex.find(",S,") == std::string::npos && generatedIndex.find(",Enabled|") == std::string::npos,
           "routine parameters are not exported as unit symbols");
   write(root / "generated.jdi", generatedIndex);
   const auto roundTrip = jdelphiast::loadSymbolIndex(root / "generated.jdi");
-  require(!roundTrip.empty() && !roundTrip.front().declarations.empty(), "index declarations round trip");
+  require(!roundTrip.empty(), "index declarations round trip");
   bool foundStringReturn = false;
-  for (const auto& declaration : roundTrip.front().declarations)
-    if (declaration.name == "MakeValue" && declaration.type == "string") foundStringReturn = true;
+  bool foundConstModifier = false;
+  for (const auto& indexedUnit : roundTrip)
+    for (const auto& declaration : indexedUnit.declarations)
+      if (declaration.name == "MakeValue" && declaration.type == "string") {
+        foundStringReturn = true;
+        foundConstModifier = declaration.parameters.size() >= 2 && declaration.parameters[1].modifier == "const";
+      }
   require(foundStringReturn, "index preserves function return type");
+  require(foundConstModifier, "index preserves parameter modifiers");
+  const auto mainIndexed = std::find_if(roundTrip.begin(), roundTrip.end(), [](const auto& item) {
+    return item.name == "MainUnit";
+  });
+  require(mainIndexed != roundTrip.end() && mainIndexed->packageName == "Demo" &&
+              mainIndexed->packageDcp == "Demo.dcp" && mainIndexed->packageBpl == "Demo.bpl",
+          "index derives package metadata from an actual DPK");
   const auto bundled = jdelphiast::bundledSymbolIndex();
   const auto hasBundledUnit = [&](const std::string& name) {
     return std::any_of(bundled.begin(), bundled.end(), [&](const auto& item) { return item.name == name; });

@@ -1,0 +1,6 @@
+# JDelphiAST symbol index v2
+CSControls.Theme|CSGlobalTheme,TCSTheme,TCSThemeOpz,GraphicOptions,ClrFocus,ClrSplashText,ClrRequired,ClrEnabled,ClrDisabled,ClrFontEnabled,ClrFontDisabled,LoadFromRisorse||variable,CSGlobalTheme,TCSTheme,CSGlobalTheme;class,TCSTheme,,TCSTheme;class,TCSThemeOpz,,TCSThemeOpz;property,GraphicOptions,,GraphicOptions|source=K:/V0600/Core/CSApplication/CSControls/Source/CSControls.Theme.pas;version=v600
+CSResources.Globals|RegCsProc||procedure,RegCsProc,,procedure%20RegCsProc%28ASamModule%3A%20TSamMod%3B%20AName%3A%20string%3B%20AProc%3A%20TCsProcType%29|source=K:/V0600/Core/CSCore/CSResources/Source/CSResources.Globals.pas;version=v600
+FireDAC.Comp.Client|TFDParam,FindParam||function,TCSEQuery.FindParam,TFDParam,function%20TCSEQuery.FindParam%28const%20Value%3A%20string%29%3A%20TFDParam|source=K:/V0600/FireDAC/Comp/Client.pas;version=v600
+Base.Unit|TClasseBase,Create||constructor,TClasseBase.Create,,constructor%20TClasseBase.Create%28A%3A%20Integer%3B%20B%3A%20string%3B%20Ute%3A%20IUserStd%29|source=K:/V0600/Base/Unit.pas;version=v600
+UMarketing|TMarketing|||source=K:/V0600/Modules/M_Mrk/UMarketing.pas;version=v600

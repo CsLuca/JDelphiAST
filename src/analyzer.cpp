@@ -343,13 +343,27 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
         if (n < tokens.size() && tokens[n].text == "(") {
           const auto open = n++;
           while (n < tokens.size() && tokens[n].kind != TokenKind::End && tokens[n].text != ")") {
-            if (n + 2 < tokens.size() && tokens[n].kind == TokenKind::Identifier && tokens[n + 1].text == ":" &&
-                tokens[n + 2].kind == TokenKind::Identifier) {
-              AstParameter parameter{tokens[n].text, tokens[n + 2].text,
-                                     {tokens[n].range.begin, tokens[n + 2].range.end}};
-              declaration.parameters.push_back(parameter);
-              variableTypes[canonical(parameter.name)] = parameter.type;
-              lexicalNames.insert(canonical(parameter.name));
+            if (tokens[n].text == ":" && n + 1 < tokens.size() && tokens[n + 1].kind == TokenKind::Identifier) {
+              std::size_t typeIndex = n + 1;
+              SourceRange typeRange;
+              const auto parameterType = qualifiedName(tokens, typeIndex, &typeRange);
+              std::size_t groupStart = n;
+              while (groupStart > open + 1 && tokens[groupStart - 1].text != ";") --groupStart;
+              std::string modifier;
+              if (groupStart < n && (word(tokens[groupStart], "const") || word(tokens[groupStart], "var") ||
+                                     word(tokens[groupStart], "out"))) {
+                modifier = canonical(tokens[groupStart].text);
+                ++groupStart;
+              }
+              for (std::size_t parameterIndex = groupStart; parameterIndex < n; ++parameterIndex) {
+                if (tokens[parameterIndex].kind != TokenKind::Identifier || isKeyword(tokens[parameterIndex].text)) continue;
+                AstParameter parameter{tokens[parameterIndex].text, parameterType,
+                                       {tokens[parameterIndex].range.begin, typeRange.end}, modifier};
+                declaration.parameters.push_back(parameter);
+                variableTypes[canonical(parameter.name)] = parameter.type;
+                lexicalNames.insert(canonical(parameter.name));
+              }
+              n = typeIndex - 1;
             }
             ++n;
           }
@@ -361,6 +375,14 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
         if (word(tokens[i], "function") && returnColon + 1 < tokens.size() && tokens[returnColon].text == ":" &&
             tokens[returnColon + 1].kind == TokenKind::Identifier)
           declaration.type = tokens[returnColon + 1].text;
+        std::size_t directive = n;
+        while (tokens[directive].kind != TokenKind::End && directive < n + 20 &&
+               !word(tokens[directive], "begin") && !word(tokens[directive], "implementation")) {
+          if (word(tokens[directive], "overload")) declaration.overload = true;
+          if (word(tokens[directive], "override")) declaration.isOverride = true;
+          if (word(tokens[directive], "deprecated")) declaration.deprecated = true;
+          ++directive;
+        }
         ast.declarations.push_back(std::move(declaration));
       }
     }
@@ -369,7 +391,12 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
       while (tokens[n].kind != TokenKind::End && !word(tokens[n], "implementation") &&
              !word(tokens[n], "const") && !word(tokens[n], "var") && !word(tokens[n], "uses")) {
         if (tokens[n].kind == TokenKind::Identifier && tokens[n + 1].text == "=") {
-          ast.exports.push_back({tokens[n].text, "type", tokens[n].range});
+          std::string kind = "type";
+          if (word(tokens[n + 2], "class")) kind = "class";
+          else if (word(tokens[n + 2], "interface")) kind = "interface";
+          else if (word(tokens[n + 2], "record")) kind = "record";
+          else if (tokens[n + 2].text == "(") kind = "enum";
+          ast.exports.push_back({tokens[n].text, kind, tokens[n].range});
           ownNames.insert(canonical(tokens[n].text));
           excluded.insert(n);
         }
@@ -516,7 +543,7 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
       range.end = tokens[end + 1].range.end;
       end += 2;
     }
-    ast.references.push_back({std::move(name), range, section, ResolutionStatus::Unresolved, {}});
+    ast.references.push_back({std::move(name), range, section, ResolutionStatus::Unresolved, {}, {}});
     i = end - 1;
   }
 
@@ -538,10 +565,108 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
       std::size_t typeEnd = i + 2;
       SourceRange typeRange;
       const auto type = qualifiedName(tokens, typeEnd, &typeRange);
-      AstDeclaration declaration{"localVariable", tokens[i].text, "private", type,
-                                 currentRoutine, {tokens[i].range.begin, typeRange.end}, {}};
+      AstDeclaration declaration;
+      declaration.kind = "localVariable";
+      declaration.name = tokens[i].text;
+      declaration.visibility = "private";
+      declaration.type = type;
+      declaration.scope = currentRoutine;
+      declaration.range = {tokens[i].range.begin, typeRange.end};
       ast.declarations.push_back(std::move(declaration));
       variableTypes[canonical(tokens[i].text)] = type;
+    }
+  }
+
+  for (i = 0; tokens[i].kind != TokenKind::End; ++i) {
+    if (tokens[i].kind != TokenKind::Identifier || tokens[i + 1].text != "=" ||
+        !(word(tokens[i + 2], "class") || word(tokens[i + 2], "interface") || word(tokens[i + 2], "record"))) continue;
+    InheritanceRelation relation;
+    relation.type = tokens[i].text;
+    relation.kind = canonical(tokens[i + 2].text);
+    relation.range = {tokens[i].range.begin, tokens[i + 2].range.end};
+    if (tokens[i + 3].text == "(" && tokens[i + 4].kind == TokenKind::Identifier) {
+      std::size_t base = i + 4;
+      SourceRange baseRange;
+      relation.baseType = qualifiedName(tokens, base, &baseRange);
+      relation.range.end = baseRange.end;
+    }
+    ast.inheritance.push_back(std::move(relation));
+  }
+
+  for (i = 0; tokens[i].kind != TokenKind::End; ++i) {
+    if (tokens[i].kind != TokenKind::Identifier || tokens[i + 1].text != "=" ||
+        !(word(tokens[i + 2], "class") || word(tokens[i + 2], "interface") || word(tokens[i + 2], "record"))) continue;
+    const auto owner = tokens[i].text;
+    std::string visibility = "private";
+    int depth = 1;
+    for (std::size_t n = i + 3; tokens[n].kind != TokenKind::End && depth > 0; ++n) {
+      if (word(tokens[n], "class") || word(tokens[n], "record")) ++depth;
+      else if (word(tokens[n], "end")) { --depth; continue; }
+      if (depth != 1) continue;
+      if (word(tokens[n], "private") || word(tokens[n], "protected") || word(tokens[n], "public") || word(tokens[n], "published")) {
+        visibility = canonical(tokens[n].text);
+        continue;
+      }
+      if (word(tokens[n], "procedure") || word(tokens[n], "function") || word(tokens[n], "constructor") || word(tokens[n], "destructor")) {
+        if (tokens[n + 1].kind != TokenKind::Identifier) continue;
+        AstDeclaration declaration;
+        declaration.kind = canonical(tokens[n].text);
+        declaration.name = owner + "." + tokens[n + 1].text;
+        declaration.ownerType = owner;
+        declaration.visibility = visibility;
+        declaration.range = {tokens[n].range.begin, tokens[n + 1].range.end};
+        std::size_t cursor = n + 2;
+        if (tokens[cursor].text == "(") {
+          const auto open = cursor++;
+          while (tokens[cursor].kind != TokenKind::End && tokens[cursor].text != ")") {
+            if (tokens[cursor].text == ":" && cursor + 1 < tokens.size()) {
+              std::size_t typeCursor = cursor + 1;
+              SourceRange typeRange;
+              const auto parameterType = qualifiedName(tokens, typeCursor, &typeRange);
+              std::size_t groupStart = cursor;
+              while (groupStart > open + 1 && tokens[groupStart - 1].text != ";") --groupStart;
+              std::string modifier;
+              if (word(tokens[groupStart], "const") || word(tokens[groupStart], "var") || word(tokens[groupStart], "out")) {
+                modifier = canonical(tokens[groupStart].text); ++groupStart;
+              }
+              for (std::size_t p = groupStart; p < cursor; ++p)
+                if (tokens[p].kind == TokenKind::Identifier && !isKeyword(tokens[p].text))
+                  declaration.parameters.push_back({tokens[p].text, parameterType,
+                                                     {tokens[p].range.begin, typeRange.end}, modifier});
+              cursor = typeCursor - 1;
+            }
+            ++cursor;
+          }
+        }
+        if (word(tokens[n], "function") && tokens[cursor + 1].text == ":" && tokens[cursor + 2].kind == TokenKind::Identifier)
+          declaration.type = tokens[cursor + 2].text;
+        for (std::size_t d = cursor; tokens[d].kind != TokenKind::End && d < cursor + 16 && tokens[d].text != ";"; ++d) {
+          if (word(tokens[d], "overload")) declaration.overload = true;
+          if (word(tokens[d], "override")) declaration.isOverride = true;
+          if (word(tokens[d], "deprecated")) declaration.deprecated = true;
+        }
+        ast.declarations.push_back(std::move(declaration));
+        while (tokens[cursor].kind != TokenKind::End && tokens[cursor].text != ";") ++cursor;
+        n = cursor;
+      } else if (word(tokens[n], "property") && tokens[n + 1].kind == TokenKind::Identifier) {
+        AstDeclaration declaration;
+        declaration.kind = "property";
+        declaration.name = owner + "." + tokens[n + 1].text;
+        declaration.ownerType = owner;
+        declaration.visibility = visibility;
+        declaration.range = {tokens[n].range.begin, tokens[n + 1].range.end};
+        if (tokens[n + 2].text == ":" && tokens[n + 3].kind == TokenKind::Identifier) declaration.type = tokens[n + 3].text;
+        ast.declarations.push_back(std::move(declaration));
+      } else if (tokens[n].kind == TokenKind::Identifier && tokens[n + 1].text == ":" && tokens[n + 2].kind == TokenKind::Identifier) {
+        AstDeclaration declaration;
+        declaration.kind = "field";
+        declaration.name = owner + "." + tokens[n].text;
+        declaration.ownerType = owner;
+        declaration.visibility = visibility;
+        declaration.type = tokens[n + 2].text;
+        declaration.range = {tokens[n].range.begin, tokens[n + 2].range.end};
+        ast.declarations.push_back(std::move(declaration));
+      }
     }
   }
 
@@ -644,6 +769,13 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
       }
     }
   }
+  for (auto& declaration : ast.declarations) {
+    if (declaration.isOverride || declaration.name.find('.') == std::string::npos) continue;
+    const auto simple = declaration.name.substr(declaration.name.find_last_of('.') + 1);
+    declaration.isOverride = std::any_of(ast.declarations.begin(), ast.declarations.end(), [&](const AstDeclaration& candidate) {
+      return candidate.isOverride && canonical(candidate.name) == canonical(simple);
+    });
+  }
   return ast;
 }
 
@@ -693,6 +825,8 @@ void Analyzer::setBuildContext(std::string configuration, std::string platform) 
   platform_ = std::move(platform);
 }
 
+void Analyzer::addDiagnostic(std::string diagnostic) { diagnostics_.push_back(std::move(diagnostic)); }
+
 UnitAst parseUnit(std::filesystem::path path, const std::string& source) {
   return parseSource(path, source);
 }
@@ -703,6 +837,7 @@ AnalysisResult Analyzer::analyze() const {
   result.configuration = configuration_;
   result.platform = platform_;
   result.defines = defines_;
+  result.diagnostics = diagnostics_;
   result.units.reserve(inputs_.size());
   const PreprocessorOptions preprocessorOptions{defines_, includePaths_, 64};
   for (const auto& input : inputs_) {
@@ -726,11 +861,12 @@ AnalysisResult Analyzer::analyze() const {
     if (sourceUnitNames.contains(canonical(indexed.name))) continue;
     UnitAst ast;
     ast.name = indexed.name;
-    ast.file = "<index>";
+    ast.file = indexed.sourceFile.empty() ? std::filesystem::path("<index>") : indexed.sourceFile;
     ast.hasInitialization = indexed.hasInitialization;
     ast.hasFinalization = indexed.hasFinalization;
     ast.complete = indexed.complete;
     ast.indexOnly = true;
+    ast.sourceIndex = indexed.indexVersion;
     for (const auto& symbol : indexed.symbols)
       ast.exports.push_back({symbol, "indexed", {}});
     ast.declarations = indexed.declarations;
@@ -852,6 +988,7 @@ AnalysisResult Analyzer::analyze() const {
           if (visible.front() == targetIndex) dependency.references.push_back(reference);
         } else if (visible.size() > 1) {
           reference.status = ResolutionStatus::Ambiguous;
+          for (const auto candidate : visible) reference.candidates.push_back(result.units[candidate].ast.name);
           if (std::find(visible.begin(), visible.end(), targetIndex) != visible.end())
             dependency.reasons.push_back("ambiguous_symbol: " + reference.name);
         }
@@ -859,6 +996,9 @@ AnalysisResult Analyzer::analyze() const {
       if (!dependency.references.empty()) {
         dependency.status = DependencyStatus::Used;
         dependency.confidence = Confidence::High;
+        if (result.units[targetIndex].ast.sourceIndex == "v500")
+          for (const auto& reference : dependency.references)
+            dependency.reasons.push_back("legacy_unmapped_symbol:" + reference.name);
       } else if (result.units[targetIndex].ast.hasInitialization || result.units[targetIndex].ast.hasFinalization) {
         dependency.status = DependencyStatus::Used;
         dependency.confidence = Confidence::High;
@@ -964,7 +1104,7 @@ std::string toText(const AnalysisResult& result) {
 
 std::string toJson(const AnalysisResult& result) {
   std::ostringstream output;
-  output << "{\"schemaVersion\":1,\"units\":[";
+  output << "{\"schemaVersion\":1,\"schema_version\":\"2.0\",\"units\":[";
   bool firstUnit = true;
   for (const auto& unit : result.units) {
     if (unit.ast.indexOnly) continue;
@@ -997,7 +1137,7 @@ std::string toJson(const AnalysisResult& result) {
     }
     output << "]}";
   }
-  output << "],\"graph\":[";
+  output << "],\"project\":{},\"uses\":[],\"references\":[],\"symbols\":[],\"inheritance\":[],\"dependencies\":[],\"diagnostics\":[],\"graph\":[";
   for (std::size_t i = 0; i < result.graph.size(); ++i) {
     if (i) output << ',';
     const auto& edge = result.graph[i];
@@ -1027,9 +1167,12 @@ std::string toProjectJson(const AnalysisResult& result, std::string_view plugin,
            << ",\"startOffset\":" << range.begin.offset << ",\"endOffset\":" << range.end.offset;
   };
   std::ostringstream output;
-  output << "{\"schemaVersion\":1,\"plugin\":\"" << jsonEscape(plugin)
+  output << "{\"schemaVersion\":1,\"schema_version\":\"2.0\",\"plugin\":\"" << jsonEscape(plugin)
          << "\",\"sourceRoot\":\"" << jsonEscape(sourceRoot.string())
-         << "\",\"generatedAt\":\"" << jsonEscape(generatedAt) << "\",\"units\":[";
+         << "\",\"generatedAt\":\"" << jsonEscape(generatedAt)
+         << "\",\"project\":{\"name\":\"" << jsonEscape(plugin) << "\",\"source_root\":\""
+         << jsonEscape(sourceRoot.string()) << "\",\"configuration\":\"" << jsonEscape(result.configuration)
+         << "\",\"platform\":\"" << jsonEscape(result.platform) << "\"},\"units\":[";
   bool firstUnit = true;
   for (const auto& unit : result.units) {
     if (unit.ast.indexOnly) continue;
@@ -1140,6 +1283,175 @@ std::string toProjectJson(const AnalysisResult& result, std::string_view plugin,
       output << '}';
     }
     output << "]}";
+  }
+  output << "],\"uses\":[";
+  bool firstUseV2 = true;
+  for (const auto& unit : result.units) {
+    if (unit.ast.indexOnly) continue;
+    for (const auto& dependency : unit.dependencies) {
+      if (!firstUseV2) output << ',';
+      firstUseV2 = false;
+      const auto unresolvedCount = std::count_if(dependency.reasons.begin(), dependency.reasons.end(), [](const std::string& reason) {
+        return reason.starts_with("unresolved_symbol:") || reason.starts_with("legacy_unmapped_symbol:");
+      });
+      const auto indexed = std::none_of(dependency.reasons.begin(), dependency.reasons.end(), [](const std::string& reason) {
+        return reason.starts_with("source_unit_not_indexed:");
+      });
+      const auto target = std::find_if(result.units.begin(), result.units.end(), [&](const UnitAnalysis& candidate) {
+        return canonical(candidate.ast.name) == canonical(dependency.unit) ||
+               (candidate.ast.name.size() > dependency.unit.size() &&
+                canonical(candidate.ast.name).ends_with("." + canonical(dependency.unit)));
+      });
+      const auto allowed = dependency.status == DependencyStatus::Unused && dependency.confidence == Confidence::High &&
+                           dependency.reasons.size() == 1 && dependency.reasons.front() == "no_references";
+      const auto legacyUnmapped = std::find_if(dependency.reasons.begin(), dependency.reasons.end(), [](const std::string& reason) {
+        return reason.starts_with("legacy_unmapped_symbol:");
+      });
+      const auto removalStatus = legacyUnmapped == dependency.reasons.end() ? toString(dependency.status) : "USED";
+      output << "{\"file\":\"" << jsonEscape(unit.ast.file.generic_string()) << "\",\"owner_unit\":\""
+             << jsonEscape(unit.ast.name) << "\",\"unit\":\"" << jsonEscape(dependency.unit)
+             << "\",\"normalized_unit\":\"" << jsonEscape(canonical(dependency.unit))
+             << "\",\"section\":\"" << (dependency.section == UsesSection::Interface ? "interface" : "implementation")
+             << "\",\"resolved_source_path\":";
+      if (target == result.units.end() || target->ast.file == "<index>") output << "null";
+      else output << '"' << jsonEscape(target->ast.file.generic_string()) << '"';
+      output << ",\"index_status\":\""
+             << (indexed ? "indexed" : "source_unit_not_indexed") << "\",\"usage_summary\":{\"interface_references\":"
+             << (dependency.section == UsesSection::Interface ? dependency.references.size() : 0)
+             << ",\"implementation_references\":" << (dependency.section == UsesSection::Implementation ? dependency.references.size() : 0)
+             << ",\"qualified_references\":0,\"unresolved_possible_references\":" << unresolvedCount
+             << ",\"active_code_references\":" << dependency.references.size() << "},\"referenced_symbols\":[";
+      for (std::size_t r = 0; r < dependency.references.size(); ++r) {
+        if (r) output << ',';
+        const auto& reference = dependency.references[r];
+        const auto legacy = std::find(dependency.reasons.begin(), dependency.reasons.end(),
+                                      "legacy_unmapped_symbol:" + reference.name) != dependency.reasons.end();
+        output << "{\"name\":\"" << jsonEscape(reference.name) << "\",\"line\":" << reference.range.begin.line
+               << ",\"kind\":\"unknown\",\"resolved\":" << (legacy ? "false" : "true");
+        if (legacy) output << ",\"diagnostic\":\"legacy_symbol_unmapped\"";
+        output << '}';
+      }
+      if (legacyUnmapped != dependency.reasons.end()) {
+        const auto symbol = legacyUnmapped->substr(legacyUnmapped->find(':') + 1);
+        if (!dependency.references.empty()) output << ',';
+        output << "{\"name\":\"" << jsonEscape(symbol) << "\",\"line\":0,\"kind\":\"unknown\","
+                  "\"resolved\":false,\"diagnostic\":\"legacy_symbol_unmapped\"}";
+      }
+      output << "],\"removal\":{\"allowed\":" << (allowed ? "true" : "false") << ",\"status\":\""
+             << removalStatus << "\",\"confidence\":\"" << toString(dependency.confidence)
+             << "\",\"reasons\":[";
+      for (std::size_t r = 0; r < dependency.reasons.size(); ++r) { if (r) output << ','; output << '"' << jsonEscape(dependency.reasons[r]) << '"'; }
+      output << "]}}";
+    }
+  }
+  output << "],\"references\":[";
+  bool firstReferenceV2 = true;
+  for (const auto& unit : result.units) {
+    if (unit.ast.indexOnly) continue;
+    for (const auto& reference : unit.ast.references) {
+      if (!firstReferenceV2) output << ',';
+      firstReferenceV2 = false;
+      const auto resolved = reference.status == ResolutionStatus::Resolved;
+      const auto owner = std::find_if(result.units.begin(), result.units.end(), [&](const UnitAnalysis& candidate) {
+        return canonical(candidate.ast.name) == canonical(reference.declaringUnit);
+      });
+      std::string resolvedKind = "unknown";
+      if (owner != result.units.end()) {
+        auto simple = reference.name.substr(reference.name.find_last_of('.') == std::string::npos
+                                                ? 0 : reference.name.find_last_of('.') + 1);
+        const auto declaration = std::find_if(owner->ast.exports.begin(), owner->ast.exports.end(), [&](const SymbolDeclaration& symbol) {
+          return canonical(symbol.name) == canonical(simple);
+        });
+        if (declaration != owner->ast.exports.end()) resolvedKind = declaration->kind;
+      }
+      std::string usage = "type_reference";
+      if (std::any_of(unit.ast.calls.begin(), unit.ast.calls.end(), [&](const AstCall& call) {
+            return reference.range.begin.offset >= call.range.begin.offset && reference.range.begin.offset < call.range.end.offset;
+          })) usage = "invocation";
+      else if (std::any_of(unit.ast.assignments.begin(), unit.ast.assignments.end(), [&](const AstAssignment& assignment) {
+                 return reference.range.begin.offset >= assignment.range.begin.offset &&
+                        reference.range.end.offset <= assignment.range.end.offset &&
+                        reference.name == assignment.left;
+               })) usage = "write";
+      output << "{\"file\":\"" << jsonEscape(unit.ast.file.generic_string()) << "\",\"unit\":\""
+             << jsonEscape(unit.ast.name) << "\",\"line\":" << reference.range.begin.line << ",\"column\":"
+             << reference.range.begin.column << ",\"symbol\":\"" << jsonEscape(reference.name)
+             << "\",\"qualified_name\":";
+      if (resolved) output << '"' << jsonEscape(reference.declaringUnit + "." + reference.name) << '"'; else output << "null";
+      output << ",\"kind\":\"" << jsonEscape(resolvedKind) << "\",\"usage\":\"" << usage << "\",\"declared_in_unit\":";
+      if (resolved) output << '"' << jsonEscape(reference.declaringUnit) << '"'; else output << "null";
+      output << ",\"declared_in_file\":";
+      if (owner == result.units.end() || owner->ast.file == "<index>") output << "null";
+      else output << '"' << jsonEscape(owner->ast.file.generic_string()) << '"';
+      output << ",\"resolved\":" << (resolved ? "true" : "false")
+             << ",\"confidence\":\"" << (resolved ? "high" : "low") << "\",\"source_index\":\""
+             << (resolved ? (owner != result.units.end() ? owner->ast.sourceIndex : "project") : "unknown") << "\"";
+      if (!resolved) {
+        output << ",\"diagnostic\":\"" << (reference.status == ResolutionStatus::Ambiguous ? "ambiguous_symbol" : "unresolved_symbol")
+               << "\",\"candidates\":[";
+        for (std::size_t c = 0; c < reference.candidates.size(); ++c) {
+          if (c) output << ',';
+          output << '"' << jsonEscape(reference.candidates[c]) << '"';
+        }
+        output << ']';
+      }
+      output << '}';
+    }
+  }
+  output << "],\"symbols\":[";
+  bool firstSymbolV2 = true;
+  for (const auto& unit : result.units) {
+    if (unit.ast.indexOnly) continue;
+    for (const auto& declaration : unit.ast.declarations) {
+      if (!firstSymbolV2) output << ',';
+      firstSymbolV2 = false;
+      output << "{\"unit\":\"" << jsonEscape(unit.ast.name) << "\",\"file\":\""
+             << jsonEscape(unit.ast.file.generic_string()) << "\",\"name\":\"" << jsonEscape(declaration.name)
+             << "\",\"qualified_name\":\"" << jsonEscape(unit.ast.name + "." + declaration.name)
+             << "\",\"kind\":\"" << jsonEscape(declaration.kind) << "\",\"visibility\":\""
+             << jsonEscape(declaration.visibility) << "\",\"type\":";
+      if (declaration.type.empty()) output << "null"; else output << '"' << jsonEscape(declaration.type) << '"';
+      output << ",\"line\":" << declaration.range.begin.line << '}';
+    }
+  }
+  output << "],\"inheritance\":[";
+  bool firstInheritanceV2 = true;
+  for (const auto& unit : result.units) for (const auto& relation : unit.ast.inheritance) {
+    if (!firstInheritanceV2) output << ',';
+    firstInheritanceV2 = false;
+    output << "{\"unit\":\"" << jsonEscape(unit.ast.name) << "\",\"type\":\"" << jsonEscape(relation.type)
+           << "\",\"kind\":\"" << jsonEscape(relation.kind) << "\",\"base_type\":";
+    if (relation.baseType.empty()) output << "null"; else output << '"' << jsonEscape(relation.baseType) << '"';
+    output << '}';
+  }
+  output << "],\"dependencies\":[";
+  for (std::size_t i = 0; i < result.graph.size(); ++i) {
+    if (i) output << ',';
+    output << "{\"from\":\"" << jsonEscape(result.graph[i].fromUnit) << "\",\"to\":\""
+           << jsonEscape(result.graph[i].toUnit) << "\",\"section\":\""
+           << (result.graph[i].section == UsesSection::Interface ? "interface" : "implementation")
+           << "\",\"status\":\"" << toString(result.graph[i].status) << "\"}";
+  }
+  output << "],\"diagnostics\":[";
+  bool firstDiagnosticV2 = true;
+  for (const auto& diagnostic : result.diagnostics) {
+    if (!firstDiagnosticV2) output << ',';
+    firstDiagnosticV2 = false;
+    const auto code = diagnostic.find("DPROJ") != std::string::npos || diagnostic.find("MSBuild") != std::string::npos
+        ? "build_environment_incomplete" : "analysis_warning";
+    output << "{\"code\":\"" << code << "\",\"severity\":\"warning\",\"message\":\""
+           << jsonEscape(diagnostic) << "\"}";
+  }
+  for (const auto& unit : result.units) {
+    if (unit.ast.indexOnly) continue;
+    for (const auto& reference : unit.ast.references) {
+      if (reference.status != ResolutionStatus::Unresolved) continue;
+      if (!firstDiagnosticV2) output << ',';
+      firstDiagnosticV2 = false;
+      output << "{\"code\":\"unresolved_symbol\",\"severity\":\"warning\",\"message\":\"Symbol "
+             << jsonEscape(reference.name) << " could not be resolved.\",\"file\":\""
+             << jsonEscape(unit.ast.file.generic_string()) << "\",\"line\":" << reference.range.begin.line << '}';
+    }
   }
   output << "],\"preprocessor\":{\"complete\":" << (result.preprocessorComplete ? "true" : "false")
          << ",\"configuration\":\"" << jsonEscape(result.configuration)

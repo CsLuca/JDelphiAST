@@ -86,7 +86,9 @@ end.)");
           "comments and strings do not create references");
 
   jdelphiast::Analyzer unresolved;
-  unresolved.addIndexedUnit({"Known", {}, {}, false, false, false});
+  jdelphiast::IndexedUnit knownIndex;
+  knownIndex.name = "Known";
+  unresolved.addIndexedUnit(std::move(knownIndex));
   unresolved.addSource("UsesUnknown.pas", "unit UsesUnknown; interface uses Known; procedure P; implementation procedure P; begin MissingCall; end; end.");
   const auto unresolvedResult = unresolved.analyze();
   require(dependency(unresolvedResult.units[0], "Known").status == jdelphiast::DependencyStatus::Unknown,
@@ -109,6 +111,28 @@ end.)");
   const auto scopedResult = scoped.analyze();
   require(dependency(scopedResult.units[1], "ExternalUnit").status == jdelphiast::DependencyStatus::Used,
           "a local in one routine does not hide an imported symbol in another routine");
+
+  jdelphiast::Analyzer legacy;
+  jdelphiast::IndexedUnit legacyIndex;
+  legacyIndex.name = "UVariStd";
+  legacyIndex.symbols = {"ArrayCopia"};
+  legacyIndex.indexVersion = "v500";
+  legacy.addIndexedUnit(std::move(legacyIndex));
+  legacy.addSource("Legacy.pas", "unit Legacy; interface uses UVariStd; procedure P; implementation procedure P; begin ArrayCopia; end; end.");
+  const auto legacyResult = legacy.analyze();
+  require(dependency(legacyResult.units[0], "UVariStd").status == jdelphiast::DependencyStatus::Used,
+          "legacy indexed symbol marks dependency used");
+  require(std::find(dependency(legacyResult.units[0], "UVariStd").reasons.begin(),
+                    dependency(legacyResult.units[0], "UVariStd").reasons.end(),
+                    "legacy_unmapped_symbol:ArrayCopia") != dependency(legacyResult.units[0], "UVariStd").reasons.end(),
+          "legacy symbol without V600 mapping is diagnosed");
+  const auto legacyJson = jdelphiast::toProjectJson(legacyResult, "Legacy", ".", "2026-09-25T22:30:00");
+  require(legacyJson.find("\"unit\":\"UVariStd\",\"status\":\"USED\"") != std::string::npos,
+          "legacy uses keeps its existing used status");
+  require(legacyJson.find("\"diagnostic\":\"legacy_symbol_unmapped\"") != std::string::npos,
+          "legacy unmapped reference is structured in the v2 report");
+  require(legacyJson.find("\"removal\":{\"allowed\":false,\"status\":\"USED\",\"confidence\":\"HIGH\"") != std::string::npos,
+          "legacy unmapped reference blocks automatic removal");
 
   std::cout << "All tests passed\n";
 }

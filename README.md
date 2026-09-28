@@ -152,6 +152,54 @@ cmake -S . -B build -DJDELPHIAST_BUILD_TESTS=OFF
 
 ## CLI Usage
 
+Display the complete command-line reference:
+
+```powershell
+DelphiAstTool.exe /?
+```
+
+The aliases `--help` and `-h` are also supported. The built-in help documents every command, option, JSON compatibility guarantee, safe-removal rule, preprocessing behavior, persistent index behavior, and exit code.
+
+### Schema V2 Analyze
+
+The explicit `analyze` command is additive and compatible with the previous project analysis:
+
+```powershell
+DelphiAstTool.exe analyze `
+  --dproj "PI_ActiveUp_BackOrd.dproj" `
+  --config Release `
+  --platform Win32 `
+  --index "delphi-v600.jdi" `
+  --format json
+```
+
+The JSON keeps the legacy `schemaVersion`, `units`, `status`, `confidence`, and `reasons` fields and adds:
+
+```text
+schema_version: "2.0"
+project
+uses
+references
+symbols
+inheritance
+dependencies
+diagnostics
+```
+
+All v2 sections may be empty when semantic data is unavailable. Query failures are returned as stable JSON diagnostics instead of aborting the complete analysis.
+
+Existing invocations remain valid. In particular, both of these forms are supported:
+
+```powershell
+# Legacy project mode
+DelphiAstTool.exe --project Plugin.dpk --output Plugin.ast.json
+
+# Explicit v2 analyze mode; JSON is written to stdout when --output is omitted
+DelphiAstTool.exe analyze --dproj Plugin.dproj --config Release --platform Win32 --format json
+```
+
+A consumer that ignores `schema_version` and all new sections can continue reading the existing `schemaVersion`, per-unit `uses`, `status`, `confidence`, and `reasons` fields.
+
 ### Analyze A Delphi Package
 
 Analyze an entire package with one command:
@@ -377,6 +425,54 @@ DelphiAstTool.exe index `
 ```
 
 Generated indexes contain exported units and symbols, available routine signatures, and initialization/finalization flags. They remain partial unless explicitly certified as `complete`, preventing unsafe `UNUSED` conclusions.
+
+The JDI v2 format is backward compatible with earlier line-oriented indexes. Optional trailing fields persist source path, catalog version, package metadata, inheritance, dependencies, complete signatures, parameter modifiers, overloads, and override flags. Old readers continue consuming the original unit, symbols, and flags columns.
+
+Set the source catalog version while generating an index:
+
+```powershell
+DelphiAstTool.exe index --version v600 --source "K:\V0600" --output "delphi-v600.jdi"
+```
+
+### Semantic Queries
+
+All semantic query commands write structured JSON and accept `--format json`.
+
+```powershell
+DelphiAstTool.exe exports --unit CSControls.Theme --index delphi-v600.jdi --format json
+
+DelphiAstTool.exe symbol --name RegCsProc --index delphi-v600.jdi --format json
+
+DelphiAstTool.exe expression --dproj Plugin.dproj --config Release --platform Win32 `
+  --file UXPTab.pas --line 684 --index delphi-v600.jdi --format json
+
+DelphiAstTool.exe hierarchy --dproj Plugin.dproj --config Release --platform Win32 `
+  --class TOExtArtControCamp --index delphi-v600.jdi --format json
+
+DelphiAstTool.exe unit-info --unit UMarketing --index delphi-v600.jdi --format json
+
+DelphiAstTool.exe compare-symbol --left-index delphi-v500.jdi --right-index delphi-v600.jdi `
+  --symbol UCSTheme --format json
+```
+
+`expression` and `hierarchy` are conservative. They return `resolved: false`, `unknown`, or a stable diagnostic when receiver types, visibility, overloads, or inheritance cannot be proven from project source and persistent indexes.
+
+`compare-symbol` is informational. A renamed-unit candidate needs a significant overlap of exported symbols; isolated common names such as `Create` do not create a verified mapping. Signature conflicts reduce compatibility, and ambiguous data remains diagnostic rather than being selected arbitrarily.
+
+Stable diagnostic codes include:
+
+```text
+unresolved_symbol
+ambiguous_symbol
+source_unit_not_indexed
+package_metadata_not_available
+expression_type_unresolved
+inheritance_unresolved
+override_signature_incompatible
+legacy_symbol_unmapped
+index_version_mismatch
+source_file_not_found
+```
 
 ## Library API
 

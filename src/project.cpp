@@ -60,6 +60,35 @@ std::vector<std::string> splitFields(std::string_view value) {
   return result;
 }
 
+std::vector<std::string> splitPreservingEmpty(std::string_view value, char delimiter) {
+  std::vector<std::string> result;
+  std::size_t start = 0;
+  while (start <= value.size()) {
+    const auto end = value.find(delimiter, start);
+    result.push_back(trim(std::string(value.substr(start,
+        end == std::string_view::npos ? value.size() - start : end - start))));
+    if (end == std::string_view::npos) break;
+    start = end + 1;
+  }
+  return result;
+}
+
+std::string percentDecode(std::string value) {
+  const auto hex = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+  };
+  std::string result;
+  for (std::size_t i = 0; i < value.size(); ++i) {
+    if (value[i] == '%' && i + 2 < value.size() && hex(value[i + 1]) >= 0 && hex(value[i + 2]) >= 0) {
+      result += static_cast<char>((hex(value[i + 1]) << 4) | hex(value[i + 2]));
+      i += 2;
+    } else result += value[i];
+  }
+  return result;
+}
+
 std::filesystem::path delphiPath(std::string value) {
   // Forward slashes are accepted by std::filesystem on Windows and POSIX.
   std::replace(value.begin(), value.end(), '\\', '/');
@@ -456,6 +485,7 @@ std::vector<IndexedUnit> loadSymbolIndex(const std::filesystem::path& indexFile)
     if (fields.empty()) continue;
     IndexedUnit unit;
     unit.name = fields[0];
+    unit.indexVersion = "v600";
     if (fields.size() > 1) unit.symbols = split(fields[1], ',');
     if (fields.size() > 2) {
       for (const auto& flag : split(fields[2], ',')) {
@@ -465,33 +495,70 @@ std::vector<IndexedUnit> loadSymbolIndex(const std::filesystem::path& indexFile)
       }
     }
     if (fields.size() > 3) {
-      const auto decode = [](std::string value) {
-        const auto hex = [](char c) -> int {
-          if (c >= '0' && c <= '9') return c - '0';
-          c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-          return c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
-        };
-        std::string result;
-        for (std::size_t i = 0; i < value.size(); ++i) {
-          if (value[i] == '%' && i + 2 < value.size() && hex(value[i + 1]) >= 0 && hex(value[i + 2]) >= 0) {
-            result += static_cast<char>((hex(value[i + 1]) << 4) | hex(value[i + 2]));
-            i += 2;
-          } else result += value[i];
-        }
-        return result;
-      };
+      const auto decode = [](std::string value) { return percentDecode(std::move(value)); };
       for (const auto& encoded : split(fields[3], ';')) {
-        const auto parts = split(encoded, ',');
+        const auto parts = splitPreservingEmpty(encoded, ',');
         if (parts.size() >= 2) {
           AstDeclaration declaration;
           declaration.kind = decode(parts[0]);
           declaration.name = decode(parts[1]);
           declaration.visibility = "public";
           if (parts.size() >= 3) declaration.type = decode(parts[2]);
+          if (parts.size() >= 4) {
+            declaration.signature = decode(parts[3]);
+            const auto open = declaration.signature.find('(');
+            const auto close = declaration.signature.rfind(')');
+            if (open != std::string::npos && close != std::string::npos && close > open) {
+              for (auto parameterText : split(declaration.signature.substr(open + 1, close - open - 1), ';')) {
+                const auto colon = parameterText.find(':');
+                if (colon == std::string::npos) continue;
+                AstParameter parameter;
+                auto nameText = trim(parameterText.substr(0, colon));
+                const auto space = nameText.find(' ');
+                if (space != std::string::npos) {
+                  const auto possibleModifier = lower(nameText.substr(0, space));
+                  if (possibleModifier == "const" || possibleModifier == "var" || possibleModifier == "out") {
+                    parameter.modifier = possibleModifier;
+                    nameText = trim(nameText.substr(space + 1));
+                  }
+                }
+                parameter.name = nameText;
+                parameter.type = trim(parameterText.substr(colon + 1));
+                declaration.parameters.push_back(std::move(parameter));
+              }
+            }
+          }
+          if (parts.size() >= 5) declaration.overload = lower(decode(parts[4])) == "overload";
+          if (parts.size() >= 6) declaration.isOverride = lower(decode(parts[5])) == "override";
+          const auto ownerSeparator = declaration.name.find_last_of('.');
+          if (ownerSeparator != std::string::npos) declaration.ownerType = declaration.name.substr(0, ownerSeparator);
           unit.declarations.push_back(std::move(declaration));
         }
       }
     }
+    if (fields.size() > 4) {
+      const auto metadata = split(fields[4], ';');
+      for (const auto& item : metadata) {
+        const auto equal = item.find('=');
+        if (equal == std::string::npos) continue;
+        const auto key = lower(item.substr(0, equal));
+        const auto value = percentDecode(item.substr(equal + 1));
+        if (key == "source") unit.sourceFile = delphiPath(value);
+        else if (key == "version") unit.indexVersion = value;
+        else if (key == "package") unit.packageName = value;
+        else if (key == "dcp") unit.packageDcp = value;
+        else if (key == "bpl") unit.packageBpl = value;
+        else if (key == "project") unit.sourceProject = delphiPath(value);
+      }
+    }
+    if (fields.size() > 5) {
+      for (const auto& encoded : split(fields[5], ';')) {
+        const auto parts = splitPreservingEmpty(encoded, ',');
+        if (parts.size() < 3) continue;
+        unit.inheritance.push_back({parts[0], parts[1], parts[2], {}});
+      }
+    }
+    if (fields.size() > 6) unit.dependencies = split(fields[6], ',');
     result.push_back(std::move(unit));
   }
   return result;
@@ -528,13 +595,14 @@ CSCore.Note.Utils|TNoteUtils,UpdateOrInsertSection,DeleteSection,AddSection||cla
       if (lower(flag) == "complete") unit.complete = true;
     }
     if (fields.size() > 3) for (const auto& encoded : split(fields[3], ';')) {
-      const auto parts = split(encoded, ',');
+      const auto parts = splitPreservingEmpty(encoded, ',');
       if (parts.size() < 2) continue;
       AstDeclaration declaration;
       declaration.kind = parts[0];
       declaration.name = parts[1];
       declaration.visibility = "public";
       if (parts.size() > 2) declaration.type = parts[2];
+      if (parts.size() > 3) declaration.signature = parts[3];
       unit.declarations.push_back(std::move(declaration));
     }
     units.push_back(std::move(unit));
@@ -543,13 +611,21 @@ CSCore.Note.Utils|TNoteUtils,UpdateOrInsertSection,DeleteSection,AddSection||cla
 }
 
 std::string createSymbolIndex(const std::vector<std::filesystem::path>& sources) {
+  return createSymbolIndex(sources, "unknown");
+}
+
+std::string createSymbolIndex(const std::vector<std::filesystem::path>& sources,
+                              std::string_view version) {
   std::vector<std::filesystem::path> files;
+  std::vector<std::filesystem::path> packages;
   for (const auto& source : sources) {
     if (std::filesystem::is_regular_file(source)) files.push_back(source);
     else if (std::filesystem::is_directory(source)) {
       for (const auto& entry : std::filesystem::recursive_directory_iterator(source)) {
         if (!entry.is_regular_file()) continue;
-        if (lower(entry.path().extension().string()) == ".pas") files.push_back(entry.path());
+        const auto extension = lower(entry.path().extension().string());
+        if (extension == ".pas") files.push_back(entry.path());
+        else if (extension == ".dpk") packages.push_back(entry.path());
       }
     } else throw std::runtime_error("Index source not found: " + source.string());
   }
@@ -558,6 +634,16 @@ std::string createSymbolIndex(const std::vector<std::filesystem::path>& sources)
   });
   files.erase(std::unique(files.begin(), files.end()), files.end());
   std::vector<UnitAst> units;
+  struct PackageMetadata { std::string name, dcp, bpl; std::filesystem::path project; };
+  std::unordered_map<std::string, PackageMetadata> packageByFile;
+  for (const auto& package : packages) {
+    const auto packageName = package.stem().string();
+    for (auto relative : packageSources(readFile(package))) {
+      if (relative.is_relative()) relative = package.parent_path() / relative;
+      packageByFile[lower(std::filesystem::absolute(relative).lexically_normal().string())] = {
+          packageName, packageName + ".dcp", packageName + ".bpl", package};
+    }
+  }
   std::unordered_set<std::string> names;
   for (const auto& file : files) {
     auto ast = parseUnit(file, readFile(file));
@@ -579,7 +665,7 @@ std::string createSymbolIndex(const std::vector<std::filesystem::path>& sources)
     return result;
   };
   std::ostringstream output;
-  output << "# JDelphiAST symbol index v2: unit|symbols|flags|declarations\n";
+  output << "# JDelphiAST symbol index v2: unit|symbols|flags|declarations|metadata|inheritance|dependencies\n";
   for (const auto& unit : units) {
     output << unit.name << '|';
     std::unordered_set<std::string> parameterNames;
@@ -588,6 +674,12 @@ std::string createSymbolIndex(const std::vector<std::filesystem::path>& sources)
     bool firstSymbol = true;
     for (const auto& symbol : unit.exports) {
       if (parameterNames.contains(lower(symbol.name))) continue;
+      const auto classMember = std::any_of(unit.declarations.begin(), unit.declarations.end(), [&](const AstDeclaration& declaration) {
+        if (declaration.ownerType.empty()) return false;
+        const auto simple = declaration.name.substr(declaration.name.find_last_of('.') + 1);
+        return lower(simple) == lower(symbol.name);
+      });
+      if (classMember) continue;
       if (!firstSymbol) output << ',';
       firstSymbol = false;
       output << symbol.name;
@@ -597,9 +689,22 @@ std::string createSymbolIndex(const std::vector<std::filesystem::path>& sources)
     if (unit.hasInitialization) { output << "initialization"; flag = true; }
     if (unit.hasFinalization) { if (flag) output << ','; output << "finalization"; }
     output << '|';
+    auto declarations = unit.declarations;
+    for (const auto& exported : unit.exports) {
+      const auto exists = std::any_of(declarations.begin(), declarations.end(), [&](const AstDeclaration& declaration) {
+        return lower(declaration.name) == lower(exported.name);
+      });
+      if (exists || parameterNames.contains(lower(exported.name))) continue;
+      AstDeclaration declaration;
+      declaration.name = exported.name;
+      declaration.kind = exported.kind;
+      declaration.visibility = "public";
+      declaration.range = exported.range;
+      declarations.push_back(std::move(declaration));
+    }
     bool firstDeclaration = true;
-    for (const auto& declaration : unit.declarations) {
-      if (declaration.visibility != "public") continue;
+    for (const auto& declaration : declarations) {
+      if (declaration.visibility != "public" && declaration.visibility != "interface") continue;
       if (!firstDeclaration) output << ';';
       firstDeclaration = false;
       std::ostringstream signature;
@@ -608,13 +713,33 @@ std::string createSymbolIndex(const std::vector<std::filesystem::path>& sources)
         signature << '(';
         for (std::size_t p = 0; p < declaration.parameters.size(); ++p) {
           if (p) signature << "; ";
+          if (!declaration.parameters[p].modifier.empty()) signature << declaration.parameters[p].modifier << ' ';
           signature << declaration.parameters[p].name << ": " << declaration.parameters[p].type;
         }
         signature << ')';
       }
       if (!declaration.type.empty()) signature << ": " << declaration.type;
       output << encode(declaration.kind) << ',' << encode(declaration.name) << ','
-             << encode(declaration.type) << ',' << encode(signature.str());
+             << encode(declaration.type) << ',' << encode(signature.str()) << ','
+             << (declaration.overload ? "overload" : "") << ','
+             << (declaration.isOverride ? "override" : "");
+    }
+    output << "|source=" << encode(unit.file.generic_string()) << ";version=" << encode(version);
+    if (const auto metadata = packageByFile.find(lower(std::filesystem::absolute(unit.file).lexically_normal().string()));
+        metadata != packageByFile.end()) {
+      output << ";package=" << encode(metadata->second.name) << ";dcp=" << encode(metadata->second.dcp)
+             << ";bpl=" << encode(metadata->second.bpl) << ";project=" << encode(metadata->second.project.generic_string());
+    }
+    output << '|';
+    for (std::size_t relation = 0; relation < unit.inheritance.size(); ++relation) {
+      if (relation) output << ';';
+      output << encode(unit.inheritance[relation].type) << ',' << encode(unit.inheritance[relation].kind)
+             << ',' << encode(unit.inheritance[relation].baseType);
+    }
+    output << '|';
+    for (std::size_t dependency = 0; dependency < unit.uses.size(); ++dependency) {
+      if (dependency) output << ',';
+      output << encode(unit.uses[dependency].name);
     }
     output << '\n';
   }
@@ -701,6 +826,7 @@ ProjectLoadResult loadPackage(const std::filesystem::path& packageFile, ProjectO
       }
     }
   }
+  for (const auto& diagnostic : result.diagnostics) result.analyzer.addDiagnostic(diagnostic);
   return result;
 }
 

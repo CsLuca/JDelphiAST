@@ -1,5 +1,6 @@
 #include "jdelphiast/analyzer.hpp"
 #include "jdelphiast/project.hpp"
+#include "jdelphiast/queries.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -27,20 +28,257 @@ std::string timestamp() {
   return buffer;
 }
 
+std::vector<jdelphiast::IndexedUnit> loadIndexes(const std::vector<std::filesystem::path>& files) {
+  auto result = jdelphiast::bundledSymbolIndex();
+  for (const auto& file : files) {
+    const auto loaded = jdelphiast::loadSymbolIndex(file);
+    for (const auto& unit : loaded) {
+      const auto found = std::find_if(result.begin(), result.end(), [&](const auto& current) {
+        auto left = current.name;
+        auto right = unit.name;
+        std::transform(left.begin(), left.end(), left.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::transform(right.begin(), right.end(), right.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return left == right;
+      });
+      if (found == result.end()) result.push_back(unit); else *found = unit;
+    }
+  }
+  return result;
+}
+
+std::filesystem::path packageFromDproj(const std::filesystem::path& dproj) {
+  auto package = dproj;
+  package.replace_extension(".dpk");
+  return package;
+}
+
+void printHelp() {
+  std::cout << R"(DelphiAstTool - Delphi/Object Pascal semantic dependency analyzer
+
+USAGE
+  DelphiAstTool.exe /?
+  DelphiAstTool.exe analyze --dproj <project.dproj> [options] --format json
+  DelphiAstTool.exe --project <package.dpk> --output <report.ast.json> [options]
+  DelphiAstTool.exe [--json] <unit1.pas> [unit2.pas ...]
+  DelphiAstTool.exe index --source <path> [--source <path> ...] --output <index.jdi> [--version v500|v600]
+  DelphiAstTool.exe exports (--unit <name> | --file <unit.pas>) [--index <index.jdi>] --format json
+  DelphiAstTool.exe symbol --name <symbol> [filters] [--index <index.jdi>] --format json
+  DelphiAstTool.exe expression --file <unit.pas> --line <number> [project options] --format json
+  DelphiAstTool.exe hierarchy (--file <unit.pas> | --dproj <project.dproj>) --class <name> [options] --format json
+  DelphiAstTool.exe unit-info --unit <name> [--index <index.jdi>] --format json
+  DelphiAstTool.exe compare-symbol --left-index <v500.jdi> --right-index <v600.jdi> --symbol <name> --format json
+
+PROJECT ANALYSIS OPTIONS
+  --project <file.dpk>       Delphi package to analyze.
+  --dproj <file.dproj>      Project settings. With explicit 'analyze', the sibling DPK is inferred.
+  --config <name>           Active build configuration. Default: Release.
+  --platform <name>         Active target platform. Default: Win32.
+  --index <file.jdi>        Persistent symbol index. May be repeated.
+  --search-path <dir>       Additional Delphi unit search path. May be repeated.
+  --include-path <dir>      Additional include search path. May be repeated.
+  --output <file>           Write the project report atomically to this file.
+  --format json             Write schema v2 JSON to stdout. Accepted by semantic queries.
+  --json                    Legacy direct-source JSON output.
+
+SYMBOL QUERY FILTERS
+  --unit <name>             Restrict exports/symbol/unit-info to a unit.
+  --file <file.pas>         Analyze a specific source file.
+  --name <symbol>           Symbol simple name.
+  --qualified-name <name>   Fully qualified symbol name.
+  --kind <kind>             Restrict symbol kind.
+  --line <number>           One-based line for expression analysis.
+  --class <name>            Class to inspect in a hierarchy query.
+
+INDEX OPTIONS
+  --source <path>           Pascal file or source tree. May be repeated.
+  --version <v500|v600>     Catalog version persisted in the JDI.
+  --left-index <file.jdi>   Legacy side of compare-symbol.
+  --right-index <file.jdi>  Destination side of compare-symbol.
+
+ANALYSIS OUTPUT
+  Project JSON preserves legacy schemaVersion=1 fields and adds schema_version="2.0".
+  Existing status, confidence, and reasons fields are never renamed or removed.
+  V2 adds project, uses, references, symbols, inheritance, dependencies, diagnostics,
+  preprocessor metadata, calls, assignments, and removal recommendations.
+
+SAFE USES REMOVAL
+  Automatic removal is allowed only when all conditions hold:
+    status     = UNUSED
+    confidence = HIGH
+    reasons    = ["no_references"]
+  Read recommendations.safeRemoveUses for approved candidates. Every USED, UNKNOWN,
+  low-confidence, ambiguous, incompletely indexed, or side-effect dependency appears
+  in recommendations.blockedRemovals.
+
+PREPROCESSING
+  The selected DPROJ configuration/platform controls DCC_UnitSearchPath,
+  DCC_IncludePath, DCC_Define, and DCC_Namespace. Supported Delphi directives include
+  IFDEF, IFNDEF, IF DEFINED, ELSEIF, ELSE, ENDIF, IFEND, DEFINE, UNDEF, I, and INCLUDE.
+  Inactive source is masked without changing byte offsets or line endings.
+
+PERSISTENT INDEX
+  The JDI stores unit exports, available signatures, return types, inheritance,
+  source paths, package metadata, dependencies, side effects, and catalog version.
+  A bootstrap RTL/VCL/WinAPI/V600 catalog is embedded in the executable. Explicit
+  indexes override matching embedded units while preserving known side-effect flags.
+
+SEMANTIC SAFETY
+  The tool does not invent owners, signatures, package names, overloads, or mappings.
+  Incomplete or ambiguous information is returned as unresolved/unknown with stable
+  machine-readable diagnostics. Analysis never modifies Delphi sources.
+
+EXIT CODES
+  0  Command executed and JSON/report produced. Semantic warnings may be in diagnostics.
+  2  Invalid command line or unrecoverable I/O/index error in legacy/index modes.
+
+EXAMPLES
+  DelphiAstTool.exe analyze --dproj Plugin.dproj --config Release --platform Win32 --index v600.jdi --format json
+  DelphiAstTool.exe --project Plugin.dpk --output Plugin.ast.json
+  DelphiAstTool.exe symbol --name RegCsProc --index v600.jdi --format json
+  DelphiAstTool.exe expression --dproj Plugin.dproj --file UXPTab.pas --line 684 --index v600.jdi --format json
+  DelphiAstTool.exe compare-symbol --left-index v500.jdi --right-index v600.jdi --symbol UCSTheme --format json
+)";
+}
+
+bool isQueryCommand(std::string_view command) {
+  return command == "exports" || command == "symbol" || command == "expression" ||
+         command == "hierarchy" || command == "unit-info" || command == "compare-symbol";
+}
+
+int runQuery(std::string_view command, int argc, char** argv) {
+  std::vector<std::filesystem::path> indexes, leftIndexes, rightIndexes;
+  std::filesystem::path file;
+  std::filesystem::path dproj;
+  std::string unit, name, kind, qualifiedName, className;
+  std::string configuration{"Release"}, platform{"Win32"};
+  std::size_t line{};
+  for (int i = 2; i < argc; ++i) {
+    const std::string argument = argv[i];
+    if (argument == "--format") {
+      if (++i >= argc || std::string(argv[i]) != "json") { std::cerr << "Only --format json is supported\n"; return 2; }
+      continue;
+    }
+    if (i + 1 >= argc) { std::cerr << "Missing value for " << argument << '\n'; return 2; }
+    const std::string value = argv[++i];
+    if (argument == "--index") indexes.emplace_back(value);
+    else if (argument == "--left-index") leftIndexes.emplace_back(value);
+    else if (argument == "--right-index") rightIndexes.emplace_back(value);
+    else if (argument == "--file") file = value;
+    else if (argument == "--unit") unit = value;
+    else if (argument == "--name" || argument == "--symbol") name = value;
+    else if (argument == "--kind") kind = value;
+    else if (argument == "--qualified-name") qualifiedName = value;
+    else if (argument == "--class") className = value;
+    else if (argument == "--line") {
+      try { line = std::stoull(value); } catch (...) { std::cerr << "Invalid line number\n"; return 2; }
+    } else if (argument == "--dproj") dproj = value;
+    else if (argument == "--config") configuration = value;
+    else if (argument == "--platform") platform = value;
+    else { std::cerr << "Unknown " << command << " option: " << argument << '\n'; return 2; }
+  }
+  try {
+    if (command == "compare-symbol") {
+      if (name.empty() || leftIndexes.empty() || rightIndexes.empty()) { std::cerr << "compare-symbol requires --symbol, --left-index and --right-index\n"; return 2; }
+      std::vector<jdelphiast::IndexedUnit> left, right;
+      for (const auto& path : leftIndexes) { auto loaded = jdelphiast::loadSymbolIndex(path); left.insert(left.end(), loaded.begin(), loaded.end()); }
+      for (const auto& path : rightIndexes) { auto loaded = jdelphiast::loadSymbolIndex(path); right.insert(right.end(), loaded.begin(), loaded.end()); }
+      std::cout << jdelphiast::compareSymbolJson(name, left, right) << '\n';
+      return 0;
+    }
+    auto loaded = loadIndexes(indexes);
+    if (!dproj.empty() && (command == "expression" || command == "hierarchy")) {
+      jdelphiast::ProjectOptions options;
+      options.dprojFile = dproj;
+      options.configuration = configuration;
+      options.platform = platform;
+      options.indexFiles = indexes;
+      const auto project = jdelphiast::loadPackage(packageFromDproj(dproj), options);
+      const auto analysis = project.analyzer.analyze();
+      for (const auto& analyzed : analysis.units) {
+        if (analyzed.ast.indexOnly) continue;
+        jdelphiast::IndexedUnit projectUnit;
+        projectUnit.name = analyzed.ast.name;
+        projectUnit.sourceFile = analyzed.ast.file;
+        projectUnit.indexVersion = "project";
+        projectUnit.declarations = analyzed.ast.declarations;
+        projectUnit.inheritance = analyzed.ast.inheritance;
+        for (const auto& symbol : analyzed.ast.exports) projectUnit.symbols.push_back(symbol.name);
+        const auto existing = std::find_if(loaded.begin(), loaded.end(), [&](const auto& candidate) {
+          return candidate.name == projectUnit.name;
+        });
+        if (existing == loaded.end()) loaded.push_back(std::move(projectUnit)); else *existing = std::move(projectUnit);
+      }
+    }
+    if (command == "exports") {
+      if (file.empty() && unit.empty()) { std::cerr << "exports requires --unit or --file\n"; return 2; }
+      std::cout << jdelphiast::exportsJson(file.empty() ? std::filesystem::path(unit) : file, loaded) << '\n';
+    } else if (command == "symbol") {
+      if (name.empty()) { std::cerr << "symbol requires --name\n"; return 2; }
+      std::cout << jdelphiast::symbolJson({name, unit, kind, qualifiedName}, loaded) << '\n';
+    } else if (command == "unit-info") {
+      if (unit.empty()) { std::cerr << "unit-info requires --unit\n"; return 2; }
+      std::cout << jdelphiast::unitInfoJson(unit, loaded) << '\n';
+    } else if (command == "expression") {
+      if (file.empty() || line == 0) { std::cerr << "expression requires --file and --line\n"; return 2; }
+      std::cout << jdelphiast::expressionJson(file, line, loaded) << '\n';
+    } else if (command == "hierarchy") {
+      if (className.empty()) { std::cerr << "hierarchy requires --class and --file or --dproj\n"; return 2; }
+      if (file.empty() && !dproj.empty()) {
+        jdelphiast::ProjectOptions options;
+        options.dprojFile = dproj;
+        options.configuration = configuration;
+        options.platform = platform;
+        options.indexFiles = indexes;
+        const auto project = jdelphiast::loadPackage(packageFromDproj(dproj), options);
+        for (const auto& candidate : project.sourceFiles) {
+          const auto source = [&] { std::ifstream input(candidate, std::ios::binary); return std::string(std::istreambuf_iterator<char>(input), {}); }();
+          const auto ast = jdelphiast::parseUnit(candidate, source);
+          if (std::any_of(ast.inheritance.begin(), ast.inheritance.end(), [&](const auto& relation) {
+                auto left = relation.type;
+                auto right = className;
+                std::transform(left.begin(), left.end(), left.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                std::transform(right.begin(), right.end(), right.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                return left == right;
+              })) { file = candidate; break; }
+        }
+      }
+      if (file.empty()) { std::cerr << "hierarchy could not locate the requested class source\n"; return 2; }
+      std::cout << jdelphiast::hierarchyJson(file, className, loaded) << '\n';
+    }
+    return 0;
+  } catch (const std::exception& error) {
+    std::cout << "{\"schema_version\":\"2.0\",\"diagnostics\":[{\"code\":\"query_execution_failed\","
+                 "\"severity\":\"error\",\"message\":\"";
+    for (const char c : std::string(error.what())) {
+      if (c == '\\' || c == '"') std::cout << '\\';
+      std::cout << c;
+    }
+    std::cout << "\"}]}\n";
+    return 0;
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc > 1 && (std::string(argv[1]) == "/?" || std::string(argv[1]) == "--help" ||
+                   std::string(argv[1]) == "-h")) {
+    printHelp();
+    return 0;
+  }
   if (argc > 1 && std::string(argv[1]) == "index") {
     std::vector<std::filesystem::path> sources;
     std::filesystem::path indexOutput;
+    std::string indexVersion{"unknown"};
     for (int i = 2; i < argc; ++i) {
       const std::string argument = argv[i];
-      if ((argument == "--source" || argument == "--output") && i + 1 >= argc) {
+      if ((argument == "--source" || argument == "--output" || argument == "--version") && i + 1 >= argc) {
         std::cerr << "Missing value for " << argument << '\n';
         return 2;
       }
       if (argument == "--source") sources.emplace_back(argv[++i]);
       else if (argument == "--output") indexOutput = argv[++i];
+      else if (argument == "--version") indexVersion = argv[++i];
       else { std::cerr << "Unknown index option: " << argument << '\n'; return 2; }
     }
     if (sources.empty() || indexOutput.empty()) {
@@ -48,7 +286,7 @@ int main(int argc, char** argv) {
       return 2;
     }
     try {
-      const auto content = jdelphiast::createSymbolIndex(sources);
+      const auto content = jdelphiast::createSymbolIndex(sources, indexVersion);
       if (!indexOutput.parent_path().empty()) std::filesystem::create_directories(indexOutput.parent_path());
       const auto temporary = indexOutput.string() + ".tmp";
       {
@@ -68,6 +306,8 @@ int main(int argc, char** argv) {
       return 2;
     }
   }
+  if (argc > 1 && isQueryCommand(argv[1])) return runQuery(argv[1], argc, argv);
+  const bool explicitAnalyze = argc > 1 && std::string(argv[1]) == "analyze";
   bool json = false;
   int fileCount = 0;
   int sourceFileCount = 0;
@@ -75,9 +315,14 @@ int main(int argc, char** argv) {
   jdelphiast::ProjectOptions projectOptions;
   std::filesystem::path package;
   std::filesystem::path outputPath;
-  for (int i = 1; i < argc; ++i) {
+  for (int i = explicitAnalyze ? 2 : 1; i < argc; ++i) {
     const std::string argument = argv[i];
     if (argument == "--json") {
+      json = true;
+      continue;
+    }
+    if (argument == "--format") {
+      if (++i >= argc || std::string(argv[i]) != "json") { std::cerr << "Only --format json is supported\n"; return 2; }
       json = true;
       continue;
     }
@@ -144,6 +389,10 @@ int main(int argc, char** argv) {
     ++fileCount;
     ++sourceFileCount;
   }
+  if (explicitAnalyze && package.empty() && !projectOptions.dprojFile.empty()) {
+    package = packageFromDproj(projectOptions.dprojFile);
+    ++fileCount;
+  }
   if (fileCount == 0) {
     std::cerr << "Usage: DelphiAstTool --project package.dpk --output package.ast.json "
                  "[--config Release] [--platform Win32] [--dproj file.dproj] "
@@ -151,7 +400,7 @@ int main(int argc, char** argv) {
                  "       DelphiAstTool [--json] unit1.pas [unit2.pas ...]\n";
     return 2;
   }
-  if ((!package.empty() && outputPath.empty()) || (package.empty() && !outputPath.empty())) {
+  if ((!explicitAnalyze && !package.empty() && outputPath.empty()) || (package.empty() && !outputPath.empty())) {
     std::cerr << "--project and --output must be specified together\n";
     return 2;
   }
@@ -173,7 +422,7 @@ int main(int argc, char** argv) {
       auto loaded = jdelphiast::loadPackage(package, std::move(projectOptions));
       for (const auto& diagnostic : loaded.diagnostics) std::cerr << "warning: " << diagnostic << '\n';
       const auto result = loaded.analyzer.analyze();
-      const auto report = outputPath.empty()
+      const auto report = outputPath.empty() && !explicitAnalyze
           ? (json ? jdelphiast::toJson(result) : jdelphiast::toText(result))
           : jdelphiast::toProjectJson(result, package.stem().string(),
                                       std::filesystem::absolute(package).parent_path(), timestamp());
@@ -198,6 +447,14 @@ int main(int argc, char** argv) {
       std::cout << (json ? jdelphiast::toJson(result) : jdelphiast::toText(result));
     }
   } catch (const std::exception& error) {
+    if (explicitAnalyze && json) {
+      std::cout << "{\"schemaVersion\":1,\"schema_version\":\"2.0\",\"project\":{},\"units\":[],"
+                   "\"uses\":[],\"references\":[],\"symbols\":[],\"inheritance\":[],\"dependencies\":[],"
+                   "\"diagnostics\":[{\"code\":\"analysis_failed\",\"severity\":\"error\",\"message\":\"";
+      for (const char c : std::string(error.what())) { if (c == '\\' || c == '"') std::cout << '\\'; std::cout << c; }
+      std::cout << "\"}]}\n";
+      return 0;
+    }
     std::cerr << "error: " << error.what() << '\n';
     return 2;
   }
