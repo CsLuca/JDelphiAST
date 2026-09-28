@@ -6,3 +6,5 @@
 *.suo
 *.obj
 *.exe
+/indexes/delphi-v500.jdi
+/indexes/delphi-v600.jdi

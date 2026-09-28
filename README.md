@@ -134,7 +134,7 @@ build-ucrt64/DelphiAstTool.exe
 build-ucrt64/jdelphiast_tests.exe
 ```
 
-Keep `C:\msys64\ucrt64\bin` in `PATH` when running binaries linked against the MSYS2 UCRT64 runtime.
+`DelphiAstTool.exe` is linked statically when built with MinGW/MSYS2, so the distributed CLI does not require `libgcc_s_seh-1.dll` or `libstdc++-6.dll` and can run without MSYS2 in `PATH`. Test executables are development artifacts and may still use the toolchain runtime.
 
 ## Generic Build
 
@@ -158,7 +158,7 @@ Display the complete command-line reference:
 DelphiAstTool.exe /?
 ```
 
-The aliases `--help` and `-h` are also supported. The built-in help documents every command, option, JSON compatibility guarantee, safe-removal rule, preprocessing behavior, persistent index behavior, and exit code.
+The aliases `--help`, `-h`, and `help` are also supported. The built-in help documents every command, option, JSON compatibility guarantee, safe-removal rule, preprocessing behavior, persistent index behavior, and exit code.
 
 ### Schema V2 Analyze
 

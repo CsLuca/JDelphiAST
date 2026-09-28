@@ -262,7 +262,7 @@ int runQuery(std::string_view command, int argc, char** argv) {
 
 int main(int argc, char** argv) {
   if (argc > 1 && (std::string(argv[1]) == "/?" || std::string(argv[1]) == "--help" ||
-                   std::string(argv[1]) == "-h")) {
+                   std::string(argv[1]) == "-h" || std::string(argv[1]) == "help")) {
     printHelp();
     return 0;
   }

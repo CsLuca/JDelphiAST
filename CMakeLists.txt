@@ -15,6 +15,10 @@ endif()
 
 add_executable(DelphiAstTool src/main.cpp)
 target_link_libraries(DelphiAstTool PRIVATE jdelphiast)
+if(MINGW)
+  # Keep the distributed CLI independent from the MSYS2 GCC runtime DLLs.
+  target_link_options(DelphiAstTool PRIVATE -static -static-libgcc -static-libstdc++)
+endif()
 add_custom_command(TARGET DelphiAstTool POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory
           ${CMAKE_CURRENT_SOURCE_DIR}/indexes
@@ -79,4 +83,6 @@ if(JDELPHIAST_BUILD_TESTS)
   add_test(NAME jdelphiast_cli_help COMMAND DelphiAstTool /?)
   set_tests_properties(jdelphiast_cli_help PROPERTIES
     PASS_REGULAR_EXPRESSION "SAFE USES REMOVAL.*PREPROCESSING.*PERSISTENT INDEX")
+  add_test(NAME jdelphiast_cli_help_word COMMAND DelphiAstTool help)
+  set_tests_properties(jdelphiast_cli_help_word PROPERTIES PASS_REGULAR_EXPRESSION "DelphiAstTool.*USAGE")
 endif()
