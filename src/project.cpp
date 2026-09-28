@@ -500,7 +500,8 @@ std::string validationSeverity(std::string_view code, const ValidationPolicy& po
   if (const auto found = policy.severities.find(normalized); found != policy.severities.end()) return found->second;
   static const std::unordered_set<std::string> infos = {"output_not_written"};
   static const std::unordered_set<std::string> warnings = {
-      "no_unit_declaration", "source_unit_not_indexed", "seed_without_export_evidence", "seed_missing_exports"};
+      "no_unit_declaration", "source_unit_not_indexed", "parser_feature_unsupported",
+      "filesystem_path_encoding_error", "seed_without_export_evidence", "seed_missing_exports"};
   if (infos.contains(normalized)) return "info";
   return warnings.contains(normalized) ? "warning" : "error";
 }
@@ -523,6 +524,7 @@ std::vector<IndexedUnit> loadSymbolIndex(const std::filesystem::path& indexFile)
         if (lower(flag) == "initialization") unit.hasInitialization = true;
         if (lower(flag) == "finalization") unit.hasFinalization = true;
         if (lower(flag) == "complete") unit.complete = true;
+        if (lower(flag) == "partial") unit.complete = false;
       }
     }
     if (fields.size() > 3) {
@@ -652,7 +654,7 @@ IndexLoadResult loadSymbolIndexValidated(const std::filesystem::path& indexFile)
     }
     for (const auto& flag : split(fields[2], ',')) {
       const auto normalized = lower(flag);
-      if (normalized != "initialization" && normalized != "finalization" && normalized != "complete") {
+      if (normalized != "initialization" && normalized != "finalization" && normalized != "complete" && normalized != "partial") {
         result.hasBlockingErrors = true;
         result.diagnostics.push_back({"index_parse_failed", "error",
             "Unknown JDI flag '" + flag + "' for unit " + fields[0], indexFile, fields[0]});
@@ -729,6 +731,7 @@ CSCore.Note.Utils|TNoteUtils,UpdateOrInsertSection,DeleteSection,AddSection||cla
       if (lower(flag) == "initialization") unit.hasInitialization = true;
       if (lower(flag) == "finalization") unit.hasFinalization = true;
       if (lower(flag) == "complete") unit.complete = true;
+      if (lower(flag) == "partial") unit.complete = false;
     }
     if (fields.size() > 3) for (const auto& encoded : split(fields[3], ';')) {
       const auto parts = splitPreservingEmpty(encoded, ',');
@@ -862,12 +865,17 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
       continue;
     }
     if (!ast.complete) {
-      ++result.statistics.filesParseFailed;
-      const auto level = severity("incomplete_unit", "error");
+      const auto structurallyTerminated = sourceText.find("interface") != std::string::npos &&
+          sourceText.find("implementation") != std::string::npos &&
+          sourceText.find("end.") != std::string::npos;
+      const auto code = structurallyTerminated ? "parser_feature_unsupported" : "incomplete_unit";
+      const auto level = severity(code, structurallyTerminated ? "warning" : "error");
       result.hasBlockingErrors = result.hasBlockingErrors || level == "error";
-      result.diagnostics.push_back({file, "parse_failed", "incomplete_unit", level,
-                                    "The Delphi unit is syntactically incomplete or contains unsupported directives."});
-      continue;
+      result.diagnostics.push_back({file, structurallyTerminated ? "partially_indexed" : "parse_failed", code, level,
+          structurallyTerminated ? "The unit was partially indexed because active syntax or directives are not fully supported."
+                                 : "The Delphi unit is syntactically incomplete."});
+      if (!structurallyTerminated) { ++result.statistics.filesParseFailed; continue; }
+      ++result.statistics.unitsPartiallyIndexed;
     }
     if (!names.insert(lower(ast.name)).second) {
       ++result.statistics.filesParseFailed;
@@ -912,6 +920,7 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
   output << "# JDelphiAST symbol index v2: unit|symbols|flags|declarations|metadata|inheritance|dependencies\n";
   output << "# statistics files_scanned=" << result.statistics.filesScanned
          << " units_indexed=" << result.statistics.unitsIndexed
+         << " units_partially_indexed=" << result.statistics.unitsPartiallyIndexed
          << " files_skipped_non_unit_source=" << result.statistics.filesSkippedNonUnitSource
          << " files_parse_failed=" << result.statistics.filesParseFailed
          << " exports_indexed=" << result.statistics.exportsIndexed << '\n';
@@ -940,6 +949,7 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
     bool flag = false;
     if (unit.hasInitialization) { output << "initialization"; flag = true; }
     if (unit.hasFinalization) { if (flag) output << ','; output << "finalization"; }
+    if (!unit.complete) { if (flag) output << ','; output << "partial"; }
     output << '|';
     auto declarations = unit.declarations;
     for (const auto& exported : unit.exports) {
@@ -1039,6 +1049,7 @@ std::string indexBuildResultJson(const IndexBuildResult& result, const std::file
   output << "]}"
          << ",\"statistics\":{\"files_scanned\":" << result.statistics.filesScanned
          << ",\"units_indexed\":" << result.statistics.unitsIndexed
+         << ",\"units_partially_indexed\":" << result.statistics.unitsPartiallyIndexed
          << ",\"files_skipped_non_unit_source\":" << result.statistics.filesSkippedNonUnitSource
          << ",\"files_parse_failed\":" << result.statistics.filesParseFailed
          << ",\"exports_indexed\":" << result.statistics.exportsIndexed << "},\"files\":[";

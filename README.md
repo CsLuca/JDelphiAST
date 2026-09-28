@@ -487,11 +487,12 @@ Default severity table:
 | `no_unit_declaration` | warning | `.pas` fragment/include without a valid `unit` declaration |
 | `source_unit_not_indexed` | warning | referenced source unit is unavailable |
 | `filesystem_path_encoding_error` | warning | one native Windows path could not be represented; that entry is skipped |
+| `parser_feature_unsupported` | warning | structurally valid unit indexed partially because active syntax is not fully supported |
 | `missing_source_root` | error | configured index source root does not exist |
 | `source_scan_failed` | error | source tree could not be enumerated completely |
 | `file_read_error` | error | a source file could not be read |
 | `parse_failure` | error | parser raised an unrecoverable error |
-| `incomplete_unit` | error | parsed unit is incomplete or contains unsupported active syntax/directives |
+| `incomplete_unit` | error | unit declaration exists but the source is structurally incomplete |
 | `duplicate_unit_source` | error | duplicate unit identity in source or JDI |
 | `duplicate_symbol` | error | duplicate exported symbol inside one indexed unit |
 | `index_read_failed` | error | JDI is missing or unreadable |
@@ -504,17 +505,8 @@ Default severity table:
 | `seed_signature_incompatible` | error | approved source/target signatures conflict |
 | `seed_without_export_evidence` | warning | seed target exists but has no shared exported evidence |
 | `seed_missing_exports` | warning | approved target omits one or more legacy exports |
-| `missing_source_root` | error | requested source root does not exist |
-| `source_scan_failed` | error | source tree enumeration was incomplete |
-| `file_read_error` | error | source file could not be read |
-| `incomplete_unit` | error | unit declaration exists but source is incomplete |
 | `no_input_units` | error | no valid units were available for an index |
-| `catalog_version_inconsistent` | error | one index mixes catalog versions |
-| `catalog_origin_inconsistent` | error | one index mixes source origins |
-| `package_metadata_inconsistent` | error | DCP/BPL metadata lacks a package identity |
 | `index_version_mismatch` | error | compare-units did not receive V500 on the left and V600 on the right |
-| `index_incomplete` | error | an index reports source parse failures |
-| `seed_missing_exports` | warning | seed target exists but omits legacy exports |
 | `seed_missing` | error | configured seed file is missing or empty |
 | `seed_parse_failed` | error | seed mapping record is malformed or contains an invalid enum |
 | `seed_schema_invalid` | error | seed JSON does not expose the required schema |

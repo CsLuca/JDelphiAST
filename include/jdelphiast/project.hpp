@@ -52,6 +52,7 @@ struct ValidationPolicy {
 struct IndexStatistics {
   std::size_t filesScanned{};
   std::size_t unitsIndexed{};
+  std::size_t unitsPartiallyIndexed{};
   std::size_t filesSkippedNonUnitSource{};
   std::size_t filesParseFailed{};
   std::size_t exportsIndexed{};
