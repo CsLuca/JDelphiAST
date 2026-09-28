@@ -1,4 +1,5 @@
 #include "jdelphiast/project.hpp"
+#include "jdelphiast/path.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -166,6 +167,17 @@ end.)");
   require(mainIndexed != roundTrip.end() && mainIndexed->packageName == "Demo" &&
               mainIndexed->packageDcp == "Demo.dcp" && mainIndexed->packageBpl == "Demo.bpl",
           "index derives package metadata from an actual DPK");
+
+  const auto unicodeDir = root / jdelphiast::pathFromSourceBytes("sorgenti-citt\xC3\xA0");
+  const auto unicodeFile = unicodeDir / jdelphiast::pathFromSourceBytes("UnitAccentuata-\xC3\xA8.pas");
+  write(unicodeFile, "unit UnitAccentuata; interface type TUnicodePath = class end; implementation end.");
+  jdelphiast::IndexBuildOptions unicodeOptions;
+  unicodeOptions.version = "v500";
+  const auto unicodeIndex = jdelphiast::buildSymbolIndex({unicodeDir}, unicodeOptions);
+  require(!unicodeIndex.hasBlockingErrors && unicodeIndex.statistics.unitsIndexed == 1,
+          "Unicode filesystem paths do not abort indexing");
+  require(unicodeIndex.content.find("sorgenti-citt%C3%A0") != std::string::npos,
+          "Unicode paths are serialized as UTF-8");
   const auto bundled = jdelphiast::bundledSymbolIndex();
   const auto hasBundledUnit = [&](const std::string& name) {
     return std::any_of(bundled.begin(), bundled.end(), [&](const auto& item) { return item.name == name; });

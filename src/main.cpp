@@ -351,7 +351,11 @@ int main(int argc, char** argv) {
       options.validationPolicy = validationPolicy;
       const auto result = jdelphiast::buildSymbolIndex(sources, options);
       if (jsonOutput) std::cout << jdelphiast::indexBuildResultJson(result, indexOutput) << '\n';
-      if (result.hasBlockingErrors) return 2;
+      if (result.hasBlockingErrors) {
+        std::error_code error;
+        std::filesystem::remove(indexOutput, error);
+        return 2;
+      }
       writeAtomic(indexOutput, result.content);
       if (!jsonOutput) std::cout << "Wrote " << indexOutput.string() << '\n';
       return 0;
@@ -406,6 +410,10 @@ int main(int argc, char** argv) {
       const auto rightUnits = right.units.empty() && !right.hasBlockingErrors ? jdelphiast::loadSymbolIndex(options.rightIndex) : right.units;
       const auto result = jdelphiast::compareUnits(options, leftUnits, rightUnits, timestamp());
       if (result.hasBlockingErrors) {
+        std::error_code error;
+        std::filesystem::remove(output, error);
+        if (!csv.empty()) std::filesystem::remove(csv, error);
+        if (!html.empty()) std::filesystem::remove(html, error);
         std::cout << result.json << '\n';
         return 2;
       }
@@ -415,7 +423,20 @@ int main(int argc, char** argv) {
       std::cout << result.json << '\n';
       return 0;
     } catch (const std::exception& error) {
-      std::cout << "{\"schema_version\":\"1.0\",\"mappings\":[],\"diagnostics\":[{\"code\":\"compare_units_failed\",\"severity\":\"error\",\"message\":\"compare-units failed\"}]}\n";
+      std::error_code removeError;
+      std::filesystem::remove(output, removeError);
+      if (!csv.empty()) std::filesystem::remove(csv, removeError);
+      if (!html.empty()) std::filesystem::remove(html, removeError);
+      std::string code = "compare_units_failed";
+      const std::string message = error.what();
+      if (message.find("Seed mapping file") != std::string::npos) code = "seed_missing";
+      else if (message.find("seed mapping schema") != std::string::npos) code = "seed_schema_invalid";
+      else if (message.find("seed mapping") != std::string::npos || message.find("seed confidence") != std::string::npos)
+        code = "seed_parse_failed";
+      std::cout << "{\"schema_version\":\"1.0\",\"validation\":{\"has_blocking_errors\":true,\"error_count\":1,\"warning_count\":0},"
+                   "\"mappings\":[],\"diagnostics\":[{\"code\":\"" << code
+                << "\",\"severity\":\"error\",\"message\":\"compare-units validation failed\"}],"
+                   "\"blocking_errors\":[{\"code\":\"" << code << "\",\"message\":\"compare-units validation failed\"}]}\n";
       std::cerr << "error: " << error.what() << '\n';
       return 2;
     }

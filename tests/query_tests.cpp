@@ -1,6 +1,7 @@
 #include "jdelphiast/project.hpp"
 #include "jdelphiast/queries.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -108,6 +109,17 @@ int main() {
   const auto duplicate = jdelphiast::loadSymbolIndexValidated(fixtures / "duplicate-unit.jdi");
   require(duplicate.hasBlockingErrors && duplicate.diagnostics.front().code == "duplicate_unit_source",
           "duplicate unit index entry is blocking");
+  const auto duplicateSymbol = jdelphiast::loadSymbolIndexValidated(fixtures / "duplicate-symbol.jdi");
+  require(duplicateSymbol.hasBlockingErrors && duplicateSymbol.diagnostics.front().code == "duplicate_symbol",
+          "duplicate exported symbol is blocking");
+  const auto mixedVersion = jdelphiast::loadSymbolIndexValidated(fixtures / "mixed-version.jdi");
+  require(mixedVersion.hasBlockingErrors &&
+              std::any_of(mixedVersion.diagnostics.begin(), mixedVersion.diagnostics.end(), [](const auto& item) {
+                return item.code == "catalog_version_inconsistent" || item.code == "catalog_origin_inconsistent";
+              }), "mixed catalog version or origin is blocking");
+  const auto badPackage = jdelphiast::loadSymbolIndexValidated(fixtures / "bad-package.jdi");
+  require(badPackage.hasBlockingErrors && badPackage.diagnostics.front().code == "package_metadata_inconsistent",
+          "inconsistent package metadata is blocking");
   const auto missingIndex = jdelphiast::loadSymbolIndexValidated(fixtures / "does-not-exist.jdi");
   require(missingIndex.hasBlockingErrors && missingIndex.diagnostics.front().code == "index_read_failed",
           "missing index is blocking");

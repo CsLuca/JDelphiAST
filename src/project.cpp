@@ -1,5 +1,6 @@
 #include "jdelphiast/project.hpp"
 #include "jdelphiast/preprocessor.hpp"
+#include "jdelphiast/path.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -17,7 +18,7 @@ namespace {
 
 std::string readFile(const std::filesystem::path& path) {
   std::ifstream input(path, std::ios::binary);
-  if (!input) throw std::runtime_error("Cannot read " + path.string());
+  if (!input) throw std::runtime_error("Cannot read " + pathToUtf8(path));
   return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
@@ -93,7 +94,7 @@ std::string percentDecode(std::string value) {
 std::filesystem::path delphiPath(std::string value) {
   // Forward slashes are accepted by std::filesystem on Windows and POSIX.
   std::replace(value.begin(), value.end(), '\\', '/');
-  return std::filesystem::path(value);
+  return pathFromSourceBytes(value);
 }
 
 std::string xmlDecode(std::string value) {
@@ -278,7 +279,7 @@ std::string attribute(std::string_view tag, std::string_view name) {
 std::string expandProjectMacros(std::string value, const std::filesystem::path& projectDir,
                                 std::vector<std::string>& diagnostics) {
   const std::pair<std::string_view, std::string> known[] = {
-      {"$(PROJECTDIR)", projectDir.string()}, {"$(PROJECTPATH)", projectDir.string()}};
+      {"$(PROJECTDIR)", pathToUtf8(projectDir)}, {"$(PROJECTPATH)", pathToUtf8(projectDir)}};
   for (const auto& [macro, replacement] : known) {
     std::size_t at = 0;
     while ((at = lower(value).find(lower(std::string(macro)), at)) != std::string::npos) {
@@ -297,8 +298,8 @@ void loadDproj(const std::filesystem::path& path, ProjectOptions& options,
   const auto xml = readFile(path);
   const auto directory = path.parent_path();
   std::unordered_map<std::string, std::string> properties;
-  properties["projectdir"] = directory.string();
-  properties["projectpath"] = path.string();
+  properties["projectdir"] = pathToUtf8(directory);
+  properties["projectpath"] = pathToUtf8(path);
   properties["config"] = options.configuration;
   properties["platform"] = options.platform;
   std::size_t at = 0;
@@ -306,7 +307,7 @@ void loadDproj(const std::filesystem::path& path, ProjectOptions& options,
     const auto tagEnd = xml.find('>', at);
     const auto groupEnd = lower(xml).find("</propertygroup>", tagEnd);
     if (tagEnd == std::string::npos || groupEnd == std::string::npos) {
-      diagnostics.push_back("Malformed PropertyGroup in " + path.string());
+      diagnostics.push_back("Malformed PropertyGroup in " + pathToUtf8(path));
       break;
     }
     const auto groupTag = std::string_view(xml).substr(at, tagEnd - at + 1);
@@ -465,7 +466,7 @@ std::optional<FoundUnit> findUnit(const std::string& name,
       const auto flat = directory / (candidate.substr(candidate.find_last_of('.') + 1) + ".pas");
       if (std::filesystem::exists(flat)) return FoundUnit{flat, candidate};
       for (const auto& entry : std::filesystem::directory_iterator(directory)) {
-        if (entry.is_regular_file() && lower(entry.path().filename().string()) == lower(candidate + ".pas"))
+        if (entry.is_regular_file() && lower(pathToUtf8(entry.path().filename())) == lower(candidate + ".pas"))
           return FoundUnit{entry.path(), candidate};
       }
     }
@@ -474,6 +475,35 @@ std::optional<FoundUnit> findUnit(const std::string& name,
 }
 
 }  // namespace
+
+ValidationPolicy loadValidationPolicy(const std::filesystem::path& policyFile) {
+  ValidationPolicy policy;
+  if (policyFile.empty()) return policy;
+  std::istringstream input(readFile(policyFile));
+  std::string line;
+  while (std::getline(input, line)) {
+    line = trim(line);
+    if (line.empty() || line[0] == '#') continue;
+    const auto equal = line.find('=');
+    if (equal == std::string::npos) throw std::runtime_error("Invalid validation policy line: " + line);
+    const auto code = lower(trim(line.substr(0, equal)));
+    const auto severity = lower(trim(line.substr(equal + 1)));
+    if (severity != "info" && severity != "warning" && severity != "error")
+      throw std::runtime_error("Invalid validation severity for " + code + ": " + severity);
+    policy.severities[code] = severity;
+  }
+  return policy;
+}
+
+std::string validationSeverity(std::string_view code, const ValidationPolicy& policy) {
+  const auto normalized = lower(std::string(code));
+  if (const auto found = policy.severities.find(normalized); found != policy.severities.end()) return found->second;
+  static const std::unordered_set<std::string> infos = {"output_not_written"};
+  static const std::unordered_set<std::string> warnings = {
+      "no_unit_declaration", "source_unit_not_indexed", "seed_without_export_evidence", "seed_missing_exports"};
+  if (infos.contains(normalized)) return "info";
+  return warnings.contains(normalized) ? "warning" : "error";
+}
 
 std::vector<IndexedUnit> loadSymbolIndex(const std::filesystem::path& indexFile) {
   std::vector<IndexedUnit> result;
@@ -658,12 +688,10 @@ IndexLoadResult loadSymbolIndexValidated(const std::filesystem::path& indexFile)
     result.diagnostics.push_back({"catalog_origin_inconsistent", "error",
         "Index contains more than one catalog origin.", indexFile, {}});
   }
-  if (!result.hasBlockingErrors) {
-    try { result.units = loadSymbolIndex(indexFile); }
-    catch (const std::exception& error) {
-      result.hasBlockingErrors = true;
-      result.diagnostics.push_back({"index_parse_failed", "error", error.what(), indexFile, {}});
-    }
+  try { result.units = loadSymbolIndex(indexFile); }
+  catch (const std::exception& error) {
+    result.hasBlockingErrors = true;
+    result.diagnostics.push_back({"index_parse_failed", "error", error.what(), indexFile, {}});
   }
   if (result.units.empty() && !result.hasBlockingErrors) {
     result.hasBlockingErrors = true;
@@ -732,21 +760,10 @@ std::string createSymbolIndex(const std::vector<std::filesystem::path>& sources,
 IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sources,
                                   const IndexBuildOptions& options) {
   IndexBuildResult result;
-  std::unordered_map<std::string, std::string> severityPolicy;
-  if (!options.validationPolicy.empty()) {
-    std::istringstream policy(readFile(options.validationPolicy));
-    std::string line;
-    while (std::getline(policy, line)) {
-      line = trim(line);
-      if (line.empty() || line[0] == '#') continue;
-      const auto equal = line.find('=');
-      if (equal == std::string::npos) continue;
-      severityPolicy[trim(line.substr(0, equal))] = lower(trim(line.substr(equal + 1)));
-    }
-  }
+  const auto severityPolicy = loadValidationPolicy(options.validationPolicy);
   const auto severity = [&](std::string_view code, std::string_view fallback) {
-    const auto found = severityPolicy.find(std::string(code));
-    return found == severityPolicy.end() ? std::string(fallback) : found->second;
+    const auto found = severityPolicy.severities.find(lower(std::string(code)));
+    return found == severityPolicy.severities.end() ? std::string(fallback) : found->second;
   };
   std::vector<std::filesystem::path> files;
   std::vector<std::filesystem::path> packages;
@@ -760,58 +777,75 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
           source, std::filesystem::directory_options::skip_permission_denied, iteratorError);
       for (const auto end = std::filesystem::recursive_directory_iterator(); iterator != end; iterator.increment(iteratorError)) {
         if (iteratorError) {
-          result.hasBlockingErrors = true;
-          result.diagnostics.push_back({source, "scan_failed", "source_scan_failed", "error", iteratorError.message()});
+          const auto level = severity("source_scan_failed", "error");
+          result.hasBlockingErrors = result.hasBlockingErrors || level == "error";
+          result.diagnostics.push_back({source, "scan_failed", "source_scan_failed", level, iteratorError.message()});
           iteratorError.clear();
           continue;
         }
         const auto& entry = *iterator;
         if (!entry.is_regular_file(iteratorError)) continue;
-        const auto extension = lower(entry.path().extension().string());
+        const auto extension = lower(pathToUtf8(entry.path().extension()));
         if (extension == ".pas") files.push_back(entry.path());
         else if (extension == ".dpk") packages.push_back(entry.path());
       }
     } else {
-      result.hasBlockingErrors = true;
-      result.diagnostics.push_back({source, "scan_failed", "missing_source_root", "error",
+      const auto level = severity("missing_source_root", "error");
+      result.hasBlockingErrors = result.hasBlockingErrors || level == "error";
+      result.diagnostics.push_back({source, "scan_failed", "missing_source_root", level,
                                     "Index source root does not exist."});
     }
   }
   std::sort(files.begin(), files.end(), [](const auto& left, const auto& right) {
-    const auto leftLower = lower(left.string()), rightLower = lower(right.string());
-    return leftLower == rightLower ? left.string() < right.string() : leftLower < rightLower;
+    const auto leftText = pathToUtf8(left), rightText = pathToUtf8(right);
+    const auto leftLower = lower(leftText), rightLower = lower(rightText);
+    return leftLower == rightLower ? leftText < rightText : leftLower < rightLower;
   });
   files.erase(std::unique(files.begin(), files.end(), [](const auto& left, const auto& right) {
-    return lower(left.string()) == lower(right.string());
+    return lower(pathToUtf8(left)) == lower(pathToUtf8(right));
   }), files.end());
   for (const auto& packageRoot : options.packageRoots)
     if (std::filesystem::is_directory(packageRoot))
       for (const auto& entry : std::filesystem::recursive_directory_iterator(packageRoot))
-        if (entry.is_regular_file() && lower(entry.path().extension().string()) == ".dpk") packages.push_back(entry.path());
+        if (entry.is_regular_file() && lower(pathToUtf8(entry.path().extension())) == ".dpk") packages.push_back(entry.path());
   std::sort(packages.begin(), packages.end(), [](const auto& left, const auto& right) {
-    const auto leftLower = lower(left.string()), rightLower = lower(right.string());
-    return leftLower == rightLower ? left.string() < right.string() : leftLower < rightLower;
+    const auto leftText = pathToUtf8(left), rightText = pathToUtf8(right);
+    const auto leftLower = lower(leftText), rightLower = lower(rightText);
+    return leftLower == rightLower ? leftText < rightText : leftLower < rightLower;
   });
   packages.erase(std::unique(packages.begin(), packages.end()), packages.end());
   std::vector<UnitAst> units;
   struct PackageMetadata { std::string name, dcp, bpl; std::filesystem::path project; };
   std::unordered_map<std::string, PackageMetadata> packageByFile;
   for (const auto& package : packages) {
-    const auto packageName = package.stem().string();
-    for (auto relative : packageSources(readFile(package))) {
-      if (relative.is_relative()) relative = package.parent_path() / relative;
-      packageByFile[lower(std::filesystem::absolute(relative).lexically_normal().string())] = {
-          packageName, packageName + ".dcp", packageName + ".bpl", package};
+    try {
+      const auto packageName = pathToUtf8(package.stem());
+      for (auto relative : packageSources(readFile(package))) {
+        if (relative.is_relative()) relative = package.parent_path() / relative;
+        packageByFile[lower(pathToUtf8(std::filesystem::absolute(relative).lexically_normal()))] = {
+            packageName, packageName + ".dcp", packageName + ".bpl", package};
+      }
+    } catch (const std::filesystem::filesystem_error&) {
+      const auto level = severity("filesystem_path_encoding_error", "warning");
+      result.hasBlockingErrors = result.hasBlockingErrors || level == "error";
+      result.diagnostics.push_back({package, "path_encoding_error", "filesystem_path_encoding_error", level,
+                                    "A package path could not be converted; package metadata was skipped."});
     }
   }
   std::unordered_set<std::string> names;
   for (const auto& file : files) {
     ++result.statistics.filesScanned;
     UnitAst ast;
-    try {
-      const auto source = readFile(file);
-      ast = parseUnit(file, source);
+    std::string sourceText;
+    try { sourceText = readFile(file); }
+    catch (const std::exception& error) {
+      ++result.statistics.filesParseFailed;
+      const auto level = severity("file_read_error", "error");
+      result.hasBlockingErrors = result.hasBlockingErrors || level == "error";
+      result.diagnostics.push_back({file, "read_failed", "file_read_error", level, error.what()});
+      continue;
     }
+    try { ast = parseUnit(file, sourceText); }
     catch (const std::exception& error) {
       ++result.statistics.filesParseFailed;
       const auto level = severity("parse_failure", "error");
@@ -843,7 +877,15 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
                                     "Another source file declares the same Delphi unit."});
       continue;
     }
-    units.push_back(std::move(ast));
+    try {
+      (void)genericPathToUtf8(file);
+      units.push_back(std::move(ast));
+    } catch (const std::filesystem::filesystem_error&) {
+      const auto level = severity("filesystem_path_encoding_error", "warning");
+      result.hasBlockingErrors = result.hasBlockingErrors || level == "error";
+      result.diagnostics.push_back({file, "path_encoding_error", "filesystem_path_encoding_error", level,
+                                    "The source path could not be represented in UTF-8 and was skipped."});
+    }
   }
   result.statistics.unitsIndexed = units.size();
   for (const auto& unit : units) result.statistics.exportsIndexed += unit.exports.size();
@@ -875,7 +917,7 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
          << " exports_indexed=" << result.statistics.exportsIndexed << '\n';
   for (const auto& diagnostic : result.diagnostics)
     output << "# source status=" << diagnostic.indexStatus << " code=" << diagnostic.code
-           << " file=" << encode(diagnostic.sourceFile.generic_string()) << '\n';
+           << " file=" << encode(genericPathToUtf8(diagnostic.sourceFile)) << '\n';
   for (const auto& unit : units) {
     output << unit.name << '|';
     std::unordered_set<std::string> parameterNames;
@@ -934,12 +976,12 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
              << (declaration.overload ? "overload" : "") << ','
              << (declaration.isOverride ? "override" : "");
     }
-    output << "|source=" << encode(unit.file.generic_string()) << ";version=" << encode(options.version)
+    output << "|source=" << encode(genericPathToUtf8(unit.file)) << ";version=" << encode(options.version)
            << ";origin=" << encode(options.origin);
-    if (const auto metadata = packageByFile.find(lower(std::filesystem::absolute(unit.file).lexically_normal().string()));
+    if (const auto metadata = packageByFile.find(lower(pathToUtf8(std::filesystem::absolute(unit.file).lexically_normal())));
         metadata != packageByFile.end()) {
       output << ";package=" << encode(metadata->second.name) << ";dcp=" << encode(metadata->second.dcp)
-             << ";bpl=" << encode(metadata->second.bpl) << ";project=" << encode(metadata->second.project.generic_string());
+             << ";bpl=" << encode(metadata->second.bpl) << ";project=" << encode(genericPathToUtf8(metadata->second.project));
     }
     output << '|';
     for (std::size_t relation = 0; relation < unit.inheritance.size(); ++relation) {
@@ -983,7 +1025,7 @@ std::string indexBuildResultJson(const IndexBuildResult& result, const std::file
     else if (diagnostic.severity == "warning") ++warnings;
     else ++infos;
   }
-  output << "{\"schema_version\":\"1.0\",\"index\":\"" << escape(outputPath.generic_string())
+  output << "{\"schema_version\":\"1.0\",\"index\":\"" << escape(genericPathToUtf8(outputPath))
          << "\",\"validation\":{\"has_blocking_errors\":" << (result.hasBlockingErrors ? "true" : "false")
          << ",\"error_count\":" << errors << ",\"warning_count\":" << warnings
          << ",\"info_count\":" << infos << ",\"blocking_errors\":[";
@@ -992,7 +1034,7 @@ std::string indexBuildResultJson(const IndexBuildResult& result, const std::file
     if (!firstBlocking) output << ',';
     firstBlocking = false;
     output << "{\"code\":\"" << escape(diagnostic.code) << "\",\"message\":\""
-           << escape(diagnostic.message) << "\",\"file\":\"" << escape(diagnostic.sourceFile.generic_string()) << "\"}";
+           << escape(diagnostic.message) << "\",\"file\":\"" << escape(genericPathToUtf8(diagnostic.sourceFile)) << "\"}";
   }
   output << "]}"
          << ",\"statistics\":{\"files_scanned\":" << result.statistics.filesScanned
@@ -1003,10 +1045,27 @@ std::string indexBuildResultJson(const IndexBuildResult& result, const std::file
   for (std::size_t i = 0; i < result.diagnostics.size(); ++i) {
     if (i) output << ',';
     const auto& diagnostic = result.diagnostics[i];
-    output << "{\"source_file\":\"" << escape(diagnostic.sourceFile.generic_string())
+    output << "{\"source_file\":\"" << escape(genericPathToUtf8(diagnostic.sourceFile))
            << "\",\"index_status\":\"" << diagnostic.indexStatus << "\",\"diagnostics\":[{\"code\":\""
            << diagnostic.code << "\",\"severity\":\"" << diagnostic.severity << "\",\"message\":\""
            << escape(diagnostic.message) << "\"}]}";
+  }
+  output << "],\"diagnostics\":[";
+  for (std::size_t i = 0; i < result.diagnostics.size(); ++i) {
+    if (i) output << ',';
+    const auto& diagnostic = result.diagnostics[i];
+    output << "{\"code\":\"" << diagnostic.code << "\",\"severity\":\"" << diagnostic.severity
+           << "\",\"message\":\"" << escape(diagnostic.message) << "\",\"file\":\""
+           << escape(diagnostic.sourceFile.generic_string()) << "\"}";
+  }
+  output << "],\"blocking_errors\":[";
+  bool firstTopLevelError = true;
+  for (const auto& diagnostic : result.diagnostics) if (diagnostic.severity == "error") {
+    if (!firstTopLevelError) output << ',';
+    firstTopLevelError = false;
+    output << "{\"code\":\"" << diagnostic.code << "\",\"message\":\""
+           << escape(diagnostic.message) << "\",\"file\":\""
+           << escape(diagnostic.sourceFile.generic_string()) << "\"}";
   }
   output << "]}";
   return output.str();
@@ -1016,11 +1075,11 @@ ProjectLoadResult loadPackage(const std::filesystem::path& packageFile, ProjectO
   ProjectLoadResult result;
   result.options = std::move(options);
   const auto package = std::filesystem::absolute(packageFile).lexically_normal();
-  if (!std::filesystem::exists(package)) throw std::runtime_error("Package not found: " + package.string());
+  if (!std::filesystem::exists(package)) throw std::runtime_error("Package not found: " + pathToUtf8(package));
   const auto packageDir = package.parent_path();
   result.options.searchPaths.insert(result.options.searchPaths.begin(), packageDir);
   const auto dproj = result.options.dprojFile.empty()
-      ? package.parent_path() / (package.stem().string() + ".dproj")
+      ? package.parent_path() / (pathToUtf8(package.stem()) + ".dproj")
       : result.options.dprojFile;
   loadDproj(dproj, result.options, result.diagnostics);
   if (!result.diagnostics.empty()) result.analyzer.setEnvironmentComplete(false);
@@ -1078,10 +1137,10 @@ ProjectLoadResult loadPackage(const std::filesystem::path& packageFile, ProjectO
   while (!pending.empty()) {
     auto path = std::filesystem::absolute(pending.back()).lexically_normal();
     pending.pop_back();
-    const auto key = lower(path.string());
+    const auto key = lower(pathToUtf8(path));
     if (loaded.contains(key)) continue;
     if (!std::filesystem::exists(path)) {
-      result.diagnostics.push_back("Source not found: " + path.string());
+      result.diagnostics.push_back("Source not found: " + pathToUtf8(path));
       continue;
     }
     const auto source = readFile(path);
@@ -1093,7 +1152,7 @@ ProjectLoadResult loadPackage(const std::filesystem::path& packageFile, ProjectO
     for (const auto& use : ast.uses) {
       if (const auto found = findUnit(use.name, result.options.searchPaths, result.options.namespaces)) {
         if (lower(found->candidateName) != lower(use.name)) result.analyzer.addUnitAlias(use.name, found->candidateName);
-        if (!loaded.contains(lower(std::filesystem::absolute(found->path).lexically_normal().string())))
+        if (!loaded.contains(lower(pathToUtf8(std::filesystem::absolute(found->path).lexically_normal()))))
           pending.push_back(found->path);
       }
     }

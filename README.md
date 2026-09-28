@@ -478,7 +478,7 @@ The authoritative catalog JSON contains deterministic, case-insensitively ordere
 
 `compare-units` works only from persistent indexes and never rescans the V500/V600 source trees. Approved seed mappings have priority but are validated against the right index; a missing seed target is downgraded and diagnosed. JSON is authoritative, while CSV and searchable HTML are optional views generated from the same deterministic mapping model.
 
-Validation defaults are conservative: `no_unit_declaration` is a recoverable warning; parse failures, duplicate unit declarations, invalid seed data, missing seed targets, and incompatible approved signatures are blocking errors. Use `--validation-policy <file>` to override individual codes with `code=warning` or `code=error` lines. Blocking validation errors return a non-zero exit code and prevent publishing the requested index or mapping catalog.
+Validation defaults are conservative: `no_unit_declaration` is a recoverable warning; parse failures, duplicate unit declarations, invalid seed data, missing seed targets, and incompatible approved signatures are blocking errors. Use `--validation-policy <file>` to override individual codes with `code=info`, `code=warning`, or `code=error` lines. Blocking validation errors return a non-zero exit code and prevent publishing the requested index or mapping catalog.
 
 Default severity table:
 
@@ -486,6 +486,7 @@ Default severity table:
 | --- | --- | --- |
 | `no_unit_declaration` | warning | `.pas` fragment/include without a valid `unit` declaration |
 | `source_unit_not_indexed` | warning | referenced source unit is unavailable |
+| `filesystem_path_encoding_error` | warning | one native Windows path could not be represented; that entry is skipped |
 | `missing_source_root` | error | configured index source root does not exist |
 | `source_scan_failed` | error | source tree could not be enumerated completely |
 | `file_read_error` | error | a source file could not be read |
@@ -502,6 +503,24 @@ Default severity table:
 | `seed_target_not_found` | error | approved seed target is absent from V600 |
 | `seed_signature_incompatible` | error | approved source/target signatures conflict |
 | `seed_without_export_evidence` | warning | seed target exists but has no shared exported evidence |
+| `seed_missing_exports` | warning | approved target omits one or more legacy exports |
+| `missing_source_root` | error | requested source root does not exist |
+| `source_scan_failed` | error | source tree enumeration was incomplete |
+| `file_read_error` | error | source file could not be read |
+| `incomplete_unit` | error | unit declaration exists but source is incomplete |
+| `no_input_units` | error | no valid units were available for an index |
+| `catalog_version_inconsistent` | error | one index mixes catalog versions |
+| `catalog_origin_inconsistent` | error | one index mixes source origins |
+| `package_metadata_inconsistent` | error | DCP/BPL metadata lacks a package identity |
+| `index_version_mismatch` | error | compare-units did not receive V500 on the left and V600 on the right |
+| `index_incomplete` | error | an index reports source parse failures |
+| `seed_missing_exports` | warning | seed target exists but omits legacy exports |
+| `seed_missing` | error | configured seed file is missing or empty |
+| `seed_parse_failed` | error | seed mapping record is malformed or contains an invalid enum |
+| `seed_schema_invalid` | error | seed JSON does not expose the required schema |
+| `no_input_units` | error | an index contains no valid unit records |
+| `index_version_mismatch` | error | left/right catalog version does not match V500/V600 |
+| `output_not_written` | info | output publication was skipped after blocking validation |
 
 Both index and compare-units JSON reports include:
 
@@ -522,6 +541,7 @@ An optional policy file can override defaults:
 # strict-validation.policy
 no_unit_declaration=error
 seed_target_not_found=warning
+source_unit_not_indexed=info
 ```
 
 When validation is blocking, the tool writes diagnostics to stdout, returns exit code `2`, and does not replace the requested `.jdi`, JSON, CSV, or HTML output.

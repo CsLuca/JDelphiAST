@@ -129,49 +129,113 @@ struct SeedMapping {
   bool nullTarget{};
 };
 
-std::string jsonStringField(std::string_view object, std::string_view field, bool& isNull) {
-  const auto key = "\"" + std::string(field) + "\"";
-  auto at = object.find(key);
-  if (at == std::string_view::npos) return {};
-  at = object.find(':', at + key.size());
-  if (at == std::string_view::npos) return {};
-  ++at;
-  while (at < object.size() && std::isspace(static_cast<unsigned char>(object[at]))) ++at;
-  if (object.substr(at, 4) == "null") { isNull = true; return {}; }
-  if (at >= object.size() || object[at] != '"') return {};
-  ++at;
-  std::string result;
-  while (at < object.size() && object[at] != '"') {
-    if (object[at] == '\\' && at + 1 < object.size()) ++at;
-    result += object[at++];
+class SeedJsonParser {
+ public:
+  explicit SeedJsonParser(std::string_view source) : source_(source) {}
+
+  std::vector<SeedMapping> parse() {
+    expect('{');
+    std::string schema;
+    std::vector<SeedMapping> mappings;
+    bool sawMappings = false;
+    while (!consume('}')) {
+      const auto key = string(); expect(':');
+      if (key == "schema_version") schema = string();
+      else if (key == "mappings") { sawMappings = true; mappings = mappingArray(); }
+      else skipValue();
+      if (!consume(',')) expect('}'); else continue;
+      break;
+    }
+    skip();
+    if (position_ != source_.size() || schema != "1.0" || !sawMappings || mappings.empty())
+      throw std::runtime_error("Invalid seed mapping schema");
+    return mappings;
   }
-  return result;
-}
+
+ private:
+  std::vector<SeedMapping> mappingArray() {
+    std::vector<SeedMapping> result;
+    expect('[');
+    if (consume(']')) return result;
+    while (true) {
+      result.push_back(mapping());
+      if (consume(']')) break;
+      expect(',');
+    }
+    return result;
+  }
+  SeedMapping mapping() {
+    SeedMapping value;
+    expect('{');
+    while (!consume('}')) {
+      const auto key = string(); expect(':');
+      if (key == "v600_unit" && literal("null")) value.nullTarget = true;
+      else if (key == "v500_unit") value.left = string();
+      else if (key == "v600_unit") value.right = string();
+      else if (key == "mapping_type") value.type = string();
+      else if (key == "confidence") value.confidence = string();
+      else if (key == "automatic_action") value.action = string();
+      else if (key == "notes") { if (!literal("null")) value.notes = string(); }
+      else skipValue();
+      if (!consume(',')) expect('}'); else continue;
+      break;
+    }
+    return value;
+  }
+  std::string string() {
+    skip(); expectRaw('"');
+    std::string value;
+    while (position_ < source_.size() && source_[position_] != '"') {
+      if (source_[position_] == '\\') {
+        if (++position_ >= source_.size()) fail();
+        const char escaped = source_[position_++];
+        if (escaped == 'n') value += '\n'; else if (escaped == 'r') value += '\r';
+        else if (escaped == 't') value += '\t'; else if (escaped == '"' || escaped == '\\' || escaped == '/') value += escaped;
+        else fail();
+      } else value += source_[position_++];
+    }
+    expectRaw('"');
+    return value;
+  }
+  void skipValue() {
+    skip();
+    if (position_ >= source_.size()) fail();
+    if (source_[position_] == '"') { (void)string(); return; }
+    if (source_[position_] == '{' || source_[position_] == '[') {
+      const char open = source_[position_++], close = open == '{' ? '}' : ']';
+      int depth = 1; bool quoted = false;
+      while (position_ < source_.size() && depth) {
+        const char c = source_[position_++];
+        if (quoted && c == '\\') { if (position_ < source_.size()) ++position_; continue; }
+        if (c == '"') quoted = !quoted;
+        else if (!quoted && c == open) ++depth;
+        else if (!quoted && c == close) --depth;
+      }
+      if (depth) fail();
+      return;
+    }
+    while (position_ < source_.size() && source_[position_] != ',' && source_[position_] != '}' && source_[position_] != ']') ++position_;
+  }
+  bool literal(std::string_view value) {
+    skip();
+    if (source_.substr(position_, value.size()) != value) return false;
+    position_ += value.size(); return true;
+  }
+  bool consume(char value) { skip(); if (position_ < source_.size() && source_[position_] == value) { ++position_; return true; } return false; }
+  void expect(char value) { skip(); expectRaw(value); }
+  void expectRaw(char value) { if (position_ >= source_.size() || source_[position_] != value) fail(); ++position_; }
+  void skip() { while (position_ < source_.size() && std::isspace(static_cast<unsigned char>(source_[position_]))) ++position_; }
+  [[noreturn]] void fail() const { throw std::runtime_error("Invalid seed mapping JSON"); }
+  std::string_view source_; std::size_t position_{};
+};
 
 std::vector<SeedMapping> loadSeed(const std::filesystem::path& file) {
-  std::vector<SeedMapping> result;
-  if (file.empty()) return result;
+  if (file.empty()) return {};
   const auto source = readFile(file);
   if (source.empty()) throw std::runtime_error("Seed mapping file is missing or empty: " + file.string());
-  if (source.find("\"schema_version\"") == std::string::npos || source.find("\"1.0\"") == std::string::npos ||
-      source.find("\"mappings\"") == std::string::npos || source.find('[') == std::string::npos ||
-      source.rfind(']') == std::string::npos || source.find('{') == std::string::npos || source.rfind('}') == std::string::npos)
-    throw std::runtime_error("Invalid seed mapping schema: " + file.string());
+  auto result = SeedJsonParser(source).parse();
   std::set<std::string> seen;
-  std::size_t at = 0;
-  while ((at = source.find("\"v500_unit\"", at)) != std::string::npos) {
-    const auto begin = source.rfind('{', at);
-    const auto end = source.find('}', at);
-    if (begin == std::string::npos || end == std::string::npos) break;
-    const auto object = std::string_view(source).substr(begin, end - begin + 1);
-    SeedMapping mapping;
-    bool ignored = false;
-    mapping.left = jsonStringField(object, "v500_unit", ignored);
-    mapping.right = jsonStringField(object, "v600_unit", mapping.nullTarget);
-    mapping.type = jsonStringField(object, "mapping_type", ignored);
-    mapping.confidence = jsonStringField(object, "confidence", ignored);
-    mapping.action = jsonStringField(object, "automatic_action", ignored);
-    mapping.notes = jsonStringField(object, "notes", ignored);
+  for (const auto& mapping : result) {
     if (mapping.left.empty() || mapping.type.empty() || mapping.confidence.empty() || mapping.action.empty())
       throw std::runtime_error("Incomplete seed mapping in " + file.string());
     const auto key = lower(mapping.left);
@@ -187,8 +251,6 @@ std::vector<SeedMapping> loadSeed(const std::filesystem::path& file) {
     if (mapping.nullTarget && mapping.type != "relocated_symbols" && mapping.type != "semantic_migration_required" &&
         mapping.type != "removed_no_equivalent" && mapping.type != "not_found")
       throw std::runtime_error("Seed mapping requires a V600 target for " + mapping.left);
-    result.push_back(std::move(mapping));
-    at = end + 1;
   }
   return result;
 }
@@ -596,20 +658,9 @@ UnitMapOutput compareUnits(const UnitMapOptions& options, const std::vector<Inde
   };
   auto left = leftInput;
   auto right = rightInput;
-  std::unordered_map<std::string, std::string> severityPolicy;
-  if (!options.validationPolicy.empty()) {
-    std::istringstream policy(readFile(options.validationPolicy));
-    std::string line;
-    while (std::getline(policy, line)) {
-      const auto equal = line.find('=');
-      if (equal == std::string::npos || line.empty() || line[0] == '#') continue;
-      severityPolicy[lower(line.substr(0, equal))] = lower(line.substr(equal + 1));
-    }
-  }
+  const auto severityPolicy = loadValidationPolicy(options.validationPolicy);
   const auto diagnosticSeverity = [&](std::string_view code) {
-    const auto found = severityPolicy.find(lower(std::string(code)));
-    if (found != severityPolicy.end()) return found->second;
-    return code == "seed_target_not_found" || code == "seed_signature_incompatible" ? std::string("error") : std::string("warning");
+    return validationSeverity(code, severityPolicy);
   };
   const auto byName = [](const IndexedUnit& a, const IndexedUnit& b) {
     const auto leftName = lower(a.name), rightName = lower(b.name);
@@ -617,7 +668,17 @@ UnitMapOutput compareUnits(const UnitMapOptions& options, const std::vector<Inde
   };
   std::sort(left.begin(), left.end(), byName);
   std::sort(right.begin(), right.end(), byName);
-  const auto seeds = loadSeed(options.seedFile);
+  std::vector<SeedMapping> seeds;
+  std::vector<ValidationDiagnostic> earlyDiagnostics = options.validationDiagnostics;
+  if (!options.seedFile.empty()) {
+    try { seeds = loadSeed(options.seedFile); }
+    catch (const std::exception& error) {
+      const std::string message = error.what();
+      const auto code = message.find("missing or empty") != std::string::npos ? "seed_missing"
+                      : message.find("schema") != std::string::npos ? "seed_schema_invalid" : "seed_parse_failed";
+      earlyDiagnostics.push_back({code, diagnosticSeverity(code), message, options.seedFile, {}});
+    }
+  }
   const std::unordered_map<std::string, std::string> namespaces = {
       {"sysutils", "System.SysUtils"}, {"classes", "System.Classes"}, {"forms", "Vcl.Forms"},
       {"comctrls", "Vcl.ComCtrls"}, {"actnlist", "Vcl.ActnList"}, {"db", "Data.DB"},
@@ -756,15 +817,14 @@ UnitMapOutput compareUnits(const UnitMapOptions& options, const std::vector<Inde
   for (const auto& mapping : mappings) ++statistics[mapping.compatibility];
   int validationErrors = 0;
   int validationWarnings = 0;
-  std::vector<ValidationDiagnostic> validationDiagnostics = options.validationDiagnostics;
+  std::vector<ValidationDiagnostic> validationDiagnostics = std::move(earlyDiagnostics);
   for (const auto& mapping : mappings) {
     for (const auto& diagnostic : mapping.diagnostics) {
       validationDiagnostics.push_back({diagnostic, diagnosticSeverity(diagnostic), diagnostic, {}, mapping.left->name});
     }
   }
   for (auto& diagnostic : validationDiagnostics) {
-    const auto overrideSeverity = severityPolicy.find(lower(diagnostic.code));
-    if (overrideSeverity != severityPolicy.end()) diagnostic.severity = overrideSeverity->second;
+    diagnostic.severity = validationSeverity(diagnostic.code, severityPolicy);
     if (diagnostic.severity == "error") ++validationErrors;
     else ++validationWarnings;
   }

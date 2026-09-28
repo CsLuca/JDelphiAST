@@ -4,6 +4,8 @@
 
 #include <filesystem>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace jdelphiast {
@@ -43,6 +45,10 @@ struct ValidationDiagnostic {
   std::string unit;
 };
 
+struct ValidationPolicy {
+  std::unordered_map<std::string, std::string> severities;
+};
+
 struct IndexStatistics {
   std::size_t filesScanned{};
   std::size_t unitsIndexed{};
@@ -76,6 +82,8 @@ struct IndexLoadResult {
                                             ProjectOptions options = {});
 [[nodiscard]] std::vector<IndexedUnit> loadSymbolIndex(const std::filesystem::path& indexFile);
 [[nodiscard]] IndexLoadResult loadSymbolIndexValidated(const std::filesystem::path& indexFile);
+[[nodiscard]] ValidationPolicy loadValidationPolicy(const std::filesystem::path& policyFile);
+[[nodiscard]] std::string validationSeverity(std::string_view code, const ValidationPolicy& policy);
 [[nodiscard]] std::vector<IndexedUnit> bundledSymbolIndex();
 [[nodiscard]] std::string createSymbolIndex(const std::vector<std::filesystem::path>& sources);
 [[nodiscard]] std::string createSymbolIndex(const std::vector<std::filesystem::path>& sources,

@@ -70,6 +70,10 @@ end.)");
           "unused dependency has only no_references reason");
   require(dependency(consumer, "Vendor.Secret").status == jdelphiast::DependencyStatus::Unknown,
           "missing source is unknown");
+  require(dependency(consumer, "Vendor.Secret").confidence == jdelphiast::Confidence::Low,
+          "missing source has low confidence");
+  require(dependency(consumer, "Vendor.Secret").reasons.front() == "source_unit_not_indexed: Vendor.Secret",
+          "missing source remains a non-removal diagnostic");
   require(dependency(consumer, "System.SysUtils").references.front().range.begin.line == 10,
           "CRLF line is preserved");
   require(jdelphiast::toJson(result).find("\"schemaVersion\":1") != std::string::npos,
