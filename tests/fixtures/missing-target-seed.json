@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0",
+  "mappings": [
+    {
+      "v500_unit": "CSETables",
+      "v600_unit": "Missing.Target",
+      "mapping_type": "unit_rename",
+      "confidence": "high",
+      "automatic_action": "replace_in_uses"
+    }
+  ]
+}

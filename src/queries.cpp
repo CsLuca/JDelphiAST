@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iterator>
 #include <optional>
+#include <set>
 #include <sstream>
 
 namespace jdelphiast {
@@ -118,6 +119,125 @@ std::vector<const AstDeclaration*> matchingDeclarations(const IndexedUnit& unit,
   return result;
 }
 
+struct SeedMapping {
+  std::string left;
+  std::string right;
+  std::string type;
+  std::string confidence;
+  std::string action;
+  std::string notes;
+  bool nullTarget{};
+};
+
+std::string jsonStringField(std::string_view object, std::string_view field, bool& isNull) {
+  const auto key = "\"" + std::string(field) + "\"";
+  auto at = object.find(key);
+  if (at == std::string_view::npos) return {};
+  at = object.find(':', at + key.size());
+  if (at == std::string_view::npos) return {};
+  ++at;
+  while (at < object.size() && std::isspace(static_cast<unsigned char>(object[at]))) ++at;
+  if (object.substr(at, 4) == "null") { isNull = true; return {}; }
+  if (at >= object.size() || object[at] != '"') return {};
+  ++at;
+  std::string result;
+  while (at < object.size() && object[at] != '"') {
+    if (object[at] == '\\' && at + 1 < object.size()) ++at;
+    result += object[at++];
+  }
+  return result;
+}
+
+std::vector<SeedMapping> loadSeed(const std::filesystem::path& file) {
+  std::vector<SeedMapping> result;
+  if (file.empty()) return result;
+  const auto source = readFile(file);
+  if (source.empty()) throw std::runtime_error("Seed mapping file is missing or empty: " + file.string());
+  if (source.find("\"schema_version\"") == std::string::npos || source.find("\"1.0\"") == std::string::npos ||
+      source.find("\"mappings\"") == std::string::npos || source.find('[') == std::string::npos ||
+      source.rfind(']') == std::string::npos || source.find('{') == std::string::npos || source.rfind('}') == std::string::npos)
+    throw std::runtime_error("Invalid seed mapping schema: " + file.string());
+  std::set<std::string> seen;
+  std::size_t at = 0;
+  while ((at = source.find("\"v500_unit\"", at)) != std::string::npos) {
+    const auto begin = source.rfind('{', at);
+    const auto end = source.find('}', at);
+    if (begin == std::string::npos || end == std::string::npos) break;
+    const auto object = std::string_view(source).substr(begin, end - begin + 1);
+    SeedMapping mapping;
+    bool ignored = false;
+    mapping.left = jsonStringField(object, "v500_unit", ignored);
+    mapping.right = jsonStringField(object, "v600_unit", mapping.nullTarget);
+    mapping.type = jsonStringField(object, "mapping_type", ignored);
+    mapping.confidence = jsonStringField(object, "confidence", ignored);
+    mapping.action = jsonStringField(object, "automatic_action", ignored);
+    mapping.notes = jsonStringField(object, "notes", ignored);
+    if (mapping.left.empty() || mapping.type.empty() || mapping.confidence.empty() || mapping.action.empty())
+      throw std::runtime_error("Incomplete seed mapping in " + file.string());
+    const auto key = lower(mapping.left);
+    if (!seen.insert(key).second) throw std::runtime_error("Duplicate seed mapping for " + mapping.left);
+    if (mapping.confidence != "low" && mapping.confidence != "medium" && mapping.confidence != "high")
+      throw std::runtime_error("Invalid seed confidence for " + mapping.left);
+    const std::set<std::string> types = {"unit_rename", "namespace_migration", "partial_compatibility",
+        "relocated_symbols", "semantic_migration_required", "removed_no_equivalent", "ambiguous", "not_found"};
+    const std::set<std::string> actions = {"replace_in_uses", "conditional_replace_in_uses", "symbol_by_symbol",
+        "manual_required", "do_not_remove", "review_required"};
+    if (!types.contains(mapping.type) || !actions.contains(mapping.action))
+      throw std::runtime_error("Invalid seed mapping enum for " + mapping.left);
+    if (mapping.nullTarget && mapping.type != "relocated_symbols" && mapping.type != "semantic_migration_required" &&
+        mapping.type != "removed_no_equivalent" && mapping.type != "not_found")
+      throw std::runtime_error("Seed mapping requires a V600 target for " + mapping.left);
+    result.push_back(std::move(mapping));
+    at = end + 1;
+  }
+  return result;
+}
+
+std::vector<std::string> commonExports(const IndexedUnit& left, const IndexedUnit& right) {
+  std::vector<std::string> result;
+  for (const auto& symbol : left.symbols)
+    if (std::any_of(right.symbols.begin(), right.symbols.end(), [&](const std::string& candidate) {
+          return lower(candidate) == lower(symbol);
+        })) result.push_back(symbol);
+  std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) { return lower(a) < lower(b); });
+  return result;
+}
+
+std::vector<std::string> missingExports(const IndexedUnit& left, const IndexedUnit& right) {
+  std::vector<std::string> result;
+  for (const auto& symbol : left.symbols)
+    if (std::none_of(right.symbols.begin(), right.symbols.end(), [&](const std::string& candidate) {
+          return lower(candidate) == lower(symbol);
+        })) result.push_back(symbol);
+  std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) { return lower(a) < lower(b); });
+  return result;
+}
+
+int confidenceRank(std::string_view confidence) {
+  if (confidence == "high") return 3;
+  if (confidence == "medium") return 2;
+  return 1;
+}
+
+std::string csvEscape(std::string_view value) {
+  std::string result = "\"";
+  for (const char c : value) { if (c == '"') result += '"'; result += c; }
+  return result + '"';
+}
+
+std::string htmlEscape(std::string_view value) {
+  std::string result;
+  for (const char c : value) {
+    if (c == '&') result += "&amp;";
+    else if (c == '<') result += "&lt;";
+    else if (c == '>') result += "&gt;";
+    else if (c == '"') result += "&quot;";
+    else if (c == '\'') result += "&#39;";
+    else result += c;
+  }
+  return result;
+}
+
 }  // namespace
 
 std::string exportsJson(const std::filesystem::path& requested, const std::vector<IndexedUnit>& index) {
@@ -147,7 +267,7 @@ std::string exportsJson(const std::filesystem::path& requested, const std::vecto
     unit = &sourceUnit;
   } else unit = findUnit(index, requested.string());
   std::ostringstream output;
-  output << "{\"schema_version\":\"2.0\",\"unit\":\"" << escape(unit ? unit->name : requested.string())
+  output << "{\"schema_version\":\"2.1\",\"unit\":\"" << escape(unit ? unit->name : requested.string())
          << "\",\"source_file\":";
   if (!unit || unit->sourceFile.empty()) output << "null";
   else output << '"' << escape(unit->sourceFile.generic_string()) << '"';
@@ -172,13 +292,21 @@ std::string exportsJson(const std::filesystem::path& requested, const std::vecto
   }
   output << "],\"diagnostics\":[";
   if (!unit) writeDiagnostic(output, "source_unit_not_indexed", "Unit not found in source or index.");
-  output << "]}";
+  output << "],\"exports_summary\":{\"count\":" << (unit ? unit->symbols.size() : 0)
+         << ",\"public_functions\":";
+  std::size_t functions = 0, classes = 0, interfaces = 0;
+  if (unit) for (const auto& declaration : unit->declarations) {
+    if (declaration.kind == "function" || declaration.kind == "procedure") ++functions;
+    else if (declaration.kind == "class") ++classes;
+    else if (declaration.kind == "interface") ++interfaces;
+  }
+  output << functions << ",\"public_classes\":" << classes << ",\"public_interfaces\":" << interfaces << "}}";
   return output.str();
 }
 
 std::string symbolJson(const SymbolQuery& query, const std::vector<IndexedUnit>& index) {
   std::ostringstream output;
-  output << "{\"schema_version\":\"2.0\",\"query\":{\"name\":\"" << escape(query.name) << "\"},\"matches\":[";
+  output << "{\"schema_version\":\"2.1\",\"query\":{\"name\":\"" << escape(query.name) << "\"},\"matches\":[";
   bool first = true;
   for (const auto& unit : index) {
     if (!query.unit.empty() && lower(unit.name) != lower(query.unit)) continue;
@@ -211,7 +339,7 @@ std::string symbolJson(const SymbolQuery& query, const std::vector<IndexedUnit>&
 std::string unitInfoJson(std::string_view requested, const std::vector<IndexedUnit>& index) {
   const auto* unit = findUnit(index, requested);
   std::ostringstream output;
-  output << "{\"schema_version\":\"2.0\",\"unit\":\"" << escape(requested)
+  output << "{\"schema_version\":\"2.1\",\"unit\":\"" << escape(requested)
          << "\",\"normalized_unit\":\"" << escape(lower(std::string(requested))) << "\",\"source_file\":";
   if (!unit || unit->sourceFile.empty()) output << "null"; else output << '"' << escape(unit->sourceFile.generic_string()) << '"';
   output << ",\"index_status\":\"" << (unit ? "indexed" : "not_found") << "\",\"package\":{\"name\":";
@@ -240,7 +368,7 @@ std::string expressionJson(const std::filesystem::path& file, std::size_t line,
                            const std::vector<IndexedUnit>& index) {
   if (!std::filesystem::is_regular_file(file)) {
     std::ostringstream output;
-    output << "{\"schema_version\":\"2.0\",\"file\":\"" << escape(file.generic_string())
+    output << "{\"schema_version\":\"2.1\",\"file\":\"" << escape(file.generic_string())
            << "\",\"line\":" << line << ",\"expression\":\"\",\"resolved\":false,\"type\":null,"
               "\"receiver\":null,\"called_symbol\":null,\"confidence\":\"low\",\"diagnostics\":[";
     writeDiagnostic(output, "source_file_not_found", "Source file was not found.", file.generic_string(), line);
@@ -291,7 +419,7 @@ std::string expressionJson(const std::filesystem::path& file, std::size_t line,
   const auto* owner = resolved ? matches.front().first : nullptr;
   const auto* match = resolved ? matches.front().second : nullptr;
   std::ostringstream output;
-  output << "{\"schema_version\":\"2.0\",\"file\":\"" << escape(file.generic_string())
+  output << "{\"schema_version\":\"2.1\",\"file\":\"" << escape(file.generic_string())
          << "\",\"line\":" << line << ",\"expression\":\"" << escape(text)
          << "\",\"resolved\":" << (resolved ? "true" : "false") << ",\"type\":";
   if (!match) output << "null";
@@ -318,7 +446,7 @@ std::string hierarchyJson(const std::filesystem::path& file, std::string_view cl
                           const std::vector<IndexedUnit>& index) {
   if (!std::filesystem::is_regular_file(file)) {
     std::ostringstream output;
-    output << "{\"schema_version\":\"2.0\",\"class\":{\"name\":\"" << escape(className)
+    output << "{\"schema_version\":\"2.1\",\"class\":{\"name\":\"" << escape(className)
            << "\",\"qualified_name\":null,\"source_file\":\"" << escape(file.generic_string())
            << "\"},\"base_class\":null,\"ancestors\":[],\"methods\":[],\"diagnostics\":[";
     writeDiagnostic(output, "source_file_not_found", "Source file was not found.", file.generic_string());
@@ -330,7 +458,7 @@ std::string hierarchyJson(const std::filesystem::path& file, std::string_view cl
   const InheritanceRelation* relation = nullptr;
   for (const auto& candidate : ast.inheritance) if (lower(candidate.type) == lower(std::string(className))) relation = &candidate;
   std::ostringstream output;
-  output << "{\"schema_version\":\"2.0\",\"class\":{\"name\":\"" << escape(className)
+  output << "{\"schema_version\":\"2.1\",\"class\":{\"name\":\"" << escape(className)
          << "\",\"qualified_name\":\"" << escape(ast.name + "." + std::string(className))
          << "\",\"source_file\":\"" << escape(file.generic_string()) << "\"},\"base_class\":";
   if (!relation) output << "null";
@@ -404,7 +532,7 @@ std::string compareSymbolJson(std::string_view symbol, const std::vector<Indexed
   std::vector<std::string> leftExports;
   if (leftUnit) leftExports = leftUnit->symbols;
   std::ostringstream output;
-  output << "{\"schema_version\":\"2.0\",\"left\":{\"version\":\""
+  output << "{\"schema_version\":\"2.1\",\"left\":{\"version\":\""
          << escape(leftUnit ? leftUnit->indexVersion : "unknown") << "\",\"unit\":\""
          << escape(leftUnit ? leftUnit->name : std::string(symbol)) << "\",\"exports\":[";
   for (std::size_t i = 0; i < leftExports.size(); ++i) {
@@ -441,7 +569,7 @@ std::string compareSymbolJson(std::string_view symbol, const std::vector<Indexed
     output << "{\"unit\":\"" << escape(unit.name) << "\",\"source_file\":";
     if (unit.sourceFile.empty()) output << "null"; else output << '"' << escape(unit.sourceFile.generic_string()) << '"';
     output << ",\"matching_exports\":[";
-    for (std::size_t i = 0; i < matching.size(); ++i) { if (i) output << ','; output << '"' << escape(matching[i]) << '"'; }
+    for (std::size_t i = 0; i < unit.symbols.size(); ++i) { if (i) output << ','; output << '"' << escape(unit.symbols[i]) << '"'; }
     output << "],\"missing_exports\":[";
     for (std::size_t i = 0; i < missing.size(); ++i) { if (i) output << ','; output << '"' << escape(missing[i]) << '"'; }
     const auto compatibility = !declarationsCompatible ? "partial_compatible"
@@ -455,6 +583,310 @@ std::string compareSymbolJson(std::string_view symbol, const std::vector<Indexed
   else if (first) writeDiagnostic(output, "legacy_symbol_unmapped", "No verified mapping was found in the right index.");
   output << "]}";
   return output.str();
+}
+
+UnitMapOutput compareUnits(const UnitMapOptions& options, const std::vector<IndexedUnit>& leftInput,
+                           const std::vector<IndexedUnit>& rightInput, std::string_view generatedAt) {
+  struct Mapping {
+    const IndexedUnit* left{};
+    const IndexedUnit* right{};
+    std::string type, compatibility, confidence, action, notes;
+    std::vector<std::string> matched, missing, incompatible, candidates, diagnostics;
+    int nameScore{}, signatureMatches{}, signatureIncompatible{};
+  };
+  auto left = leftInput;
+  auto right = rightInput;
+  std::unordered_map<std::string, std::string> severityPolicy;
+  if (!options.validationPolicy.empty()) {
+    std::istringstream policy(readFile(options.validationPolicy));
+    std::string line;
+    while (std::getline(policy, line)) {
+      const auto equal = line.find('=');
+      if (equal == std::string::npos || line.empty() || line[0] == '#') continue;
+      severityPolicy[lower(line.substr(0, equal))] = lower(line.substr(equal + 1));
+    }
+  }
+  const auto diagnosticSeverity = [&](std::string_view code) {
+    const auto found = severityPolicy.find(lower(std::string(code)));
+    if (found != severityPolicy.end()) return found->second;
+    return code == "seed_target_not_found" || code == "seed_signature_incompatible" ? std::string("error") : std::string("warning");
+  };
+  const auto byName = [](const IndexedUnit& a, const IndexedUnit& b) {
+    const auto leftName = lower(a.name), rightName = lower(b.name);
+    return leftName == rightName ? a.name < b.name : leftName < rightName;
+  };
+  std::sort(left.begin(), left.end(), byName);
+  std::sort(right.begin(), right.end(), byName);
+  const auto seeds = loadSeed(options.seedFile);
+  const std::unordered_map<std::string, std::string> namespaces = {
+      {"sysutils", "System.SysUtils"}, {"classes", "System.Classes"}, {"forms", "Vcl.Forms"},
+      {"comctrls", "Vcl.ComCtrls"}, {"actnlist", "Vcl.ActnList"}, {"db", "Data.DB"},
+      {"generics.collections", "System.Generics.Collections"}, {"comobj", "System.Win.ComObj"},
+      {"clipbrd", "Vcl.Clipbrd"}};
+  const std::set<std::string> semanticOnly = {"csmail", "rnote", "uvaristd", "iacquisti", "iquoart",
+      "icontatti", "ustamain", "cbfrig", "fsecstdns", "fgridstdns", "cercaprezzostd"};
+  std::vector<Mapping> mappings;
+  for (const auto& leftUnit : left) {
+    Mapping mapping;
+    mapping.left = &leftUnit;
+    const auto seed = std::find_if(seeds.begin(), seeds.end(), [&](const SeedMapping& item) {
+      return lower(item.left) == lower(leftUnit.name);
+    });
+    if (seed != seeds.end()) {
+      mapping.type = "seeded_mapping";
+      mapping.compatibility = seed->type == "partial_compatibility" ? "partial_compatible"
+                            : seed->type == "relocated_symbols" ? "relocated_symbols"
+                            : seed->type == "semantic_migration_required" ? "semantic_migration_required"
+                            : seed->type == "removed_no_equivalent" ? "not_found" : "full_compatible";
+      mapping.confidence = seed->confidence.empty() ? "high" : seed->confidence;
+      mapping.action = seed->action.empty() ? "review_required" : seed->action;
+      mapping.notes = seed->notes;
+      if (!seed->nullTarget) mapping.right = findUnit(right, seed->right);
+      if (!seed->nullTarget && !mapping.right) {
+        mapping.type = "not_found";
+        mapping.compatibility = "not_found";
+        mapping.confidence = "low";
+        mapping.action = "review_required";
+        mapping.diagnostics.push_back("seed_target_not_found");
+      }
+    } else if (semanticOnly.contains(lower(leftUnit.name))) {
+      mapping.type = lower(leftUnit.name) == "rnote" ? "relocated_symbols" : "semantic_migration_required";
+      mapping.compatibility = mapping.type;
+      mapping.confidence = "high";
+      mapping.action = mapping.type == "relocated_symbols" ? "symbol_by_symbol" : "manual_required";
+    } else {
+      mapping.right = findUnit(right, leftUnit.name);
+      if (mapping.right) mapping.nameScore = 100;
+      if (!mapping.right) {
+        const auto known = namespaces.find(lower(leftUnit.name));
+        if (known != namespaces.end()) { mapping.right = findUnit(right, known->second); mapping.nameScore = 95; }
+      }
+      if (!mapping.right) {
+        const auto simple = lower(leftUnit.name.substr(leftUnit.name.find_last_of('.') == std::string::npos
+                                                          ? 0 : leftUnit.name.find_last_of('.') + 1));
+        std::vector<const IndexedUnit*> candidates;
+        for (const auto& candidate : right) {
+          const auto candidateSimple = lower(candidate.name.substr(candidate.name.find_last_of('.') == std::string::npos
+                                                                       ? 0 : candidate.name.find_last_of('.') + 1));
+          const auto common = commonExports(leftUnit, candidate);
+          if (candidateSimple == simple || common.size() >= 2) candidates.push_back(&candidate);
+        }
+        if (candidates.size() == 1) mapping.right = candidates.front();
+        else if (candidates.size() > 1) {
+          mapping.type = "ambiguous"; mapping.compatibility = "ambiguous"; mapping.confidence = "low";
+          mapping.action = "review_required";
+          for (const auto* candidate : candidates) mapping.candidates.push_back(candidate->name);
+        }
+      }
+      if (!mapping.right && mapping.type.empty() && leftUnit.symbols.size() >= 2) {
+        std::set<std::string> relocatedUnits;
+        std::size_t relocatedExports = 0;
+        for (const auto& exported : leftUnit.symbols) {
+          std::vector<std::string> owners;
+          for (const auto& candidate : right)
+            if (std::any_of(candidate.symbols.begin(), candidate.symbols.end(), [&](const std::string& symbol) {
+                  return lower(symbol) == lower(exported);
+                })) owners.push_back(candidate.name);
+          if (owners.size() == 1) { relocatedUnits.insert(owners.front()); ++relocatedExports; }
+        }
+        if (relocatedUnits.size() > 1 && relocatedExports >= 2) {
+          mapping.type = "relocated_symbols";
+          mapping.compatibility = "relocated_symbols";
+          mapping.confidence = relocatedExports == leftUnit.symbols.size() ? "high" : "medium";
+          mapping.action = "symbol_by_symbol";
+          mapping.candidates.assign(relocatedUnits.begin(), relocatedUnits.end());
+        }
+      }
+      if (mapping.right) {
+        mapping.matched = commonExports(leftUnit, *mapping.right);
+        mapping.missing = missingExports(leftUnit, *mapping.right);
+        for (const auto& name : mapping.matched) {
+          const auto l = matchingDeclarations(leftUnit, name);
+          const auto r = matchingDeclarations(*mapping.right, name);
+          if (!l.empty() && !r.empty() && !l.front()->signature.empty() && !r.front()->signature.empty()) {
+            if (lower(l.front()->signature) == lower(r.front()->signature)) ++mapping.signatureMatches;
+            else { ++mapping.signatureIncompatible; mapping.incompatible.push_back(name); }
+          }
+        }
+        const auto complete = !leftUnit.symbols.empty() && mapping.missing.empty() && mapping.signatureIncompatible == 0;
+        const auto nameEvidence = mapping.nameScore >= 95;
+        const auto signatureEvidence = mapping.signatureMatches > 0;
+        mapping.type = complete ? (mapping.nameScore == 95 ? "namespace_migration" : "unit_rename") : "partial_compatibility";
+        mapping.compatibility = complete ? "full_compatible" : "partial_compatible";
+        mapping.confidence = complete && (nameEvidence || signatureEvidence) ? "high" : "medium";
+        mapping.action = mapping.confidence == "high" && complete ? "replace_in_uses" : "review_required";
+      } else if (mapping.type.empty()) {
+        mapping.type = "not_found"; mapping.compatibility = "not_found"; mapping.confidence = "low";
+        mapping.action = "do_not_remove";
+      }
+    }
+    if (mapping.right && mapping.matched.empty()) {
+      mapping.matched = commonExports(leftUnit, *mapping.right);
+      mapping.missing = missingExports(leftUnit, *mapping.right);
+    }
+    if (seed != seeds.end() && mapping.right) {
+      for (const auto& name : mapping.matched) {
+        const auto leftDeclarations = matchingDeclarations(leftUnit, name);
+        const auto rightDeclarations = matchingDeclarations(*mapping.right, name);
+        if (!leftDeclarations.empty() && !rightDeclarations.empty() &&
+            !leftDeclarations.front()->signature.empty() && !rightDeclarations.front()->signature.empty()) {
+          if (lower(leftDeclarations.front()->signature) == lower(rightDeclarations.front()->signature)) ++mapping.signatureMatches;
+          else { ++mapping.signatureIncompatible; mapping.incompatible.push_back(name); }
+        }
+      }
+      const auto seedAllowsPartial = seed->type == "partial_compatibility" && seed->action == "conditional_replace_in_uses";
+      if (mapping.matched.empty() || mapping.signatureIncompatible > 0 || (!mapping.missing.empty() && !seedAllowsPartial)) {
+        mapping.confidence = mapping.signatureIncompatible > 0 ? "low" : "medium";
+        mapping.action = "review_required";
+        mapping.diagnostics.push_back(mapping.signatureIncompatible > 0 ? "seed_signature_incompatible"
+                                      : mapping.matched.empty() ? "seed_without_export_evidence" : "seed_missing_exports");
+      }
+    }
+    mappings.push_back(std::move(mapping));
+  }
+  const auto minimumRank = confidenceRank(options.minimumConfidence);
+  std::vector<const Mapping*> emitted;
+  for (const auto& mapping : mappings) {
+    if (confidenceRank(mapping.confidence) < minimumRank) continue;
+    if (mapping.compatibility == "not_found" && !options.includeUnmapped) continue;
+    if (mapping.type == "ambiguous" && !options.includeAmbiguous) continue;
+    emitted.push_back(&mapping);
+  }
+  std::unordered_map<std::string, int> statistics;
+  for (const auto& mapping : mappings) ++statistics[mapping.compatibility];
+  int validationErrors = 0;
+  int validationWarnings = 0;
+  std::vector<ValidationDiagnostic> validationDiagnostics = options.validationDiagnostics;
+  for (const auto& mapping : mappings) {
+    for (const auto& diagnostic : mapping.diagnostics) {
+      validationDiagnostics.push_back({diagnostic, diagnosticSeverity(diagnostic), diagnostic, {}, mapping.left->name});
+    }
+  }
+  for (auto& diagnostic : validationDiagnostics) {
+    const auto overrideSeverity = severityPolicy.find(lower(diagnostic.code));
+    if (overrideSeverity != severityPolicy.end()) diagnostic.severity = overrideSeverity->second;
+    if (diagnostic.severity == "error") ++validationErrors;
+    else ++validationWarnings;
+  }
+  if (validationErrors > 0)
+    validationDiagnostics.push_back({"output_not_written", "info",
+        "Output files were not written because validation contains blocking errors.", {}, {}});
+  std::ostringstream json;
+  json << "{\"schema_version\":\"1.0\",\"generated_at\":\"" << escape(generatedAt)
+       << "\",\"left_catalog\":{\"version\":\"" << escape(left.empty() ? "unknown" : left.front().indexVersion)
+       << "\",\"index\":\"" << escape(options.leftIndex.generic_string()) << "\"},\"right_catalog\":{\"version\":\""
+       << escape(right.empty() ? "unknown" : right.front().indexVersion) << "\",\"index\":\""
+       << escape(options.rightIndex.generic_string()) << "\"},\"statistics\":{\"v500_units\":" << left.size()
+       << ",\"v600_units\":" << right.size() << ",\"full_compatible\":" << statistics["full_compatible"]
+       << ",\"partial_compatible\":" << statistics["partial_compatible"]
+       << ",\"relocated_symbols\":" << statistics["relocated_symbols"]
+      << ",\"semantic_migration_required\":" << statistics["semantic_migration_required"]
+       << ",\"ambiguous\":" << statistics["ambiguous"] << ",\"not_found\":" << statistics["not_found"]
+       << ",\"mappings_emitted\":" << emitted.size()
+       << "},\"validation\":{\"has_blocking_errors\":" << (validationErrors > 0 ? "true" : "false")
+       << ",\"error_count\":" << validationErrors << ",\"warning_count\":" << validationWarnings
+       << "},\"mappings\":[";
+  for (std::size_t i = 0; i < emitted.size(); ++i) {
+    if (i) json << ',';
+    const auto& m = *emitted[i];
+    json << "{\"v500_unit\":\"" << escape(m.left->name) << "\",\"v500_normalized_unit\":\"" << escape(lower(m.left->name))
+         << "\",\"v500_source\":" << (m.left->sourceFile.empty() ? "null" : "\"" + escape(m.left->sourceFile.generic_string()) + "\"")
+         << ",\"v600_unit\":" << (m.right ? "\"" + escape(m.right->name) + "\"" : "null")
+         << ",\"v600_normalized_unit\":" << (m.right ? "\"" + escape(lower(m.right->name)) + "\"" : "null")
+         << ",\"v600_source\":" << (!m.right || m.right->sourceFile.empty() ? "null" : "\"" + escape(m.right->sourceFile.generic_string()) + "\"")
+         << ",\"mapping_type\":\"" << m.type << "\",\"compatibility\":\"" << m.compatibility
+         << "\",\"confidence\":\"" << m.confidence << "\",\"automatic_action\":\"" << m.action
+         << "\",\"evidence\":{\"name_match_score\":" << m.nameScore << ",\"export_match_count\":" << m.matched.size()
+         << ",\"export_missing_count\":" << m.missing.size() << ",\"signature_match_count\":" << m.signatureMatches
+         << ",\"signature_incompatible_count\":" << m.signatureIncompatible << ",\"package_relation\":null},\"matched_exports\":[";
+    if (options.includeSymbolDetails) for (std::size_t n = 0; n < m.matched.size(); ++n) { if (n) json << ','; json << '"' << escape(m.matched[n]) << '"'; }
+    json << "],\"missing_exports\":[";
+    if (options.includeSymbolDetails) for (std::size_t n = 0; n < m.missing.size(); ++n) { if (n) json << ','; json << '"' << escape(m.missing[n]) << '"'; }
+    json << "],\"incompatible_exports\":[";
+    if (options.includeSymbolDetails) for (std::size_t n = 0; n < m.incompatible.size(); ++n) { if (n) json << ','; json << '"' << escape(m.incompatible[n]) << '"'; }
+    json << "],\"candidates\":[";
+    for (std::size_t n = 0; n < m.candidates.size(); ++n) { if (n) json << ','; json << '"' << escape(m.candidates[n]) << '"'; }
+    json << "],\"notes\":" << (m.notes.empty() ? "null" : "\"" + escape(m.notes) + "\"") << ",\"diagnostics\":[";
+    for (std::size_t n = 0; n < m.diagnostics.size(); ++n) {
+      if (n) json << ',';
+      json << "{\"code\":\"" << escape(m.diagnostics[n]) << "\",\"severity\":\""
+           << diagnosticSeverity(m.diagnostics[n]) << "\",\"message\":\""
+           << escape(m.diagnostics[n]) << "\"}";
+    }
+    json << "]}";
+  }
+  json << "],\"unmapped_units\":[";
+  bool firstUnmapped = true;
+  for (const auto& m : mappings) if (m.compatibility == "not_found") { if (!firstUnmapped) json << ','; firstUnmapped = false; json << '"' << escape(m.left->name) << '"'; }
+  json << "],\"ambiguous_units\":[";
+  bool firstAmbiguous = true;
+  for (const auto& m : mappings) if (m.type == "ambiguous") { if (!firstAmbiguous) json << ','; firstAmbiguous = false; json << '"' << escape(m.left->name) << '"'; }
+  json << "],\"semantic_migration_required\":[";
+  bool firstSemantic = true;
+  for (const auto& m : mappings) if (m.compatibility == "semantic_migration_required" || m.compatibility == "relocated_symbols") {
+    if (!firstSemantic) json << ',';
+    firstSemantic = false;
+    json << "{\"symbol_or_unit\":\"" << escape(m.left->name) << "\",\"reason\":\""
+         << (m.compatibility == "relocated_symbols" ? "Symbols are distributed across V600 APIs." : "API flow requires semantic migration.") << "\"}";
+  }
+  const std::vector<std::pair<std::string, std::string>> requiredSemantic = {
+      {"CSMail", "Email/DMS/UI flow requires semantic migration."},
+      {"RNote", "Note API symbols require symbol-by-symbol migration."},
+      {"UVariStd", "Legacy globals require semantic migration."},
+      {"IAcquisti", "Legacy purchasing API requires semantic migration."},
+      {"IQuoArt", "Legacy quotation API requires semantic migration."},
+      {"IContatti", "Legacy contacts API requires semantic migration."},
+      {"UStaMain", "Legacy print flow requires semantic migration."},
+      {"CBFrig", "Legacy symbol or unit requires semantic migration."},
+      {"FSecStdNS", "Legacy form API requires semantic migration."},
+      {"FGridStdNS", "Legacy grid API requires semantic migration."},
+      {"CercaPrezzoStd", "Legacy pricing API requires semantic migration."}};
+  for (const auto& [name, reason] : requiredSemantic) {
+    const auto exists = std::any_of(mappings.begin(), mappings.end(), [&](const Mapping& mapping) {
+      return lower(mapping.left->name) == lower(name) &&
+             (mapping.compatibility == "semantic_migration_required" || mapping.compatibility == "relocated_symbols");
+    });
+    if (exists) continue;
+    if (!firstSemantic) json << ',';
+    firstSemantic = false;
+    json << "{\"symbol_or_unit\":\"" << name << "\",\"reason\":\"" << reason << "\"}";
+  }
+  json << "],\"diagnostics\":[";
+  for (std::size_t i = 0; i < validationDiagnostics.size(); ++i) {
+    if (i) json << ',';
+    const auto& diagnostic = validationDiagnostics[i];
+    json << "{\"code\":\"" << escape(diagnostic.code) << "\",\"severity\":\""
+         << escape(diagnostic.severity) << "\",\"message\":\"" << escape(diagnostic.message) << "\"";
+    if (!diagnostic.file.empty()) json << ",\"file\":\"" << escape(diagnostic.file.generic_string()) << "\"";
+    if (!diagnostic.unit.empty()) json << ",\"unit\":\"" << escape(diagnostic.unit) << "\"";
+    json << '}';
+  }
+  json << "],\"blocking_errors\":[";
+  bool firstBlocking = true;
+  for (const auto& diagnostic : validationDiagnostics) if (diagnostic.severity == "error") {
+    if (!firstBlocking) json << ',';
+    firstBlocking = false;
+    json << "{\"code\":\"" << escape(diagnostic.code) << "\",\"message\":\""
+         << escape(diagnostic.message) << "\"";
+    if (!diagnostic.unit.empty()) json << ",\"unit\":\"" << escape(diagnostic.unit) << "\"";
+    json << '}';
+  }
+  json << "]}";
+  std::ostringstream csv;
+  csv << "v500_unit,v600_unit,mapping_type,compatibility,confidence,automatic_action,matched_export_count,missing_export_count,notes\n";
+  for (const auto* item : emitted) csv << csvEscape(item->left->name) << ',' << csvEscape(item->right ? item->right->name : "")
+      << ',' << csvEscape(item->type) << ',' << csvEscape(item->compatibility) << ',' << csvEscape(item->confidence)
+      << ',' << csvEscape(item->action) << ',' << item->matched.size() << ',' << item->missing.size() << ',' << csvEscape(item->notes) << '\n';
+  std::ostringstream html;
+  html << "<!doctype html><html><head><meta charset=\"utf-8\"><title>Delphi unit mapping</title>"
+          "<style>body{font-family:system-ui;margin:2rem}input{padding:.6rem;width:24rem}table{border-collapse:collapse;width:100%;margin-top:1rem}th,td{border:1px solid #ccc;padding:.5rem;text-align:left}</style></head><body>"
+          "<h1>Delphi V500 to V600 unit mapping</h1><input id=\"q\" placeholder=\"Filter mappings\"><table id=\"m\"><thead><tr>"
+          "<th>V500 unit</th><th>V600 unit</th><th>Type</th><th>Compatibility</th><th>Confidence</th><th>Action</th></tr></thead><tbody>";
+  for (const auto* item : emitted) html << "<tr><td>" << htmlEscape(item->left->name) << "</td><td>" << htmlEscape(item->right ? item->right->name : "")
+      << "</td><td>" << htmlEscape(item->type) << "</td><td>" << htmlEscape(item->compatibility) << "</td><td>" << htmlEscape(item->confidence)
+      << "</td><td>" << htmlEscape(item->action) << "</td></tr>";
+  html << "</tbody></table><script>q.oninput=()=>{for(const r of m.tBodies[0].rows)r.hidden=!r.innerText.toLowerCase().includes(q.value.toLowerCase())}</script></body></html>";
+  return {json.str(), csv.str(), html.str(), validationErrors > 0};
 }
 
 }  // namespace jdelphiast

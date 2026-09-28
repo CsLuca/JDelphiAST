@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -16,7 +17,10 @@
 namespace {
 
 std::string timestamp() {
-  const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+  auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+  if (const auto* epoch = std::getenv("SOURCE_DATE_EPOCH")) {
+    try { now = static_cast<std::time_t>(std::stoll(epoch)); } catch (...) {}
+  }
   std::tm value{};
 #ifdef _WIN32
   localtime_s(&value, &now);
@@ -26,6 +30,21 @@ std::string timestamp() {
   char buffer[20]{};
   std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S", &value);
   return buffer;
+}
+
+void writeAtomic(const std::filesystem::path& path, std::string_view content) {
+  if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
+  const auto temporary = path.string() + ".tmp";
+  {
+    std::ofstream output(temporary, std::ios::binary);
+    if (!output) throw std::runtime_error("Cannot write " + temporary);
+    output << content;
+    output.flush();
+    if (!output) throw std::runtime_error("Failed writing " + temporary);
+  }
+  std::error_code error;
+  std::filesystem::remove(path, error);
+  std::filesystem::rename(temporary, path);
 }
 
 std::vector<jdelphiast::IndexedUnit> loadIndexes(const std::vector<std::filesystem::path>& files) {
@@ -67,6 +86,7 @@ USAGE
   DelphiAstTool.exe hierarchy (--file <unit.pas> | --dproj <project.dproj>) --class <name> [options] --format json
   DelphiAstTool.exe unit-info --unit <name> [--index <index.jdi>] --format json
   DelphiAstTool.exe compare-symbol --left-index <v500.jdi> --right-index <v600.jdi> --symbol <name> --format json
+  DelphiAstTool.exe compare-units --left-index <v500.jdi> --right-index <v600.jdi> --output <catalog.json> [options]
 
 PROJECT ANALYSIS OPTIONS
   --project <file.dpk>       Delphi package to analyze.
@@ -77,6 +97,7 @@ PROJECT ANALYSIS OPTIONS
   --search-path <dir>       Additional Delphi unit search path. May be repeated.
   --include-path <dir>      Additional include search path. May be repeated.
   --output <file>           Write the project report atomically to this file.
+  --unit-map <file.json>    Attach a previously generated compare-units catalog reference.
   --format json             Write schema v2 JSON to stdout. Accepted by semantic queries.
   --json                    Legacy direct-source JSON output.
 
@@ -94,9 +115,22 @@ INDEX OPTIONS
   --version <v500|v600>     Catalog version persisted in the JDI.
   --left-index <file.jdi>   Legacy side of compare-symbol.
   --right-index <file.jdi>  Destination side of compare-symbol.
+  --origin <text>           Catalog source origin persisted by index.
+  --source-root <path>      Additional source root scanned by index.
+  --package-root <path>     Root searched for real DPK metadata.
+  --validation-policy <file> Override diagnostic severity with code=warning|error lines.
+
+COMPARE-UNITS OPTIONS
+  --seed <file.json>        Approved mappings, evaluated before heuristics.
+  --include-unmapped        Include not_found entries in mappings.
+  --include-ambiguous       Include ambiguous entries in mappings.
+  --include-symbol-details  Include export and signature evidence.
+  --minimum-confidence <low|medium|high>
+  --csv <file.csv>          Optional CSV report.
+  --html <file.html>        Optional searchable HTML report.
 
 ANALYSIS OUTPUT
-  Project JSON preserves legacy schemaVersion=1 fields and adds schema_version="2.0".
+  Project JSON preserves legacy schemaVersion=1 fields and adds schema_version="2.1".
   Existing status, confidence, and reasons fields are never renamed or removed.
   V2 adds project, uses, references, symbols, inheritance, dependencies, diagnostics,
   preprocessor metadata, calls, assignments, and removal recommendations.
@@ -129,7 +163,15 @@ SEMANTIC SAFETY
 
 EXIT CODES
   0  Command executed and JSON/report produced. Semantic warnings may be in diagnostics.
-  2  Invalid command line or unrecoverable I/O/index error in legacy/index modes.
+  2  Invalid command line or blocking validation/I/O/index error.
+
+VALIDATION SEVERITY
+  Default warnings: no_unit_declaration, source_unit_not_indexed.
+  Default errors: missing source root, file read failure, parse failure, incomplete unit,
+  duplicate unit, duplicate symbol, malformed/inconsistent JDI, missing seed target,
+  seed signature incompatibility, and missing V500/V600 index.
+  Use --validation-policy <file> with code=warning or code=error lines to override.
+  Blocking errors are returned in validation.has_blocking_errors and blocking_errors.
 
 EXAMPLES
   DelphiAstTool.exe analyze --dproj Plugin.dproj --config Release --platform Win32 --index v600.jdi --format json
@@ -137,6 +179,7 @@ EXAMPLES
   DelphiAstTool.exe symbol --name RegCsProc --index v600.jdi --format json
   DelphiAstTool.exe expression --dproj Plugin.dproj --file UXPTab.pas --line 684 --index v600.jdi --format json
   DelphiAstTool.exe compare-symbol --left-index v500.jdi --right-index v600.jdi --symbol UCSTheme --format json
+  DelphiAstTool.exe compare-units --left-index v500.jdi --right-index v600.jdi --seed uses_mapping_seed.json --output uses_v500_to_v600.json --format json
 )";
 }
 
@@ -247,7 +290,7 @@ int runQuery(std::string_view command, int argc, char** argv) {
     }
     return 0;
   } catch (const std::exception& error) {
-    std::cout << "{\"schema_version\":\"2.0\",\"diagnostics\":[{\"code\":\"query_execution_failed\","
+    std::cout << "{\"schema_version\":\"2.1\",\"diagnostics\":[{\"code\":\"query_execution_failed\","
                  "\"severity\":\"error\",\"message\":\"";
     for (const char c : std::string(error.what())) {
       if (c == '\\' || c == '"') std::cout << '\\';
@@ -270,38 +313,109 @@ int main(int argc, char** argv) {
     std::vector<std::filesystem::path> sources;
     std::filesystem::path indexOutput;
     std::string indexVersion{"unknown"};
+    std::string origin;
+    std::vector<std::filesystem::path> sourceRoots, packageRoots;
+    std::filesystem::path validationPolicy;
+    bool jsonOutput = false;
     for (int i = 2; i < argc; ++i) {
       const std::string argument = argv[i];
-      if ((argument == "--source" || argument == "--output" || argument == "--version") && i + 1 >= argc) {
+      if (argument == "--format") {
+        if (++i >= argc || std::string(argv[i]) != "json") return 2;
+        jsonOutput = true;
+        continue;
+      }
+      if ((argument == "--source" || argument == "--output" || argument == "--version" || argument == "--origin" ||
+           argument == "--source-root" || argument == "--package-root" || argument == "--validation-policy") && i + 1 >= argc) {
         std::cerr << "Missing value for " << argument << '\n';
         return 2;
       }
       if (argument == "--source") sources.emplace_back(argv[++i]);
       else if (argument == "--output") indexOutput = argv[++i];
       else if (argument == "--version") indexVersion = argv[++i];
+      else if (argument == "--origin") origin = argv[++i];
+      else if (argument == "--source-root") sourceRoots.emplace_back(argv[++i]);
+      else if (argument == "--package-root") packageRoots.emplace_back(argv[++i]);
+      else if (argument == "--validation-policy") validationPolicy = argv[++i];
       else { std::cerr << "Unknown index option: " << argument << '\n'; return 2; }
     }
-    if (sources.empty() || indexOutput.empty()) {
-      std::cerr << "Usage: DelphiAstTool index --source path [--source path ...] --output index.jdi\n";
+    if ((sources.empty() && sourceRoots.empty()) || indexOutput.empty()) {
+      std::cerr << "Usage: DelphiAstTool index (--source path | --source-root path) [...] --output index.jdi\n";
       return 2;
     }
     try {
-      const auto content = jdelphiast::createSymbolIndex(sources, indexVersion);
-      if (!indexOutput.parent_path().empty()) std::filesystem::create_directories(indexOutput.parent_path());
-      const auto temporary = indexOutput.string() + ".tmp";
-      {
-        std::ofstream output(temporary, std::ios::binary);
-        if (!output) throw std::runtime_error("Cannot write " + temporary);
-        output << content;
-        output.flush();
-        if (!output) throw std::runtime_error("Failed writing " + temporary);
-      }
-      std::error_code error;
-      std::filesystem::remove(indexOutput, error);
-      std::filesystem::rename(temporary, indexOutput);
-      std::cout << "Wrote " << indexOutput.string() << '\n';
+      jdelphiast::IndexBuildOptions options;
+      options.version = indexVersion;
+      options.origin = origin;
+      options.sourceRoots = sourceRoots;
+      options.packageRoots = packageRoots;
+      options.validationPolicy = validationPolicy;
+      const auto result = jdelphiast::buildSymbolIndex(sources, options);
+      if (jsonOutput) std::cout << jdelphiast::indexBuildResultJson(result, indexOutput) << '\n';
+      if (result.hasBlockingErrors) return 2;
+      writeAtomic(indexOutput, result.content);
+      if (!jsonOutput) std::cout << "Wrote " << indexOutput.string() << '\n';
       return 0;
     } catch (const std::exception& error) {
+      std::cerr << "error: " << error.what() << '\n';
+      return 2;
+    }
+  }
+  if (argc > 1 && std::string(argv[1]) == "compare-units") {
+    jdelphiast::UnitMapOptions options;
+    std::filesystem::path output, csv, html;
+    for (int i = 2; i < argc; ++i) {
+      const std::string argument = argv[i];
+      if (argument == "--include-unmapped") { options.includeUnmapped = true; continue; }
+      if (argument == "--include-ambiguous") { options.includeAmbiguous = true; continue; }
+      if (argument == "--include-symbol-details") { options.includeSymbolDetails = true; continue; }
+      if (argument == "--format") { if (++i >= argc || std::string(argv[i]) != "json") return 2; continue; }
+      if (++i >= argc) { std::cerr << "Missing value for " << argument << '\n'; return 2; }
+      const std::string value = argv[i];
+      if (argument == "--left-index") options.leftIndex = value;
+      else if (argument == "--right-index") options.rightIndex = value;
+      else if (argument == "--output") output = value;
+      else if (argument == "--seed") options.seedFile = value;
+      else if (argument == "--csv") csv = value;
+      else if (argument == "--html") html = value;
+      else if (argument == "--minimum-confidence") options.minimumConfidence = value;
+      else if (argument == "--validation-policy") options.validationPolicy = value;
+      else { std::cerr << "Unknown compare-units option: " << argument << '\n'; return 2; }
+    }
+    if (options.leftIndex.empty() || options.rightIndex.empty() || output.empty()) {
+      std::cerr << "compare-units requires --left-index, --right-index and --output\n"; return 2;
+    }
+    if (options.minimumConfidence != "low" && options.minimumConfidence != "medium" && options.minimumConfidence != "high") {
+      std::cerr << "--minimum-confidence must be low, medium, or high\n";
+      return 2;
+    }
+    try {
+      const auto left = jdelphiast::loadSymbolIndexValidated(options.leftIndex);
+      const auto right = jdelphiast::loadSymbolIndexValidated(options.rightIndex);
+      options.validationDiagnostics = left.diagnostics;
+      options.validationDiagnostics.insert(options.validationDiagnostics.end(), right.diagnostics.begin(), right.diagnostics.end());
+      const auto versionMismatch = [](const std::vector<jdelphiast::IndexedUnit>& units, std::string_view expected) {
+        return std::any_of(units.begin(), units.end(), [&](const auto& unit) {
+          return unit.indexVersion != "unknown" && unit.indexVersion != expected;
+        });
+      };
+      if (versionMismatch(left.units, "v500")) options.validationDiagnostics.push_back(
+          {"index_version_mismatch", "error", "Left catalog is not consistently V500.", options.leftIndex, {}});
+      if (versionMismatch(right.units, "v600")) options.validationDiagnostics.push_back(
+          {"index_version_mismatch", "error", "Right catalog is not consistently V600.", options.rightIndex, {}});
+      const auto leftUnits = left.units.empty() && !left.hasBlockingErrors ? jdelphiast::loadSymbolIndex(options.leftIndex) : left.units;
+      const auto rightUnits = right.units.empty() && !right.hasBlockingErrors ? jdelphiast::loadSymbolIndex(options.rightIndex) : right.units;
+      const auto result = jdelphiast::compareUnits(options, leftUnits, rightUnits, timestamp());
+      if (result.hasBlockingErrors) {
+        std::cout << result.json << '\n';
+        return 2;
+      }
+      writeAtomic(output, result.json + "\n");
+      if (!csv.empty()) writeAtomic(csv, result.csv);
+      if (!html.empty()) writeAtomic(html, result.html);
+      std::cout << result.json << '\n';
+      return 0;
+    } catch (const std::exception& error) {
+      std::cout << "{\"schema_version\":\"1.0\",\"mappings\":[],\"diagnostics\":[{\"code\":\"compare_units_failed\",\"severity\":\"error\",\"message\":\"compare-units failed\"}]}\n";
       std::cerr << "error: " << error.what() << '\n';
       return 2;
     }
@@ -328,7 +442,7 @@ int main(int argc, char** argv) {
     }
     if ((argument == "--index" || argument == "--search-path" || argument == "--include-path" ||
          argument == "--project" || argument == "--output" || argument == "--config" ||
-         argument == "--platform" || argument == "--dproj") && i + 1 >= argc) {
+         argument == "--platform" || argument == "--dproj" || argument == "--unit-map") && i + 1 >= argc) {
       std::cerr << "Missing value for " << argument << '\n';
       return 2;
     }
@@ -354,6 +468,10 @@ int main(int argc, char** argv) {
     }
     if (argument == "--dproj") {
       projectOptions.dprojFile = argv[++i];
+      continue;
+    }
+    if (argument == "--unit-map") {
+      projectOptions.unitMappingCatalog = argv[++i];
       continue;
     }
     if (argument == "--project") {
@@ -448,7 +566,7 @@ int main(int argc, char** argv) {
     }
   } catch (const std::exception& error) {
     if (explicitAnalyze && json) {
-      std::cout << "{\"schemaVersion\":1,\"schema_version\":\"2.0\",\"project\":{},\"units\":[],"
+      std::cout << "{\"schemaVersion\":1,\"schema_version\":\"2.1\",\"project\":{},\"units\":[],"
                    "\"uses\":[],\"references\":[],\"symbols\":[],\"inheritance\":[],\"dependencies\":[],"
                    "\"diagnostics\":[{\"code\":\"analysis_failed\",\"severity\":\"error\",\"message\":\"";
       for (const char c : std::string(error.what())) { if (c == '\\' || c == '"') std::cout << '\\'; std::cout << c; }

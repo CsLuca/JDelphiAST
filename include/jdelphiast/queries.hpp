@@ -1,6 +1,7 @@
 #pragma once
 
 #include "jdelphiast/analyzer.hpp"
+#include "jdelphiast/project.hpp"
 
 #include <filesystem>
 #include <string>
@@ -13,6 +14,25 @@ struct SymbolQuery {
   std::string unit;
   std::string kind;
   std::string qualifiedName;
+};
+
+struct UnitMapOptions {
+  std::filesystem::path leftIndex;
+  std::filesystem::path rightIndex;
+  std::filesystem::path seedFile;
+  bool includeUnmapped{};
+  bool includeAmbiguous{};
+  bool includeSymbolDetails{};
+  std::string minimumConfidence{"low"};
+  std::filesystem::path validationPolicy;
+  std::vector<ValidationDiagnostic> validationDiagnostics;
+};
+
+struct UnitMapOutput {
+  std::string json;
+  std::string csv;
+  std::string html;
+  bool hasBlockingErrors{};
 };
 
 [[nodiscard]] std::string exportsJson(const std::filesystem::path& unit,
@@ -28,5 +48,9 @@ struct SymbolQuery {
 [[nodiscard]] std::string compareSymbolJson(std::string_view symbol,
                                             const std::vector<IndexedUnit>& left,
                                             const std::vector<IndexedUnit>& right);
+[[nodiscard]] UnitMapOutput compareUnits(const UnitMapOptions& options,
+                                         const std::vector<IndexedUnit>& left,
+                                         const std::vector<IndexedUnit>& right,
+                                         std::string_view generatedAt);
 
 }  // namespace jdelphiast

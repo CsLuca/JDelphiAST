@@ -1,0 +1,2 @@
+# Promote otherwise recoverable non-unit files to blocking errors.
+no_unit_declaration=error

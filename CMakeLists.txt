@@ -38,7 +38,8 @@ if(JDELPHIAST_BUILD_TESTS)
   add_executable(jdelphiast_query_tests tests/query_tests.cpp)
   target_link_libraries(jdelphiast_query_tests PRIVATE jdelphiast)
   target_compile_definitions(jdelphiast_query_tests PRIVATE
-    JDELPHIAST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+    JDELPHIAST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+    JDELPHIAST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
   add_test(NAME jdelphiast_query_tests COMMAND jdelphiast_query_tests)
   add_test(NAME jdelphiast_cli_package
     COMMAND DelphiAstTool --project ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/DemoPackage.dpk
@@ -52,10 +53,24 @@ if(JDELPHIAST_BUILD_TESTS)
     COMMAND DelphiAstTool index --source ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/shared
             --output ${CMAKE_CURRENT_BINARY_DIR}/generated-v600.jdi)
   set_tests_properties(jdelphiast_cli_index PROPERTIES PASS_REGULAR_EXPRESSION "Wrote.*generated-v600.jdi")
+  add_test(NAME jdelphiast_cli_index_resilient
+    COMMAND DelphiAstTool index --source ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/shared
+            --output ${CMAKE_CURRENT_BINARY_DIR}/generated-resilient.jdi --version v600 --format json)
+  set_tests_properties(jdelphiast_cli_index_resilient PROPERTIES
+    PASS_REGULAR_EXPRESSION "files_skipped_non_unit_source.*no_unit_declaration")
+  add_test(NAME jdelphiast_cli_index_strict_validation
+    COMMAND DelphiAstTool index --source ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/shared
+            --output ${CMAKE_CURRENT_BINARY_DIR}/generated-strict.jdi --version v600 --format json
+            --validation-policy ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/strict-validation.policy)
+  set_tests_properties(jdelphiast_cli_index_strict_validation PROPERTIES WILL_FAIL TRUE)
+  add_test(NAME jdelphiast_cli_index_source_root
+    COMMAND DelphiAstTool index --source-root ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/shared
+            --output ${CMAKE_CURRENT_BINARY_DIR}/generated-source-root.jdi --version v600 --format json)
+  set_tests_properties(jdelphiast_cli_index_source_root PROPERTIES PASS_REGULAR_EXPRESSION "units_indexed")
   add_test(NAME jdelphiast_cli_analyze_v2
     COMMAND DelphiAstTool analyze --dproj ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/DemoPackage.dproj
             --config Release --platform Win32 --format json)
-  set_tests_properties(jdelphiast_cli_analyze_v2 PROPERTIES PASS_REGULAR_EXPRESSION "schema_version.*2.0")
+  set_tests_properties(jdelphiast_cli_analyze_v2 PROPERTIES PASS_REGULAR_EXPRESSION "schema_version.*2.1")
   add_test(NAME jdelphiast_cli_exports
     COMMAND DelphiAstTool exports --unit CSControls.Theme --index ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/v600.jdi --format json)
   set_tests_properties(jdelphiast_cli_exports PROPERTIES PASS_REGULAR_EXPRESSION "CSGlobalTheme")
@@ -85,4 +100,28 @@ if(JDELPHIAST_BUILD_TESTS)
     PASS_REGULAR_EXPRESSION "SAFE USES REMOVAL.*PREPROCESSING.*PERSISTENT INDEX")
   add_test(NAME jdelphiast_cli_help_word COMMAND DelphiAstTool help)
   set_tests_properties(jdelphiast_cli_help_word PROPERTIES PASS_REGULAR_EXPRESSION "DelphiAstTool.*USAGE")
+  add_test(NAME jdelphiast_cli_compare_units
+    COMMAND DelphiAstTool compare-units
+      --left-index ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/unit-map-v500.jdi
+      --right-index ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/unit-map-v600.jdi
+      --seed ${CMAKE_CURRENT_SOURCE_DIR}/mappings/uses_mapping_seed.json
+      --output ${CMAKE_CURRENT_BINARY_DIR}/uses-map.json
+      --csv ${CMAKE_CURRENT_BINARY_DIR}/uses-map.csv
+      --html ${CMAKE_CURRENT_BINARY_DIR}/uses-map.html
+      --include-unmapped --include-ambiguous --include-symbol-details --format json)
+  set_tests_properties(jdelphiast_cli_compare_units PROPERTIES PASS_REGULAR_EXPRESSION "CSETables.*CSData.CSETables")
+  add_test(NAME jdelphiast_cli_compare_units_malformed
+    COMMAND ${CMAKE_COMMAND}
+      -DTOOL=$<TARGET_FILE:DelphiAstTool>
+      -DEXPECT_EXIT=2
+      -DEXPECT_TEXT=index_parse_failed
+      "-DARGS=compare-units;--left-index;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/malformed.jdi;--right-index;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/unit-map-v600.jdi;--output;${CMAKE_CURRENT_BINARY_DIR}/invalid-map.json;--format;json"
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_command.cmake)
+  add_test(NAME jdelphiast_cli_compare_units_duplicate
+    COMMAND ${CMAKE_COMMAND}
+      -DTOOL=$<TARGET_FILE:DelphiAstTool>
+      -DEXPECT_EXIT=2
+      -DEXPECT_TEXT=duplicate_unit_source
+      "-DARGS=compare-units;--left-index;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/duplicate-unit.jdi;--right-index;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/unit-map-v600.jdi;--output;${CMAKE_CURRENT_BINARY_DIR}/duplicate-map.json;--format;json"
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_command.cmake)
 endif()

@@ -826,6 +826,10 @@ void Analyzer::setBuildContext(std::string configuration, std::string platform) 
 }
 
 void Analyzer::addDiagnostic(std::string diagnostic) { diagnostics_.push_back(std::move(diagnostic)); }
+void Analyzer::setUnitMappingCatalog(std::filesystem::path catalog, bool valid) {
+  unitMappingCatalog_ = std::move(catalog);
+  unitMappingCatalogValid_ = valid;
+}
 
 UnitAst parseUnit(std::filesystem::path path, const std::string& source) {
   return parseSource(path, source);
@@ -838,6 +842,8 @@ AnalysisResult Analyzer::analyze() const {
   result.platform = platform_;
   result.defines = defines_;
   result.diagnostics = diagnostics_;
+  result.unitMappingCatalog = unitMappingCatalog_;
+  result.unitMappingCatalogValid = unitMappingCatalogValid_;
   result.units.reserve(inputs_.size());
   const PreprocessorOptions preprocessorOptions{defines_, includePaths_, 64};
   for (const auto& input : inputs_) {
@@ -1104,7 +1110,7 @@ std::string toText(const AnalysisResult& result) {
 
 std::string toJson(const AnalysisResult& result) {
   std::ostringstream output;
-  output << "{\"schemaVersion\":1,\"schema_version\":\"2.0\",\"units\":[";
+  output << "{\"schemaVersion\":1,\"schema_version\":\"2.1\",\"units\":[";
   bool firstUnit = true;
   for (const auto& unit : result.units) {
     if (unit.ast.indexOnly) continue;
@@ -1167,7 +1173,7 @@ std::string toProjectJson(const AnalysisResult& result, std::string_view plugin,
            << ",\"startOffset\":" << range.begin.offset << ",\"endOffset\":" << range.end.offset;
   };
   std::ostringstream output;
-  output << "{\"schemaVersion\":1,\"schema_version\":\"2.0\",\"plugin\":\"" << jsonEscape(plugin)
+  output << "{\"schemaVersion\":1,\"schema_version\":\"2.1\",\"plugin\":\"" << jsonEscape(plugin)
          << "\",\"sourceRoot\":\"" << jsonEscape(sourceRoot.string())
          << "\",\"generatedAt\":\"" << jsonEscape(generatedAt)
          << "\",\"project\":{\"name\":\"" << jsonEscape(plugin) << "\",\"source_root\":\""
@@ -1453,7 +1459,16 @@ std::string toProjectJson(const AnalysisResult& result, std::string_view plugin,
              << jsonEscape(unit.ast.file.generic_string()) << "\",\"line\":" << reference.range.begin.line << '}';
     }
   }
-  output << "],\"preprocessor\":{\"complete\":" << (result.preprocessorComplete ? "true" : "false")
+  output << "],\"unit_mapping\":{\"available\":" << (result.unitMappingCatalogValid ? "true" : "false")
+         << ",\"catalog\":";
+  if (result.unitMappingCatalog.empty()) output << "null";
+  else output << '"' << jsonEscape(result.unitMappingCatalog.generic_string()) << '"';
+  output << ",\"mappings\":[],\"diagnostics\":[";
+  if (!result.unitMappingCatalogValid) output << "{\"code\":\""
+      << (result.unitMappingCatalog.empty() ? "unit_mapping_catalog_not_provided" : "unit_mapping_catalog_invalid")
+      << "\",\"severity\":\"info\",\"message\":\"Use compare-units with valid V500 and V600 indexes to generate verified mappings.\"}";
+  output << "]},"
+            "\"preprocessor\":{\"complete\":" << (result.preprocessorComplete ? "true" : "false")
          << ",\"configuration\":\"" << jsonEscape(result.configuration)
          << "\",\"platform\":\"" << jsonEscape(result.platform) << "\",\"defines\":[";
   for (std::size_t i = 0; i < result.defines.size(); ++i) {

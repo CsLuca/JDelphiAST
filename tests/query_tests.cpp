@@ -52,6 +52,76 @@ int main() {
   const auto noMapping = jdelphiast::compareSymbolJson("UCSTheme", left, {unrelated});
   require(noMapping.find("legacy_symbol_unmapped") != std::string::npos,
           "single common export does not create an invented migration mapping");
+
+  jdelphiast::UnitMapOptions mapOptions;
+  mapOptions.leftIndex = fixtures / "unit-map-v500.jdi";
+  mapOptions.rightIndex = fixtures / "unit-map-v600.jdi";
+  mapOptions.seedFile = std::filesystem::path(JDELPHIAST_SOURCE_DIR) / "mappings" / "uses_mapping_seed.json";
+  mapOptions.includeUnmapped = true;
+  mapOptions.includeAmbiguous = true;
+  mapOptions.includeSymbolDetails = true;
+  const auto unitMap = jdelphiast::compareUnits(mapOptions,
+      jdelphiast::loadSymbolIndex(mapOptions.leftIndex), jdelphiast::loadSymbolIndex(mapOptions.rightIndex),
+      "2026-09-28T00:00:00");
+  require(unitMap.json.find("\"v500_unit\":\"CSETables\"") != std::string::npos &&
+              unitMap.json.find("\"v600_unit\":\"CSData.CSETables\"") != std::string::npos,
+          "approved CSETables mapping is emitted");
+  require(unitMap.json.find("\"v500_unit\":\"UCSTheme\"") != std::string::npos &&
+              unitMap.json.find("\"compatibility\":\"partial_compatible\"") != std::string::npos,
+          "UCSTheme is partial compatible");
+  require(unitMap.json.find("\"symbol_or_unit\":\"CSMail\"") != std::string::npos &&
+              unitMap.json.find("\"symbol_or_unit\":\"RNote\"") != std::string::npos,
+          "semantic-only legacy APIs do not receive invented unit mappings");
+  require(unitMap.json.find("Vcl.ComCtrls") != std::string::npos && unitMap.json.find("Vcl.ActnList") != std::string::npos &&
+              unitMap.json.find("System.Generics.Collections") != std::string::npos &&
+              unitMap.json.find("System.Win.ComObj") != std::string::npos && unitMap.json.find("Vcl.Clipbrd") != std::string::npos,
+          "known namespace migrations are emitted");
+  require(unitMap.json.find("\"v500_unit\":\"ComCtrls\"") != std::string::npos &&
+              unitMap.json.find("\"mapping_type\":\"namespace_migration\"") != std::string::npos,
+          "standard namespace migrations are classified explicitly");
+  require(unitMap.json.find("\"matched_exports\":[\"CSGlobalTheme\"") != std::string::npos,
+          "CSGlobalTheme is compared as a public unit export");
+  require(unitMap.csv.find("v500_unit,v600_unit") != std::string::npos &&
+              unitMap.html.find("Filter mappings") != std::string::npos,
+          "CSV and searchable HTML reports are generated");
+  jdelphiast::UnitMapOptions missingSeed = mapOptions;
+  missingSeed.seedFile = fixtures / "missing-target-seed.json";
+  const auto missingTarget = jdelphiast::compareUnits(missingSeed,
+      jdelphiast::loadSymbolIndex(missingSeed.leftIndex), jdelphiast::loadSymbolIndex(missingSeed.rightIndex),
+      "2026-09-28T00:00:00");
+  require(missingTarget.json.find("seed_target_not_found") != std::string::npos &&
+              missingTarget.json.find("\"confidence\":\"low\"") != std::string::npos,
+          "missing seed target is diagnosed and never retains high confidence");
+  require(missingTarget.json.find("\"has_blocking_errors\":true") != std::string::npos &&
+              missingTarget.json.find("\"severity\":\"error\"") != std::string::npos,
+          "missing seed target is a blocking validation error by default");
+  missingSeed.validationPolicy = fixtures / "warning-validation.policy";
+  const auto warningTarget = jdelphiast::compareUnits(missingSeed,
+      jdelphiast::loadSymbolIndex(missingSeed.leftIndex), jdelphiast::loadSymbolIndex(missingSeed.rightIndex),
+      "2026-09-28T00:00:00");
+  require(!warningTarget.hasBlockingErrors && warningTarget.json.find("\"severity\":\"warning\"") != std::string::npos,
+          "validation policy can demote a seed target diagnostic to warning");
+
+  const auto malformed = jdelphiast::loadSymbolIndexValidated(fixtures / "malformed.jdi");
+  require(malformed.hasBlockingErrors && malformed.diagnostics.front().code == "index_parse_failed",
+          "malformed index is a blocking validation error");
+  const auto duplicate = jdelphiast::loadSymbolIndexValidated(fixtures / "duplicate-unit.jdi");
+  require(duplicate.hasBlockingErrors && duplicate.diagnostics.front().code == "duplicate_unit_source",
+          "duplicate unit index entry is blocking");
+  const auto missingIndex = jdelphiast::loadSymbolIndexValidated(fixtures / "does-not-exist.jdi");
+  require(missingIndex.hasBlockingErrors && missingIndex.diagnostics.front().code == "index_read_failed",
+          "missing index is blocking");
+  require(missingTarget.json.find("\"unmapped_units\":[") != std::string::npos &&
+              missingTarget.json.find("\"CSETables\"") != std::string::npos,
+          "missing seed target is listed as unmapped");
+  jdelphiast::UnitMapOptions compactOptions = mapOptions;
+  compactOptions.includeSymbolDetails = false;
+  const auto compact = jdelphiast::compareUnits(compactOptions,
+      jdelphiast::loadSymbolIndex(compactOptions.leftIndex), jdelphiast::loadSymbolIndex(compactOptions.rightIndex),
+      "2026-09-28T00:00:00");
+  require(compact.json.find("\"export_match_count\":3") != std::string::npos &&
+              compact.json.find("\"matched_exports\":[]") != std::string::npos,
+          "compact catalog preserves evidence counts without symbol detail arrays");
   const auto missingComparison = jdelphiast::compareSymbolJson("DefinitelyMissing", left, right);
   require(missingComparison.find("legacy_symbol_unmapped") != std::string::npos,
           "missing comparison input returns a diagnostic without crashing");

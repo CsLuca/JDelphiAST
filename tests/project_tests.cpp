@@ -48,7 +48,8 @@ int main() {
   write(root / "Demo.dpk", R"(package Demo;
 requires rtl;
 contains
-  MainUnit in 'src\MainUnit.pas';
+  MainUnit in 'src\MainUnit.pas',
+  SharedUnit in 'shared\SharedUnit.pas';
 end.)");
   write(root / "Demo.dproj", R"(<Project><PropertyGroup>
 <Base>True</Base>
@@ -92,6 +93,8 @@ end.)");
 
   jdelphiast::ProjectOptions options;
   options.indexFiles.push_back(root / "rtl.jdi");
+  options.unitMappingCatalog = root / "uses-map.json";
+  write(root / "uses-map.json", "{\"schema_version\":\"1.0\",\"mappings\":[]}");
   const auto loaded = jdelphiast::loadPackage(root / "Demo.dpk", options);
   require(loaded.diagnostics.empty(), "realistic Release Win32 DPROJ conditions are fully evaluated");
   require(loaded.sourceFiles.size() == 2, "DPK and DPROJ discover package sources recursively");
@@ -115,7 +118,7 @@ end.)");
   require(mainUnit.ast.assignments.size() == 2, "assignments are extracted from package units");
   const auto json = jdelphiast::toProjectJson(result, "Demo", root, "2026-09-25T22:30:00");
   require(json.find("\"plugin\":\"Demo\"") != std::string::npos, "project JSON contains plugin");
-  require(json.find("\"schemaVersion\":1,\"schema_version\":\"2.0\"") != std::string::npos,
+  require(json.find("\"schemaVersion\":1,\"schema_version\":\"2.1\"") != std::string::npos,
           "project JSON preserves legacy schema marker and adds v2 marker");
   require(json.find("\"sourceHash\":\"sha256:") != std::string::npos, "project JSON contains SHA-256");
   require(json.find("\"uses\":{\"interface\":[") != std::string::npos, "project JSON groups uses");
@@ -129,6 +132,9 @@ end.)");
           "preprocessor completeness is serialized");
   require(json.find("\"recommendations\":{\"safeRemoveUses\":[") != std::string::npos,
           "automation recommendations are serialized");
+  require(json.find("\"unit_mapping\":{\"available\":true") != std::string::npos &&
+              json.find("uses-map.json") != std::string::npos,
+          "optional unit mapping catalog reference is serialized additively");
   require(json.find("\"blockedRemovals\":[") != std::string::npos,
           "blocked removals are serialized");
   require(json.find("\"uses\":[") != std::string::npos && json.find("\"references\":[") != std::string::npos &&
@@ -155,7 +161,7 @@ end.)");
   require(foundStringReturn, "index preserves function return type");
   require(foundConstModifier, "index preserves parameter modifiers");
   const auto mainIndexed = std::find_if(roundTrip.begin(), roundTrip.end(), [](const auto& item) {
-    return item.name == "MainUnit";
+    return item.name == "SharedUnit";
   });
   require(mainIndexed != roundTrip.end() && mainIndexed->packageName == "Demo" &&
               mainIndexed->packageDcp == "Demo.dcp" && mainIndexed->packageBpl == "Demo.bpl",

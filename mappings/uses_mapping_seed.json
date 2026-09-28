@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "mappings": [
+    {"v500_unit":"CSETables","v600_unit":"CSData.CSETables","mapping_type":"unit_rename","confidence":"high","automatic_action":"replace_in_uses"},
+    {"v500_unit":"UCoreTipi","v600_unit":"CSCore.Types","mapping_type":"unit_rename","confidence":"high","automatic_action":"replace_in_uses"},
+    {"v500_unit":"CSCTipi","v600_unit":"CSControls.Types","mapping_type":"unit_rename","confidence":"high","automatic_action":"replace_in_uses"},
+    {"v500_unit":"CSTipiCommon","v600_unit":"CSCommon.Types","mapping_type":"unit_rename","confidence":"high","automatic_action":"replace_in_uses"},
+    {"v500_unit":"CSMemo","v600_unit":"MemoEx","mapping_type":"unit_rename","confidence":"high","automatic_action":"replace_in_uses"},
+    {"v500_unit":"F2Ext","v600_unit":"CompF2","mapping_type":"unit_rename","confidence":"high","automatic_action":"replace_in_uses"},
+    {"v500_unit":"UCSTheme","v600_unit":"CSControls.Theme","mapping_type":"partial_compatibility","confidence":"high","automatic_action":"conditional_replace_in_uses","notes":"AppStyle, BitCount, TTMSStyle e tsTerminal non hanno equivalente diretto verificato."},
+    {"v500_unit":"RNote","v600_unit":null,"mapping_type":"relocated_symbols","confidence":"high","automatic_action":"symbol_by_symbol"},
+    {"v500_unit":"CSMail","v600_unit":null,"mapping_type":"semantic_migration_required","confidence":"high","automatic_action":"manual_required"},
+    {"v500_unit":"UCSException","v600_unit":"CSCommon.Exceptions","mapping_type":"unit_rename","confidence":"high","automatic_action":"replace_in_uses"},
+    {"v500_unit":"CSFieldEdit","v600_unit":null,"mapping_type":"removed_no_equivalent","confidence":"high","automatic_action":"conditional_replace_in_uses","notes":"Rimuovere dal uses e verificare eventuali simboli residui con Delphi."}
+  ]
+}

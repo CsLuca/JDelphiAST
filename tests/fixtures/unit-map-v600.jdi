@@ -1,0 +1,10 @@
+# JDelphiAST symbol index v2
+CSData.CSETables|TCSTable,OpenTable|||source=K:/V0600/CSData.CSETables.pas;version=v600
+CSCore.Types|TCoreType|||source=K:/V0600/CSCore.Types.pas;version=v600
+CSControls.Types|TControlType|||source=K:/V0600/CSControls.Types.pas;version=v600
+CSControls.Theme|CSGlobalTheme,TCSTheme,TCSThemeOpz,GraphicOptions,ClrFocus,ClrSplashText,ClrRequired,ClrEnabled,ClrDisabled,ClrFontEnabled,ClrFontDisabled,LoadFromRisorse|||source=K:/V0600/CSControls.Theme.pas;version=v600
+Vcl.ComCtrls|TListView,TTreeView|||source=K:/V0600/Vcl.ComCtrls.pas;version=v600
+Vcl.ActnList|TActionList,TAction|||source=K:/V0600/Vcl.ActnList.pas;version=v600
+System.Generics.Collections|TList,TDictionary|||source=K:/V0600/System.Generics.Collections.pas;version=v600
+System.Win.ComObj|CreateOleObject|||source=K:/V0600/System.Win.ComObj.pas;version=v600
+Vcl.Clipbrd|Clipboard,TClipboard|||source=K:/V0600/Vcl.Clipbrd.pas;version=v600

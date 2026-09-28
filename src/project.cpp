@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iterator>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_set>
@@ -549,6 +550,7 @@ std::vector<IndexedUnit> loadSymbolIndex(const std::filesystem::path& indexFile)
         else if (key == "dcp") unit.packageDcp = value;
         else if (key == "bpl") unit.packageBpl = value;
         else if (key == "project") unit.sourceProject = delphiPath(value);
+        else if (key == "origin") unit.origin = value;
       }
     }
     if (fields.size() > 5) {
@@ -560,6 +562,112 @@ std::vector<IndexedUnit> loadSymbolIndex(const std::filesystem::path& indexFile)
     }
     if (fields.size() > 6) unit.dependencies = split(fields[6], ',');
     result.push_back(std::move(unit));
+  }
+  return result;
+}
+
+IndexLoadResult loadSymbolIndexValidated(const std::filesystem::path& indexFile) {
+  IndexLoadResult result;
+  std::string source;
+  try { source = readFile(indexFile); }
+  catch (const std::exception& error) {
+    result.hasBlockingErrors = true;
+    result.diagnostics.push_back({"index_read_failed", "error", error.what(), indexFile, {}});
+    return result;
+  }
+  std::istringstream input(source);
+  std::string line;
+  std::unordered_set<std::string> names;
+  std::set<std::string> versions;
+  std::set<std::string> origins;
+  std::size_t lineNumber = 0;
+  while (std::getline(input, line)) {
+    ++lineNumber;
+    line = trim(line);
+    if (line.starts_with("# statistics")) {
+      const auto failed = line.find("files_parse_failed=");
+      if (failed != std::string::npos) {
+        const auto valueStart = failed + std::string_view("files_parse_failed=").size();
+        const auto valueEnd = line.find(' ', valueStart);
+        const auto value = line.substr(valueStart, valueEnd == std::string::npos ? std::string::npos : valueEnd - valueStart);
+        if (!value.empty() && value != "0") {
+        result.hasBlockingErrors = true;
+        result.diagnostics.push_back({"index_incomplete", "error",
+            "Index metadata reports source parse failures.", indexFile, {}});
+        }
+      }
+      continue;
+    }
+    if (line.empty() || line[0] == '#') continue;
+    const auto fields = splitFields(line);
+    if (fields.size() < 3 || fields[0].empty()) {
+      result.hasBlockingErrors = true;
+      result.diagnostics.push_back({"index_parse_failed", "error",
+          "Malformed JDI record at line " + std::to_string(lineNumber), indexFile, {}});
+      continue;
+    }
+    const auto unitName = lower(fields[0]);
+    if (!names.insert(unitName).second) {
+      result.hasBlockingErrors = true;
+      result.diagnostics.push_back({"duplicate_unit_source", "error",
+          "Duplicate unit entry in index: " + fields[0], indexFile, fields[0]});
+    }
+    std::unordered_set<std::string> symbols;
+    if (fields.size() > 1) for (const auto& symbol : split(fields[1], ',')) {
+      if (!symbols.insert(lower(symbol)).second) {
+        result.hasBlockingErrors = true;
+        result.diagnostics.push_back({"duplicate_symbol", "error",
+            "Duplicate exported symbol in unit " + fields[0] + ": " + symbol, indexFile, fields[0]});
+      }
+    }
+    for (const auto& flag : split(fields[2], ',')) {
+      const auto normalized = lower(flag);
+      if (normalized != "initialization" && normalized != "finalization" && normalized != "complete") {
+        result.hasBlockingErrors = true;
+        result.diagnostics.push_back({"index_parse_failed", "error",
+            "Unknown JDI flag '" + flag + "' for unit " + fields[0], indexFile, fields[0]});
+      }
+    }
+    if (fields.size() > 4) {
+      std::string package, dcp, bpl;
+      for (const auto& metadata : split(fields[4], ';')) {
+        const auto equal = metadata.find('=');
+        if (equal == std::string::npos) continue;
+        const auto key = lower(metadata.substr(0, equal));
+        const auto value = percentDecode(metadata.substr(equal + 1));
+        if (key == "version" && !value.empty() && value != "unknown") versions.insert(lower(value));
+        else if (key == "origin" && !value.empty()) origins.insert(lower(value));
+        else if (key == "package") package = value;
+        else if (key == "dcp") dcp = value;
+        else if (key == "bpl") bpl = value;
+      }
+      if (package.empty() && (!dcp.empty() || !bpl.empty())) {
+        result.hasBlockingErrors = true;
+        result.diagnostics.push_back({"package_metadata_inconsistent", "error",
+            "DCP/BPL metadata requires an explicit package name.", indexFile, fields[0]});
+      }
+    }
+  }
+  if (versions.size() > 1) {
+    result.hasBlockingErrors = true;
+    result.diagnostics.push_back({"catalog_version_inconsistent", "error",
+        "Index contains more than one catalog version.", indexFile, {}});
+  }
+  if (origins.size() > 1) {
+    result.hasBlockingErrors = true;
+    result.diagnostics.push_back({"catalog_origin_inconsistent", "error",
+        "Index contains more than one catalog origin.", indexFile, {}});
+  }
+  if (!result.hasBlockingErrors) {
+    try { result.units = loadSymbolIndex(indexFile); }
+    catch (const std::exception& error) {
+      result.hasBlockingErrors = true;
+      result.diagnostics.push_back({"index_parse_failed", "error", error.what(), indexFile, {}});
+    }
+  }
+  if (result.units.empty() && !result.hasBlockingErrors) {
+    result.hasBlockingErrors = true;
+    result.diagnostics.push_back({"no_input_units", "error", "Index contains no Delphi units.", indexFile, {}});
   }
   return result;
 }
@@ -611,28 +719,80 @@ CSCore.Note.Utils|TNoteUtils,UpdateOrInsertSection,DeleteSection,AddSection||cla
 }
 
 std::string createSymbolIndex(const std::vector<std::filesystem::path>& sources) {
-  return createSymbolIndex(sources, "unknown");
+  return buildSymbolIndex(sources).content;
 }
 
 std::string createSymbolIndex(const std::vector<std::filesystem::path>& sources,
                               std::string_view version) {
+  IndexBuildOptions options;
+  options.version = std::string(version);
+  return buildSymbolIndex(sources, options).content;
+}
+
+IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sources,
+                                  const IndexBuildOptions& options) {
+  IndexBuildResult result;
+  std::unordered_map<std::string, std::string> severityPolicy;
+  if (!options.validationPolicy.empty()) {
+    std::istringstream policy(readFile(options.validationPolicy));
+    std::string line;
+    while (std::getline(policy, line)) {
+      line = trim(line);
+      if (line.empty() || line[0] == '#') continue;
+      const auto equal = line.find('=');
+      if (equal == std::string::npos) continue;
+      severityPolicy[trim(line.substr(0, equal))] = lower(trim(line.substr(equal + 1)));
+    }
+  }
+  const auto severity = [&](std::string_view code, std::string_view fallback) {
+    const auto found = severityPolicy.find(std::string(code));
+    return found == severityPolicy.end() ? std::string(fallback) : found->second;
+  };
   std::vector<std::filesystem::path> files;
   std::vector<std::filesystem::path> packages;
-  for (const auto& source : sources) {
+  auto allSources = sources;
+  allSources.insert(allSources.end(), options.sourceRoots.begin(), options.sourceRoots.end());
+  for (const auto& source : allSources) {
     if (std::filesystem::is_regular_file(source)) files.push_back(source);
     else if (std::filesystem::is_directory(source)) {
-      for (const auto& entry : std::filesystem::recursive_directory_iterator(source)) {
-        if (!entry.is_regular_file()) continue;
+      std::error_code iteratorError;
+      std::filesystem::recursive_directory_iterator iterator(
+          source, std::filesystem::directory_options::skip_permission_denied, iteratorError);
+      for (const auto end = std::filesystem::recursive_directory_iterator(); iterator != end; iterator.increment(iteratorError)) {
+        if (iteratorError) {
+          result.hasBlockingErrors = true;
+          result.diagnostics.push_back({source, "scan_failed", "source_scan_failed", "error", iteratorError.message()});
+          iteratorError.clear();
+          continue;
+        }
+        const auto& entry = *iterator;
+        if (!entry.is_regular_file(iteratorError)) continue;
         const auto extension = lower(entry.path().extension().string());
         if (extension == ".pas") files.push_back(entry.path());
         else if (extension == ".dpk") packages.push_back(entry.path());
       }
-    } else throw std::runtime_error("Index source not found: " + source.string());
+    } else {
+      result.hasBlockingErrors = true;
+      result.diagnostics.push_back({source, "scan_failed", "missing_source_root", "error",
+                                    "Index source root does not exist."});
+    }
   }
   std::sort(files.begin(), files.end(), [](const auto& left, const auto& right) {
-    return lower(left.string()) < lower(right.string());
+    const auto leftLower = lower(left.string()), rightLower = lower(right.string());
+    return leftLower == rightLower ? left.string() < right.string() : leftLower < rightLower;
   });
-  files.erase(std::unique(files.begin(), files.end()), files.end());
+  files.erase(std::unique(files.begin(), files.end(), [](const auto& left, const auto& right) {
+    return lower(left.string()) == lower(right.string());
+  }), files.end());
+  for (const auto& packageRoot : options.packageRoots)
+    if (std::filesystem::is_directory(packageRoot))
+      for (const auto& entry : std::filesystem::recursive_directory_iterator(packageRoot))
+        if (entry.is_regular_file() && lower(entry.path().extension().string()) == ".dpk") packages.push_back(entry.path());
+  std::sort(packages.begin(), packages.end(), [](const auto& left, const auto& right) {
+    const auto leftLower = lower(left.string()), rightLower = lower(right.string());
+    return leftLower == rightLower ? left.string() < right.string() : leftLower < rightLower;
+  });
+  packages.erase(std::unique(packages.begin(), packages.end()), packages.end());
   std::vector<UnitAst> units;
   struct PackageMetadata { std::string name, dcp, bpl; std::filesystem::path project; };
   std::unordered_map<std::string, PackageMetadata> packageByFile;
@@ -646,14 +806,56 @@ std::string createSymbolIndex(const std::vector<std::filesystem::path>& sources,
   }
   std::unordered_set<std::string> names;
   for (const auto& file : files) {
-    auto ast = parseUnit(file, readFile(file));
-    if (ast.name.empty()) throw std::runtime_error("No Delphi unit declaration in " + file.string());
-    if (!names.insert(lower(ast.name)).second) throw std::runtime_error("Duplicate indexed unit: " + ast.name);
+    ++result.statistics.filesScanned;
+    UnitAst ast;
+    try {
+      const auto source = readFile(file);
+      ast = parseUnit(file, source);
+    }
+    catch (const std::exception& error) {
+      ++result.statistics.filesParseFailed;
+      const auto level = severity("parse_failure", "error");
+      result.hasBlockingErrors = result.hasBlockingErrors || level == "error";
+      result.diagnostics.push_back({file, "parse_failed", "parse_failure", level, error.what()});
+      continue;
+    }
+    if (ast.name.empty()) {
+      ++result.statistics.filesSkippedNonUnitSource;
+      const auto level = severity("no_unit_declaration", "warning");
+      result.hasBlockingErrors = result.hasBlockingErrors || level == "error";
+      result.diagnostics.push_back({file, "skipped_non_unit_source", "no_unit_declaration", level,
+                                    "The Pascal file does not contain a parseable unit declaration."});
+      continue;
+    }
+    if (!ast.complete) {
+      ++result.statistics.filesParseFailed;
+      const auto level = severity("incomplete_unit", "error");
+      result.hasBlockingErrors = result.hasBlockingErrors || level == "error";
+      result.diagnostics.push_back({file, "parse_failed", "incomplete_unit", level,
+                                    "The Delphi unit is syntactically incomplete or contains unsupported directives."});
+      continue;
+    }
+    if (!names.insert(lower(ast.name)).second) {
+      ++result.statistics.filesParseFailed;
+      const auto level = severity("duplicate_unit_source", "error");
+      result.hasBlockingErrors = result.hasBlockingErrors || level == "error";
+      result.diagnostics.push_back({file, "parse_failed", "duplicate_unit_source", level,
+                                    "Another source file declares the same Delphi unit."});
+      continue;
+    }
     units.push_back(std::move(ast));
   }
-  if (units.empty()) throw std::runtime_error("No Pascal source files found for index");
+  result.statistics.unitsIndexed = units.size();
+  for (const auto& unit : units) result.statistics.exportsIndexed += unit.exports.size();
+  if (units.empty()) {
+    const auto level = severity("no_input_units", "error");
+    result.hasBlockingErrors = result.hasBlockingErrors || level == "error";
+    result.diagnostics.push_back({{}, "index_failed", "no_input_units", level,
+                                  "No valid Delphi units found while indexing."});
+  }
   std::sort(units.begin(), units.end(), [](const UnitAst& left, const UnitAst& right) {
-    return lower(left.name) < lower(right.name);
+    const auto leftLower = lower(left.name), rightLower = lower(right.name);
+    return leftLower == rightLower ? left.name < right.name : leftLower < rightLower;
   });
   const auto encode = [](std::string_view value) {
     constexpr char digits[] = "0123456789ABCDEF";
@@ -666,6 +868,14 @@ std::string createSymbolIndex(const std::vector<std::filesystem::path>& sources,
   };
   std::ostringstream output;
   output << "# JDelphiAST symbol index v2: unit|symbols|flags|declarations|metadata|inheritance|dependencies\n";
+  output << "# statistics files_scanned=" << result.statistics.filesScanned
+         << " units_indexed=" << result.statistics.unitsIndexed
+         << " files_skipped_non_unit_source=" << result.statistics.filesSkippedNonUnitSource
+         << " files_parse_failed=" << result.statistics.filesParseFailed
+         << " exports_indexed=" << result.statistics.exportsIndexed << '\n';
+  for (const auto& diagnostic : result.diagnostics)
+    output << "# source status=" << diagnostic.indexStatus << " code=" << diagnostic.code
+           << " file=" << encode(diagnostic.sourceFile.generic_string()) << '\n';
   for (const auto& unit : units) {
     output << unit.name << '|';
     std::unordered_set<std::string> parameterNames;
@@ -724,7 +934,8 @@ std::string createSymbolIndex(const std::vector<std::filesystem::path>& sources,
              << (declaration.overload ? "overload" : "") << ','
              << (declaration.isOverride ? "override" : "");
     }
-    output << "|source=" << encode(unit.file.generic_string()) << ";version=" << encode(version);
+    output << "|source=" << encode(unit.file.generic_string()) << ";version=" << encode(options.version)
+           << ";origin=" << encode(options.origin);
     if (const auto metadata = packageByFile.find(lower(std::filesystem::absolute(unit.file).lexically_normal().string()));
         metadata != packageByFile.end()) {
       output << ";package=" << encode(metadata->second.name) << ";dcp=" << encode(metadata->second.dcp)
@@ -743,6 +954,61 @@ std::string createSymbolIndex(const std::vector<std::filesystem::path>& sources,
     }
     output << '\n';
   }
+  result.content = output.str();
+  return result;
+}
+
+std::string indexBuildResultJson(const IndexBuildResult& result, const std::filesystem::path& outputPath) {
+  const auto escape = [](std::string_view value) {
+    std::string escaped;
+    for (const char c : value) {
+      if (c == '\\') escaped += "\\\\";
+      else if (c == '"') escaped += "\\\"";
+      else if (c == '\n') escaped += "\\n";
+      else if (c == '\r') escaped += "\\r";
+      else if (c == '\t') escaped += "\\t";
+      else if (static_cast<unsigned char>(c) < 0x20) {
+        constexpr char digits[] = "0123456789abcdef";
+        escaped += "\\u00";
+        escaped += digits[(static_cast<unsigned char>(c) >> 4) & 15];
+        escaped += digits[static_cast<unsigned char>(c) & 15];
+      } else escaped += c;
+    }
+    return escaped;
+  };
+  std::ostringstream output;
+  std::size_t errors = 0, warnings = 0, infos = 0;
+  for (const auto& diagnostic : result.diagnostics) {
+    if (diagnostic.severity == "error") ++errors;
+    else if (diagnostic.severity == "warning") ++warnings;
+    else ++infos;
+  }
+  output << "{\"schema_version\":\"1.0\",\"index\":\"" << escape(outputPath.generic_string())
+         << "\",\"validation\":{\"has_blocking_errors\":" << (result.hasBlockingErrors ? "true" : "false")
+         << ",\"error_count\":" << errors << ",\"warning_count\":" << warnings
+         << ",\"info_count\":" << infos << ",\"blocking_errors\":[";
+  bool firstBlocking = true;
+  for (const auto& diagnostic : result.diagnostics) if (diagnostic.severity == "error") {
+    if (!firstBlocking) output << ',';
+    firstBlocking = false;
+    output << "{\"code\":\"" << escape(diagnostic.code) << "\",\"message\":\""
+           << escape(diagnostic.message) << "\",\"file\":\"" << escape(diagnostic.sourceFile.generic_string()) << "\"}";
+  }
+  output << "]}"
+         << ",\"statistics\":{\"files_scanned\":" << result.statistics.filesScanned
+         << ",\"units_indexed\":" << result.statistics.unitsIndexed
+         << ",\"files_skipped_non_unit_source\":" << result.statistics.filesSkippedNonUnitSource
+         << ",\"files_parse_failed\":" << result.statistics.filesParseFailed
+         << ",\"exports_indexed\":" << result.statistics.exportsIndexed << "},\"files\":[";
+  for (std::size_t i = 0; i < result.diagnostics.size(); ++i) {
+    if (i) output << ',';
+    const auto& diagnostic = result.diagnostics[i];
+    output << "{\"source_file\":\"" << escape(diagnostic.sourceFile.generic_string())
+           << "\",\"index_status\":\"" << diagnostic.indexStatus << "\",\"diagnostics\":[{\"code\":\""
+           << diagnostic.code << "\",\"severity\":\"" << diagnostic.severity << "\",\"message\":\""
+           << escape(diagnostic.message) << "\"}]}";
+  }
+  output << "]}";
   return output.str();
 }
 
@@ -768,6 +1034,12 @@ ProjectLoadResult loadPackage(const std::filesystem::path& packageFile, ProjectO
   else if (lower(result.options.platform) == "win64") { addDefine("MSWINDOWS"); addDefine("WIN64"); addDefine("CPUX64"); }
   result.analyzer.setPreprocessor(result.options.defines, result.options.includePaths);
   result.analyzer.setBuildContext(result.options.configuration, result.options.platform);
+  if (!result.options.unitMappingCatalog.empty()) {
+    const auto catalog = readFile(result.options.unitMappingCatalog);
+    const auto valid = !catalog.empty() && catalog.find("\"schema_version\":\"1.0\"") != std::string::npos &&
+                       catalog.find("\"mappings\"") != std::string::npos;
+    result.analyzer.setUnitMappingCatalog(result.options.unitMappingCatalog, valid);
+  }
 
   std::unordered_map<std::string, IndexedUnit> mergedIndex;
   for (auto unit : bundledSymbolIndex()) mergedIndex[lower(unit.name)] = std::move(unit);

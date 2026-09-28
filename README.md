@@ -173,10 +173,10 @@ DelphiAstTool.exe analyze `
   --format json
 ```
 
-The JSON keeps the legacy `schemaVersion`, `units`, `status`, `confidence`, and `reasons` fields and adds:
+The JSON keeps the legacy `schemaVersion`, `units`, `status`, `confidence`, and `reasons` fields and adds schema `2.1` data:
 
 ```text
-schema_version: "2.0"
+schema_version: "2.1"
 project
 uses
 references
@@ -431,7 +431,8 @@ The JDI v2 format is backward compatible with earlier line-oriented indexes. Opt
 Set the source catalog version while generating an index:
 
 ```powershell
-DelphiAstTool.exe index --version v600 --source "K:\V0600" --output "delphi-v600.jdi"
+DelphiAstTool.exe index --version v600 --origin "V600 Win32 Release" `
+  --source "K:\V0600" --package-root "K:\V0600" --output "delphi-v600.jdi"
 ```
 
 ### Semantic Queries
@@ -453,11 +454,88 @@ DelphiAstTool.exe unit-info --unit UMarketing --index delphi-v600.jdi --format j
 
 DelphiAstTool.exe compare-symbol --left-index delphi-v500.jdi --right-index delphi-v600.jdi `
   --symbol UCSTheme --format json
+
+DelphiAstTool.exe compare-units `
+  --left-index delphi-v500-full.jdi `
+  --right-index delphi-v600-full.jdi `
+  --seed mappings\uses_mapping_seed.json `
+  --output uses_v500_to_v600.json `
+  --csv uses_v500_to_v600.csv `
+  --html uses_v500_to_v600.html `
+  --include-unmapped `
+  --include-ambiguous `
+  --include-symbol-details `
+  --format json
 ```
+
+The approved starter seed is versioned at `mappings/uses_mapping_seed.json`. Seed entries always have priority, but the target must exist in the V600 index and export/signature evidence is still reported. Missing or incompatible seed targets are downgraded and diagnosed instead of becoming automatic replacements.
+
+The authoritative catalog JSON contains deterministic, case-insensitively ordered mappings and statistics for full, partial, relocated, semantic, ambiguous, and not-found outcomes. `--csv` and `--html` generate optional views without rescanning source trees.
 
 `expression` and `hierarchy` are conservative. They return `resolved: false`, `unknown`, or a stable diagnostic when receiver types, visibility, overloads, or inheritance cannot be proven from project source and persistent indexes.
 
 `compare-symbol` is informational. A renamed-unit candidate needs a significant overlap of exported symbols; isolated common names such as `Create` do not create a verified mapping. Signature conflicts reduce compatibility, and ambiguous data remains diagnostic rather than being selected arbitrarily.
+
+`compare-units` works only from persistent indexes and never rescans the V500/V600 source trees. Approved seed mappings have priority but are validated against the right index; a missing seed target is downgraded and diagnosed. JSON is authoritative, while CSV and searchable HTML are optional views generated from the same deterministic mapping model.
+
+Validation defaults are conservative: `no_unit_declaration` is a recoverable warning; parse failures, duplicate unit declarations, invalid seed data, missing seed targets, and incompatible approved signatures are blocking errors. Use `--validation-policy <file>` to override individual codes with `code=warning` or `code=error` lines. Blocking validation errors return a non-zero exit code and prevent publishing the requested index or mapping catalog.
+
+Default severity table:
+
+| Code | Default | Meaning |
+| --- | --- | --- |
+| `no_unit_declaration` | warning | `.pas` fragment/include without a valid `unit` declaration |
+| `source_unit_not_indexed` | warning | referenced source unit is unavailable |
+| `missing_source_root` | error | configured index source root does not exist |
+| `source_scan_failed` | error | source tree could not be enumerated completely |
+| `file_read_error` | error | a source file could not be read |
+| `parse_failure` | error | parser raised an unrecoverable error |
+| `incomplete_unit` | error | parsed unit is incomplete or contains unsupported active syntax/directives |
+| `duplicate_unit_source` | error | duplicate unit identity in source or JDI |
+| `duplicate_symbol` | error | duplicate exported symbol inside one indexed unit |
+| `index_read_failed` | error | JDI is missing or unreadable |
+| `index_parse_failed` | error | malformed JDI record or unknown flag |
+| `index_incomplete` | error | JDI metadata reports parse failures |
+| `catalog_version_inconsistent` | error | mixed versions in one index |
+| `catalog_origin_inconsistent` | error | mixed origins in one index |
+| `package_metadata_inconsistent` | error | DCP/BPL metadata lacks its package identity |
+| `seed_target_not_found` | error | approved seed target is absent from V600 |
+| `seed_signature_incompatible` | error | approved source/target signatures conflict |
+| `seed_without_export_evidence` | warning | seed target exists but has no shared exported evidence |
+
+Both index and compare-units JSON reports include:
+
+```json
+{
+  "validation": {
+    "has_blocking_errors": false,
+    "error_count": 0,
+    "warning_count": 1,
+    "blocking_errors": []
+  }
+}
+```
+
+An optional policy file can override defaults:
+
+```text
+# strict-validation.policy
+no_unit_declaration=error
+seed_target_not_found=warning
+```
+
+When validation is blocking, the tool writes diagnostics to stdout, returns exit code `2`, and does not replace the requested `.jdi`, JSON, CSV, or HTML output.
+
+An existing project analysis can optionally reference the generated catalog without changing legacy dependency decisions:
+
+```powershell
+DelphiAstTool.exe analyze --dproj Plugin.dproj --config Release --platform Win32 `
+  --unit-map uses_v500_to_v600.json --format json
+```
+
+Without `--unit-map`, the additive `unit_mapping` section reports `available:false` and old consumers continue using `status`, `confidence`, and `reasons` exactly as before.
+
+Indexing is resilient to `.pas` fragments without a parseable `unit` declaration. Such files are skipped, retained in the structured index report with `no_unit_declaration`, and do not abort indexing of valid units.
 
 Stable diagnostic codes include:
 

@@ -1,0 +1,12 @@
+# JDelphiAST symbol index v2
+CSETables|TCSTable,OpenTable|||source=K:/V0500/CSETables.pas;version=v500
+UCoreTipi|TCoreType|||source=K:/V0500/UCoreTipi.pas;version=v500
+CSCTipi|TControlType|||source=K:/V0500/CSCTipi.pas;version=v500
+UCSTheme|CSGlobalTheme,TCSTheme,TCSThemeOpz,AppStyle,BitCount|||source=K:/V0500/UCSTheme.pas;version=v500
+RNote|SetSezNota,DeleteSezNota|||source=K:/V0500/RNote.pas;version=v500
+CSMail|TCSMail,SendMail|||source=K:/V0500/CSMail.pas;version=v500
+ComCtrls|TListView,TTreeView|||source=K:/V0500/ComCtrls.pas;version=v500
+ActnList|TActionList,TAction|||source=K:/V0500/ActnList.pas;version=v500
+Generics.Collections|TList,TDictionary|||source=K:/V0500/Generics.Collections.pas;version=v500
+ComObj|CreateOleObject|||source=K:/V0500/ComObj.pas;version=v500
+Clipbrd|Clipboard,TClipboard|||source=K:/V0500/Clipbrd.pas;version=v500

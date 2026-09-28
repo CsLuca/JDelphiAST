@@ -167,6 +167,8 @@ struct AnalysisResult {
   std::vector<InactiveRange> inactiveRanges;
   bool preprocessorComplete{true};
   std::vector<std::string> diagnostics;
+  std::filesystem::path unitMappingCatalog;
+  bool unitMappingCatalogValid{};
 };
 
 struct IndexedUnit {
@@ -184,6 +186,7 @@ struct IndexedUnit {
   std::string packageBpl;
   std::filesystem::path sourceProject;
   std::vector<std::string> dependencies;
+  std::string origin;
 };
 
 class Analyzer {
@@ -196,6 +199,7 @@ class Analyzer {
                        std::vector<std::filesystem::path> includePaths);
   void setBuildContext(std::string configuration, std::string platform);
   void addDiagnostic(std::string diagnostic);
+  void setUnitMappingCatalog(std::filesystem::path catalog, bool valid);
   [[nodiscard]] AnalysisResult analyze() const;
 
  private:
@@ -212,6 +216,8 @@ class Analyzer {
   std::string configuration_;
   std::string platform_;
   std::vector<std::string> diagnostics_;
+  std::filesystem::path unitMappingCatalog_;
+  bool unitMappingCatalogValid_{};
 };
 
 [[nodiscard]] UnitAst parseUnit(std::filesystem::path path, const std::string& source);

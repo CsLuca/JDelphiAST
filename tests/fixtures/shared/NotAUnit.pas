@@ -1,0 +1,3 @@
+procedure GeneratedFragment;
+begin
+end;
