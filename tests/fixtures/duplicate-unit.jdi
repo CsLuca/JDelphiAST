@@ -1,2 +1,2 @@
-Same.Unit|TFoo||
-Same.Unit|TBar||
+Same.Unit|TFoo|||source=First.pas;version=v500
+Same.Unit|TBar|||source=Second.pas;version=v500

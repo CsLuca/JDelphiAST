@@ -107,8 +107,10 @@ int main() {
   require(malformed.hasBlockingErrors && malformed.diagnostics.front().code == "index_parse_failed",
           "malformed index is a blocking validation error");
   const auto duplicate = jdelphiast::loadSymbolIndexValidated(fixtures / "duplicate-unit.jdi");
-  require(duplicate.hasBlockingErrors && duplicate.diagnostics.front().code == "duplicate_unit_source",
-          "duplicate unit index entry is blocking");
+  require(!duplicate.hasBlockingErrors && duplicate.units.size() == 2 &&
+              duplicate.diagnostics.front().code == "duplicate_unit_source" &&
+              duplicate.diagnostics.front().severity == "warning",
+          "duplicate unit candidates are retained as a warning");
   const auto duplicateSymbol = jdelphiast::loadSymbolIndexValidated(fixtures / "duplicate-symbol.jdi");
   require(duplicateSymbol.hasBlockingErrors && duplicateSymbol.diagnostics.front().code == "duplicate_symbol",
           "duplicate exported symbol is blocking");

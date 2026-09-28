@@ -7,6 +7,7 @@
 #include <optional>
 #include <set>
 #include <sstream>
+#include <unordered_set>
 
 namespace jdelphiast {
 namespace {
@@ -668,6 +669,18 @@ UnitMapOutput compareUnits(const UnitMapOptions& options, const std::vector<Inde
   };
   std::sort(left.begin(), left.end(), byName);
   std::sort(right.begin(), right.end(), byName);
+  std::set<std::string> duplicateLeft, duplicateRight;
+  for (std::size_t i = 1; i < left.size(); ++i)
+    if (lower(left[i - 1].name) == lower(left[i].name)) duplicateLeft.insert(lower(left[i].name));
+  for (std::size_t i = 1; i < right.size(); ++i)
+    if (lower(right[i - 1].name) == lower(right[i].name)) duplicateRight.insert(lower(right[i].name));
+  std::unordered_map<std::string, std::vector<const IndexedUnit*>> rightBySimpleName;
+  std::unordered_map<std::string, std::vector<const IndexedUnit*>> rightByExport;
+  for (const auto& unit : right) {
+    const auto separator = unit.name.find_last_of('.');
+    rightBySimpleName[lower(unit.name.substr(separator == std::string::npos ? 0 : separator + 1))].push_back(&unit);
+    for (const auto& symbol : unit.symbols) rightByExport[lower(symbol)].push_back(&unit);
+  }
   std::vector<SeedMapping> seeds;
   std::vector<ValidationDiagnostic> earlyDiagnostics = options.validationDiagnostics;
   if (!options.seedFile.empty()) {
@@ -688,8 +701,21 @@ UnitMapOutput compareUnits(const UnitMapOptions& options, const std::vector<Inde
       "icontatti", "ustamain", "cbfrig", "fsecstdns", "fgridstdns", "cercaprezzostd"};
   std::vector<Mapping> mappings;
   for (const auto& leftUnit : left) {
+    if (!mappings.empty() && lower(mappings.back().left->name) == lower(leftUnit.name)) continue;
     Mapping mapping;
     mapping.left = &leftUnit;
+    if (duplicateLeft.contains(lower(leftUnit.name))) {
+      mapping.type = "ambiguous";
+      mapping.compatibility = "ambiguous";
+      mapping.confidence = "low";
+      mapping.action = "review_required";
+      mapping.diagnostics.push_back("duplicate_unit_source");
+      for (const auto& candidate : left)
+        if (lower(candidate.name) == lower(leftUnit.name))
+          mapping.candidates.push_back(candidate.sourceFile.empty() ? candidate.name : candidate.sourceFile.generic_string());
+      mappings.push_back(std::move(mapping));
+      continue;
+    }
     const auto seed = std::find_if(seeds.begin(), seeds.end(), [&](const SeedMapping& item) {
       return lower(item.left) == lower(leftUnit.name);
     });
@@ -703,7 +729,18 @@ UnitMapOutput compareUnits(const UnitMapOptions& options, const std::vector<Inde
       mapping.action = seed->action.empty() ? "review_required" : seed->action;
       mapping.notes = seed->notes;
       if (!seed->nullTarget) mapping.right = findUnit(right, seed->right);
-      if (!seed->nullTarget && !mapping.right) {
+      if (mapping.right && duplicateRight.contains(lower(mapping.right->name))) {
+        mapping.type = "ambiguous";
+        mapping.compatibility = "ambiguous";
+        mapping.confidence = "low";
+        mapping.action = "review_required";
+        mapping.diagnostics.push_back("duplicate_unit_source");
+        for (const auto& candidate : right)
+          if (lower(candidate.name) == lower(mapping.right->name))
+            mapping.candidates.push_back(candidate.sourceFile.empty() ? candidate.name : candidate.sourceFile.generic_string());
+        mapping.right = nullptr;
+      }
+      if (!seed->nullTarget && !mapping.right && mapping.type != "ambiguous") {
         mapping.type = "not_found";
         mapping.compatibility = "not_found";
         mapping.confidence = "low";
@@ -717,21 +754,37 @@ UnitMapOutput compareUnits(const UnitMapOptions& options, const std::vector<Inde
       mapping.action = mapping.type == "relocated_symbols" ? "symbol_by_symbol" : "manual_required";
     } else {
       mapping.right = findUnit(right, leftUnit.name);
+      if (mapping.right && duplicateRight.contains(lower(mapping.right->name))) {
+        mapping.type = "ambiguous";
+        mapping.compatibility = "ambiguous";
+        mapping.confidence = "low";
+        mapping.action = "review_required";
+        mapping.diagnostics.push_back("duplicate_unit_source");
+        for (const auto& candidate : right)
+          if (lower(candidate.name) == lower(mapping.right->name))
+            mapping.candidates.push_back(candidate.sourceFile.empty() ? candidate.name : candidate.sourceFile.generic_string());
+        mapping.right = nullptr;
+      }
       if (mapping.right) mapping.nameScore = 100;
-      if (!mapping.right) {
+      if (!mapping.right && mapping.type.empty()) {
         const auto known = namespaces.find(lower(leftUnit.name));
         if (known != namespaces.end()) { mapping.right = findUnit(right, known->second); mapping.nameScore = 95; }
       }
-      if (!mapping.right) {
+      if (!mapping.right && mapping.type.empty()) {
         const auto simple = lower(leftUnit.name.substr(leftUnit.name.find_last_of('.') == std::string::npos
                                                           ? 0 : leftUnit.name.find_last_of('.') + 1));
         std::vector<const IndexedUnit*> candidates;
-        for (const auto& candidate : right) {
-          const auto candidateSimple = lower(candidate.name.substr(candidate.name.find_last_of('.') == std::string::npos
-                                                                       ? 0 : candidate.name.find_last_of('.') + 1));
-          const auto common = commonExports(leftUnit, candidate);
-          if (candidateSimple == simple || common.size() >= 2) candidates.push_back(&candidate);
-        }
+        std::unordered_map<const IndexedUnit*, std::size_t> exportMatches;
+        for (const auto& symbol : leftUnit.symbols)
+          if (const auto owners = rightByExport.find(lower(symbol)); owners != rightByExport.end())
+            for (const auto* owner : owners->second) ++exportMatches[owner];
+        std::unordered_set<const IndexedUnit*> candidateSet;
+        if (const auto sameName = rightBySimpleName.find(simple); sameName != rightBySimpleName.end())
+          candidateSet.insert(sameName->second.begin(), sameName->second.end());
+        for (const auto& [candidate, matches] : exportMatches)
+          if (matches >= 2) candidateSet.insert(candidate);
+        for (const auto& candidate : right)
+          if (candidateSet.contains(&candidate)) candidates.push_back(&candidate);
         if (candidates.size() == 1) mapping.right = candidates.front();
         else if (candidates.size() > 1) {
           mapping.type = "ambiguous"; mapping.compatibility = "ambiguous"; mapping.confidence = "low";
@@ -743,12 +796,11 @@ UnitMapOutput compareUnits(const UnitMapOptions& options, const std::vector<Inde
         std::set<std::string> relocatedUnits;
         std::size_t relocatedExports = 0;
         for (const auto& exported : leftUnit.symbols) {
-          std::vector<std::string> owners;
-          for (const auto& candidate : right)
-            if (std::any_of(candidate.symbols.begin(), candidate.symbols.end(), [&](const std::string& symbol) {
-                  return lower(symbol) == lower(exported);
-                })) owners.push_back(candidate.name);
-          if (owners.size() == 1) { relocatedUnits.insert(owners.front()); ++relocatedExports; }
+          const auto owners = rightByExport.find(lower(exported));
+          if (owners != rightByExport.end() && owners->second.size() == 1) {
+            relocatedUnits.insert(owners->second.front()->name);
+            ++relocatedExports;
+          }
         }
         if (relocatedUnits.size() > 1 && relocatedExports >= 2) {
           mapping.type = "relocated_symbols";

@@ -478,7 +478,7 @@ The authoritative catalog JSON contains deterministic, case-insensitively ordere
 
 `compare-units` works only from persistent indexes and never rescans the V500/V600 source trees. Approved seed mappings have priority but are validated against the right index; a missing seed target is downgraded and diagnosed. JSON is authoritative, while CSV and searchable HTML are optional views generated from the same deterministic mapping model.
 
-Validation defaults are conservative: `no_unit_declaration` is a recoverable warning; parse failures, duplicate unit declarations, invalid seed data, missing seed targets, and incompatible approved signatures are blocking errors. Use `--validation-policy <file>` to override individual codes with `code=info`, `code=warning`, or `code=error` lines. Blocking validation errors return a non-zero exit code and prevent publishing the requested index or mapping catalog.
+Validation defaults preserve usable legacy evidence: `no_unit_declaration`, recoverable `incomplete_unit`, and duplicate unit candidates are warnings. Unrecoverable parse failures, invalid seed data, missing seed targets, and incompatible approved signatures remain blocking errors. Use `--validation-policy <file>` to override individual codes with `code=info`, `code=warning`, or `code=error` lines. Blocking validation errors return a non-zero exit code and prevent publishing the requested index or mapping catalog.
 
 Default severity table:
 
@@ -492,8 +492,8 @@ Default severity table:
 | `source_scan_failed` | error | source tree could not be enumerated completely |
 | `file_read_error` | error | a source file could not be read |
 | `parse_failure` | error | parser raised an unrecoverable error |
-| `incomplete_unit` | error | unit declaration exists but the source is structurally incomplete |
-| `duplicate_unit_source` | error | duplicate unit identity in source or JDI |
+| `incomplete_unit` | warning | unit/interface evidence is indexed as `partial` with low confidence; nonrecoverable sources are diagnosed and skipped |
+| `duplicate_unit_source` | warning | all duplicate source candidates are retained without selecting an owner |
 | `duplicate_symbol` | error | duplicate exported symbol inside one indexed unit |
 | `index_read_failed` | error | JDI is missing or unreadable |
 | `index_parse_failed` | error | malformed JDI record or unknown flag |
@@ -547,7 +547,7 @@ DelphiAstTool.exe analyze --dproj Plugin.dproj --config Release --platform Win32
 
 Without `--unit-map`, the additive `unit_mapping` section reports `available:false` and old consumers continue using `status`, `confidence`, and `reasons` exactly as before.
 
-Indexing is resilient to `.pas` fragments without a parseable `unit` declaration. Such files are skipped, retained in the structured index report with `no_unit_declaration`, and do not abort indexing of valid units.
+Indexing is resilient to `.pas` fragments without a parseable `unit` declaration. Such files are skipped, retained in the structured index report with `no_unit_declaration`, and do not abort indexing of valid units. A source with `unit`, `interface`, and recoverable exports is emitted with the `partial` flag plus `confidence=low;diagnostics=incomplete_unit`. Duplicate unit names retain every source record; comparison reports them as ambiguous candidates and never chooses an owner automatically.
 
 Stable diagnostic codes include:
 

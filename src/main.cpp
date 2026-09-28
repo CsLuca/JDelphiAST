@@ -166,9 +166,10 @@ EXIT CODES
   2  Invalid command line or blocking validation/I/O/index error.
 
 VALIDATION SEVERITY
-  Default warnings: no_unit_declaration, source_unit_not_indexed.
-  Default errors: missing source root, file read failure, parse failure, incomplete unit,
-  duplicate unit, duplicate symbol, malformed/inconsistent JDI, missing seed target,
+  Default warnings: no_unit_declaration, recoverable incomplete_unit,
+  duplicate_unit_source, source_unit_not_indexed.
+  Default errors: missing source root, file read failure, unrecoverable parse failure,
+  duplicate symbol, malformed/inconsistent JDI, missing seed target,
   seed signature incompatibility, and missing V500/V600 index.
   Use --validation-policy <file> with code=warning or code=error lines to override.
   Blocking errors are returned in validation.has_blocking_errors and blocking_errors.

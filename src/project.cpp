@@ -500,7 +500,8 @@ std::string validationSeverity(std::string_view code, const ValidationPolicy& po
   if (const auto found = policy.severities.find(normalized); found != policy.severities.end()) return found->second;
   static const std::unordered_set<std::string> infos = {"output_not_written"};
   static const std::unordered_set<std::string> warnings = {
-      "no_unit_declaration", "source_unit_not_indexed", "parser_feature_unsupported",
+      "no_unit_declaration", "incomplete_unit", "duplicate_unit_source",
+      "source_unit_not_indexed", "parser_feature_unsupported",
       "filesystem_path_encoding_error", "seed_without_export_evidence", "seed_missing_exports"};
   if (infos.contains(normalized)) return "info";
   return warnings.contains(normalized) ? "warning" : "error";
@@ -640,8 +641,7 @@ IndexLoadResult loadSymbolIndexValidated(const std::filesystem::path& indexFile)
     }
     const auto unitName = lower(fields[0]);
     if (!names.insert(unitName).second) {
-      result.hasBlockingErrors = true;
-      result.diagnostics.push_back({"duplicate_unit_source", "error",
+      result.diagnostics.push_back({"duplicate_unit_source", "warning",
           "Duplicate unit entry in index: " + fields[0], indexFile, fields[0]});
     }
     std::unordered_set<std::string> symbols;
@@ -865,25 +865,26 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
       continue;
     }
     if (!ast.complete) {
-      const auto structurallyTerminated = sourceText.find("interface") != std::string::npos &&
-          sourceText.find("implementation") != std::string::npos &&
-          sourceText.find("end.") != std::string::npos;
+      const auto normalizedSource = lower(sourceText);
+      const auto hasInterface = normalizedSource.find("interface") != std::string::npos;
+      const auto hasImplementation = normalizedSource.find("implementation") != std::string::npos;
+      const auto hasTerminator = normalizedSource.find("end.") != std::string::npos;
+      const auto structurallyTerminated = hasInterface && hasImplementation && hasTerminator;
+      const auto recoverablePartial = hasInterface && (hasImplementation || !ast.exports.empty());
       const auto code = structurallyTerminated ? "parser_feature_unsupported" : "incomplete_unit";
-      const auto level = severity(code, structurallyTerminated ? "warning" : "error");
+      const auto level = severity(code, "warning");
       result.hasBlockingErrors = result.hasBlockingErrors || level == "error";
-      result.diagnostics.push_back({file, structurallyTerminated ? "partially_indexed" : "parse_failed", code, level,
-          structurallyTerminated ? "The unit was partially indexed because active syntax or directives are not fully supported."
-                                 : "The Delphi unit is syntactically incomplete."});
-      if (!structurallyTerminated) { ++result.statistics.filesParseFailed; continue; }
+      result.diagnostics.push_back({file, recoverablePartial ? "partially_indexed" : "parse_failed", code, level,
+          recoverablePartial ? "The unit was partially indexed; extracted interface exports remain available with low confidence."
+                             : "The Delphi unit has no safe partial interface index and was skipped without blocking valid units."});
+      if (!recoverablePartial) continue;
       ++result.statistics.unitsPartiallyIndexed;
     }
     if (!names.insert(lower(ast.name)).second) {
-      ++result.statistics.filesParseFailed;
-      const auto level = severity("duplicate_unit_source", "error");
+      const auto level = severity("duplicate_unit_source", "warning");
       result.hasBlockingErrors = result.hasBlockingErrors || level == "error";
-      result.diagnostics.push_back({file, "parse_failed", "duplicate_unit_source", level,
-                                    "Another source file declares the same Delphi unit."});
-      continue;
+      result.diagnostics.push_back({file, "duplicate_candidate", "duplicate_unit_source", level,
+                                    "Another source file declares the same Delphi unit; all candidates are preserved."});
     }
     try {
       (void)genericPathToUtf8(file);
@@ -933,6 +934,7 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
     for (const auto& declaration : unit.declarations)
       for (const auto& parameter : declaration.parameters) parameterNames.insert(lower(parameter.name));
     bool firstSymbol = true;
+    std::unordered_set<std::string> emittedSymbols;
     for (const auto& symbol : unit.exports) {
       if (parameterNames.contains(lower(symbol.name))) continue;
       const auto classMember = std::any_of(unit.declarations.begin(), unit.declarations.end(), [&](const AstDeclaration& declaration) {
@@ -941,6 +943,7 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
         return lower(simple) == lower(symbol.name);
       });
       if (classMember) continue;
+      if (!emittedSymbols.insert(lower(symbol.name)).second) continue;
       if (!firstSymbol) output << ',';
       firstSymbol = false;
       output << symbol.name;
@@ -987,7 +990,8 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
              << (declaration.isOverride ? "override" : "");
     }
     output << "|source=" << encode(genericPathToUtf8(unit.file)) << ";version=" << encode(options.version)
-           << ";origin=" << encode(options.origin);
+            << ";origin=" << encode(options.origin);
+    if (!unit.complete) output << ";confidence=low;diagnostics=incomplete_unit";
     if (const auto metadata = packageByFile.find(lower(pathToUtf8(std::filesystem::absolute(unit.file).lexically_normal())));
         metadata != packageByFile.end()) {
       output << ";package=" << encode(metadata->second.name) << ";dcp=" << encode(metadata->second.dcp)

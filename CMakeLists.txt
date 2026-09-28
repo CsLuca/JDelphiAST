@@ -75,8 +75,9 @@ if(JDELPHIAST_BUILD_TESTS)
     PASS_REGULAR_EXPRESSION "info_count.*1")
   add_test(NAME jdelphiast_cli_index_incomplete_unit
     COMMAND ${CMAKE_COMMAND}
-      -DTOOL=$<TARGET_FILE:DelphiAstTool> -DEXPECT_EXIT=2 -DEXPECT_TEXT=incomplete_unit
-      -DEXPECT_MISSING_FILE=${CMAKE_CURRENT_BINARY_DIR}/incomplete-unit.jdi -DCREATE_STALE_FILE=1
+      -DTOOL=$<TARGET_FILE:DelphiAstTool> -DEXPECT_EXIT=0 -DEXPECT_TEXT=incomplete_unit
+      -DEXPECT_PRESENT_FILE=${CMAKE_CURRENT_BINARY_DIR}/incomplete-unit.jdi
+      -DEXPECT_FILE_TEXT=confidence=low.*diagnostics=incomplete_unit
       "-DARGS=index;--source;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/incomplete;--output;${CMAKE_CURRENT_BINARY_DIR}/incomplete-unit.jdi;--version;v600;--format;json"
       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_command.cmake)
   add_test(NAME jdelphiast_cli_index_missing_root
@@ -140,11 +141,10 @@ if(JDELPHIAST_BUILD_TESTS)
   add_test(NAME jdelphiast_cli_compare_units_duplicate
     COMMAND ${CMAKE_COMMAND}
       -DTOOL=$<TARGET_FILE:DelphiAstTool>
-      -DEXPECT_EXIT=2
-      -DEXPECT_TEXT=duplicate_unit_source
-      -DEXPECT_MISSING_FILE=${CMAKE_CURRENT_BINARY_DIR}/duplicate-map.json
-      -DCREATE_STALE_FILE=1
-      "-DARGS=compare-units;--left-index;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/duplicate-unit.jdi;--right-index;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/unit-map-v600.jdi;--output;${CMAKE_CURRENT_BINARY_DIR}/duplicate-map.json;--format;json"
+      -DEXPECT_EXIT=0
+      -DEXPECT_TEXT=ambiguous
+      -DEXPECT_PRESENT_FILE=${CMAKE_CURRENT_BINARY_DIR}/duplicate-map.json
+      "-DARGS=compare-units;--left-index;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/duplicate-unit.jdi;--right-index;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/unit-map-v600.jdi;--output;${CMAKE_CURRENT_BINARY_DIR}/duplicate-map.json;--include-ambiguous;--format;json"
       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_command.cmake)
   add_test(NAME jdelphiast_cli_compare_units_duplicate_symbol
     COMMAND ${CMAKE_COMMAND}
