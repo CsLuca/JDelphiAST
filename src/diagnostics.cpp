@@ -102,18 +102,6 @@ std::vector<std::string> activeSourceEvidence(const std::vector<IndexedUnit>& un
   return result;
 }
 
-std::string inferIdentifierType(const UnitAst& ast, std::string expression) {
-  const auto dot = expression.find('.');
-  if (dot != std::string::npos) expression.resize(dot);
-  const auto key = lower(expression);
-  for (const auto& declaration : ast.declarations) {
-    if (lower(simpleName(declaration.name)) == key && !declaration.type.empty()) return declaration.type;
-    for (const auto& parameter : declaration.parameters)
-      if (lower(parameter.name) == key) return parameter.type;
-  }
-  return {};
-}
-
 struct InferredType {
   std::string type;
   std::string source;
@@ -593,8 +581,8 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
       if (declaration.parameters.size() != call.arguments.size()) continue;
       hasArityMatch = true;
       for (std::size_t i = 0; i < call.arguments.size(); ++i) {
-        auto actual = call.arguments[i].resolvedType;
-        if (actual.empty()) actual = inferType(ast, call.arguments[i].text, right, call.range.begin.offset).type;
+        auto actual = inferType(ast, call.arguments[i].text, right, call.range.begin.offset).type;
+        if (actual.empty()) actual = call.arguments[i].resolvedType;
         if (!actual.empty() && !declaration.parameters[i].type.empty() &&
             !typeCompatible(actual, declaration.parameters[i].type)) hasTypedMismatch = true;
       }
@@ -704,8 +692,8 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
       score += 20;
       bool known = true, compatible = true;
       for (std::size_t i = 0; i < selected->arguments.size(); ++i) {
-        auto actual = selected->arguments[i].resolvedType;
-        if (actual.empty()) actual = inferIdentifierType(ast, selected->arguments[i].text);
+        auto actual = inferType(ast, selected->arguments[i].text, right, selected->range.begin.offset).type;
+        if (actual.empty()) actual = selected->arguments[i].resolvedType;
         if (actual.empty() || declaration.parameters[i].type.empty()) known = false;
         else if (!typeCompatible(actual, declaration.parameters[i].type)) compatible = false;
       }
@@ -730,8 +718,8 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
   const Candidate* selectedCandidate = candidates.empty() ||
       (candidates.size() > 1 && candidates[0].score == candidates[1].score) ? nullptr : &candidates.front();
   if (selectedCandidate && selected && !selected->arguments.empty()) {
-    const auto actualFirst = selected->arguments.front().resolvedType.empty()
-        ? inferType(ast, selected->arguments.front().text, right, selected->range.begin.offset).type : selected->arguments.front().resolvedType;
+    auto actualFirst = inferType(ast, selected->arguments.front().text, right, selected->range.begin.offset).type;
+    if (actualFirst.empty()) actualFirst = selected->arguments.front().resolvedType;
     bool acceptsCurrent = false, acceptsConnection = false;
     for (const auto& candidate : candidates) {
       if (candidate.unit != selectedCandidate->unit ||
@@ -816,8 +804,8 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
   std::size_t safeArgumentIndex = 0;
   if (selectedCandidate && selected) {
     for (std::size_t i = 0; i < selected->arguments.size() && i < selectedCandidate->declaration->parameters.size(); ++i) {
-      auto actual = selected->arguments[i].resolvedType;
-      if (actual.empty()) actual = inferType(ast, selected->arguments[i].text, right, selected->range.begin.offset).type;
+      auto actual = inferType(ast, selected->arguments[i].text, right, selected->range.begin.offset).type;
+      if (actual.empty()) actual = selected->arguments[i].resolvedType;
       const auto expected = selectedCandidate->declaration->parameters[i].type;
       if (lower(actual) != "taziendastd" ||
           (lower(expected) != "tcsedatabase" && lower(expected) != "ierpconnection")) continue;
@@ -917,7 +905,7 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
   if (selected) for (std::size_t i = 0; i < selected->arguments.size(); ++i) {
     if (i) output << ',';
     auto inferred = inferType(ast, selected->arguments[i].text, right, selected->range.begin.offset);
-    auto actual = selected->arguments[i].resolvedType.empty() ? inferred.type : selected->arguments[i].resolvedType;
+    auto actual = inferred.type.empty() ? selected->arguments[i].resolvedType : inferred.type;
     if (!selected->arguments[i].resolvedType.empty() && inferred.type.empty())
       inferred = {selected->arguments[i].resolvedType, "inferred", "high"};
     const auto expected = selectedCandidate && i < selectedCandidate->declaration->parameters.size()
@@ -1045,7 +1033,16 @@ std::string typeInfoJson(std::string_view requested, const std::vector<IndexedUn
   struct Member { const IndexedUnit* unit; AstDeclaration declaration; bool inherited; };
   std::vector<Member> methods, properties;
   std::set<std::string> acceptedOwners{lower(std::string(requested))};
-  if (includeInherited) for (const auto& ancestor : ancestors) acceptedOwners.insert(lower(ancestor));
+  if (includeInherited) {
+    for (const auto& ancestor : ancestors) acceptedOwners.insert(lower(ancestor));
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (const auto& unit : index) for (const auto& relation : unit.inheritance)
+        if (acceptedOwners.contains(lower(relation.type)) && !relation.baseType.empty() &&
+            acceptedOwners.insert(lower(relation.baseType)).second) changed = true;
+    }
+  }
   auto collect = [&](const IndexedUnit& unit, const AstDeclaration& declaration) {
     if (declaration.ownerType.empty() || !acceptedOwners.contains(lower(declaration.ownerType))) return;
     const bool inherited = lower(declaration.ownerType) != lower(std::string(requested));
@@ -1113,14 +1110,22 @@ std::string symbolOriginJson(std::string_view name, const std::vector<IndexedUni
       std::any_of(unit.inheritance.begin(), unit.inheritance.end(), [&](const auto& relation) {
         return lower(relation.type) == lower(std::string(name));
       })) providers.push_back(&unit);
-  const auto evidence = activeSourceEvidence(index, name, 32);
+  struct Evidence { std::string file, usage, unit; std::size_t line{}, column{}; };
+  std::vector<Evidence> evidence;
+  for (const auto& unit : index) for (const auto& item : unit.sourceEvidence) {
+    if (lower(simpleName(item.symbol)) != lower(std::string(name))) continue;
+    evidence.push_back({unit.sourceFile.generic_string(), item.usage, unit.name, item.line, item.column});
+    if (evidence.size() >= 32) break;
+  }
   const std::string classification = providers.size() == 1 ? "provider_resolved" :
                                      (!providers.empty() || !evidence.empty()) ? "ambiguous" : "unresolved";
   std::ostringstream output;
   output << "{\"schema_version\":\"2.3\",\"symbol\":\"" << escape(name) << "\",\"active_source_evidence\":[";
   for (std::size_t i = 0; i < evidence.size(); ++i) {
     if (i) output << ',';
-    output << "{\"file\":\"" << escape(evidence[i]) << "\",\"usage\":\"type_reference\"}";
+    output << "{\"file\":\"" << escape(evidence[i].file) << "\",\"line\":" << evidence[i].line
+           << ",\"column\":" << evidence[i].column << ",\"usage\":\"" << escape(evidence[i].usage)
+           << "\",\"active\":true,\"unit\":\"" << escape(evidence[i].unit) << "\"}";
   }
   output << "],\"provider_candidates\":[";
   for (std::size_t i = 0; i < providers.size(); ++i) {
