@@ -3,7 +3,7 @@ project(JDelphiAST VERSION 0.1.0 LANGUAGES CXX)
 
 option(JDELPHIAST_BUILD_TESTS "Build JDelphiAST tests" ON)
 
-add_library(jdelphiast src/analyzer.cpp src/project.cpp src/preprocessor.cpp src/queries.cpp)
+add_library(jdelphiast src/analyzer.cpp src/project.cpp src/preprocessor.cpp src/queries.cpp src/diagnostics.cpp)
 target_include_directories(jdelphiast PUBLIC include)
 target_compile_features(jdelphiast PUBLIC cxx_std_20)
 
@@ -42,10 +42,12 @@ if(JDELPHIAST_BUILD_TESTS)
     JDELPHIAST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
   add_test(NAME jdelphiast_query_tests COMMAND jdelphiast_query_tests)
   add_test(NAME jdelphiast_cli_package
-    COMMAND DelphiAstTool --project ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/DemoPackage.dpk
-            --output ${CMAKE_CURRENT_BINARY_DIR}/DemoPackage.ast.json)
-  set_tests_properties(jdelphiast_cli_package PROPERTIES
-    PASS_REGULAR_EXPRESSION "Wrote.*DemoPackage.ast.json")
+    COMMAND ${CMAKE_COMMAND}
+      -DTOOL=$<TARGET_FILE:DelphiAstTool> -DEXPECT_EXIT=0 -DEXPECT_TEXT=Wrote.*DemoPackage.ast.json
+      -DEXPECT_PRESENT_FILE=${CMAKE_CURRENT_BINARY_DIR}/DemoPackage.ast.json
+      -DEXPECT_FILE_TEXT=schemaVersion.*status.*confidence.*reasons
+      "-DARGS=--project;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/DemoPackage.dpk;--output;${CMAKE_CURRENT_BINARY_DIR}/DemoPackage.ast.json"
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_command.cmake)
   add_test(NAME jdelphiast_cli_requires_output
     COMMAND DelphiAstTool --project ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/DemoPackage.dpk)
   set_tests_properties(jdelphiast_cli_requires_output PROPERTIES WILL_FAIL TRUE)
@@ -176,4 +178,25 @@ if(JDELPHIAST_BUILD_TESTS)
       -DTOOL=$<TARGET_FILE:DelphiAstTool> -DEXPECT_EXIT=0 -DEXPECT_TEXT=has_blocking_errors.*false
       "-DARGS=compare-units;--left-index;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/unit-map-v500.jdi;--right-index;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/unit-map-v600.jdi;--seed;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/missing-target-seed.json;--validation-policy;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/warning-validation.policy;--output;${CMAKE_CURRENT_BINARY_DIR}/warning-policy-map.json;--include-unmapped;--format;json"
       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_command.cmake)
+  add_test(NAME jdelphiast_cli_compiler_log
+    COMMAND DelphiAstTool compiler-log --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/dcc32-errors.log --format json)
+  set_tests_properties(jdelphiast_cli_compiler_log PROPERTIES
+    PASS_REGULAR_EXPRESSION "first_actionable_error.*ordinal.*1")
+  add_test(NAME jdelphiast_cli_legacy_refs
+    COMMAND DelphiAstTool legacy-refs --file ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/LegacyRefs.pas
+      --legacy-unit UVariStd --left-index ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnose-v500.jdi
+      --right-index ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnose-v600.jdi
+      --unit-map ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnostic-unit-map.json --format json)
+  set_tests_properties(jdelphiast_cli_legacy_refs PROPERTIES PASS_REGULAR_EXPRESSION "unresolved_active_references.*ArrayCopia.*allowed.*false")
+  add_test(NAME jdelphiast_cli_model_migration
+    COMMAND DelphiAstTool model-migration --file ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/ModelMigration.pas
+      --symbol TCSFields --left-index ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnose-v500.jdi
+      --right-index ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnose-v600.jdi
+      --unit-map ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnostic-unit-map.json --format json)
+  set_tests_properties(jdelphiast_cli_model_migration PROPERTIES PASS_REGULAR_EXPRESSION "legacy_model_migration_required")
+  add_test(NAME jdelphiast_cli_diagnose
+    COMMAND DelphiAstTool diagnose --file ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/DiagnosticCalls.pas
+      --line 16 --error-code E2010 --index ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnose-v600.jdi
+      --left-index ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnose-v500.jdi --format json)
+  set_tests_properties(jdelphiast_cli_diagnose PROPERTIES PASS_REGULAR_EXPRESSION "PrdRT.Utils.GetColumnMaxLength")
 endif()

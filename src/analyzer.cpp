@@ -826,9 +826,11 @@ void Analyzer::setBuildContext(std::string configuration, std::string platform) 
 }
 
 void Analyzer::addDiagnostic(std::string diagnostic) { diagnostics_.push_back(std::move(diagnostic)); }
-void Analyzer::setUnitMappingCatalog(std::filesystem::path catalog, bool valid) {
+void Analyzer::setUnitMappingCatalog(std::filesystem::path catalog, bool valid,
+                                     std::vector<UnitMappingSuggestion> mappings) {
   unitMappingCatalog_ = std::move(catalog);
   unitMappingCatalogValid_ = valid;
+  unitMappings_ = std::move(mappings);
 }
 
 UnitAst parseUnit(std::filesystem::path path, const std::string& source) {
@@ -844,6 +846,7 @@ AnalysisResult Analyzer::analyze() const {
   result.diagnostics = diagnostics_;
   result.unitMappingCatalog = unitMappingCatalog_;
   result.unitMappingCatalogValid = unitMappingCatalogValid_;
+  result.unitMappings = unitMappings_;
   result.units.reserve(inputs_.size());
   const PreprocessorOptions preprocessorOptions{defines_, includePaths_, 64};
   for (const auto& input : inputs_) {
@@ -1288,7 +1291,26 @@ std::string toProjectJson(const AnalysisResult& result, std::string_view plugin,
       writePosition(output, assignment.range);
       output << '}';
     }
-    output << "]}";
+    output << "],\"unit_mapping\":{\"available\":" << (result.unitMappingCatalogValid ? "true" : "false")
+           << ",\"catalog\":";
+    if (result.unitMappingCatalog.empty()) output << "null";
+    else output << '"' << jsonEscape(result.unitMappingCatalog.generic_string()) << '"';
+    output << ",\"suggestions\":[";
+    bool firstSuggestion = true;
+    for (const auto& mapping : result.unitMappings) {
+      const auto used = std::any_of(unit.dependencies.begin(), unit.dependencies.end(), [&](const Dependency& dependency) {
+        return canonical(dependency.unit) == canonical(mapping.sourceUnit);
+      });
+      if (!used) continue;
+      if (!firstSuggestion) output << ',';
+      firstSuggestion = false;
+      output << "{\"source_unit\":\"" << jsonEscape(mapping.sourceUnit) << "\",\"target_unit\":";
+      if (mapping.targetUnit.empty()) output << "null"; else output << '"' << jsonEscape(mapping.targetUnit) << '"';
+      output << ",\"confidence\":\"" << jsonEscape(mapping.confidence)
+             << "\",\"compatibility\":\"" << jsonEscape(mapping.compatibility)
+             << "\",\"automatic_action\":\"" << jsonEscape(mapping.automaticAction) << "\"}";
+    }
+    output << "]}}";
   }
   output << "],\"uses\":[";
   bool firstUseV2 = true;
@@ -1463,7 +1485,17 @@ std::string toProjectJson(const AnalysisResult& result, std::string_view plugin,
          << ",\"catalog\":";
   if (result.unitMappingCatalog.empty()) output << "null";
   else output << '"' << jsonEscape(result.unitMappingCatalog.generic_string()) << '"';
-  output << ",\"mappings\":[],\"diagnostics\":[";
+  output << ",\"mappings\":[";
+  for (std::size_t i = 0; i < result.unitMappings.size(); ++i) {
+    if (i) output << ',';
+    const auto& mapping = result.unitMappings[i];
+    output << "{\"source_unit\":\"" << jsonEscape(mapping.sourceUnit) << "\",\"target_unit\":";
+    if (mapping.targetUnit.empty()) output << "null"; else output << '"' << jsonEscape(mapping.targetUnit) << '"';
+    output << ",\"confidence\":\"" << jsonEscape(mapping.confidence)
+           << "\",\"compatibility\":\"" << jsonEscape(mapping.compatibility)
+           << "\",\"automatic_action\":\"" << jsonEscape(mapping.automaticAction) << "\"}";
+  }
+  output << "],\"diagnostics\":[";
   if (!result.unitMappingCatalogValid) output << "{\"code\":\""
       << (result.unitMappingCatalog.empty() ? "unit_mapping_catalog_not_provided" : "unit_mapping_catalog_invalid")
       << "\",\"severity\":\"info\",\"message\":\"Use compare-units with valid V500 and V600 indexes to generate verified mappings.\"}";

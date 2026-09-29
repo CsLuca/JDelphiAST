@@ -1,0 +1,3 @@
+PI_PulsarEngineering_GenPIeLV_Models.pas(391) Error: E2010 Incompatible types: 'Integer' and 'procedure, untyped pointer or untyped parameter'
+PI_PulsarEngineering_GenPIeLV_Models.pas(429) Error: E2010 Incompatible types: 'string' and 'Integer'
+[dcc32 Error] PI_PulsarEngineering_GenPIeLV_Models.pas(651): E2003 Undeclared identifier: 'ExecuteScalar'

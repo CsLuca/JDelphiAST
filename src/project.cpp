@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iterator>
 #include <optional>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -450,6 +451,15 @@ std::vector<std::filesystem::path> packageSources(const std::string& source) {
   return result;
 }
 
+std::vector<std::filesystem::path> dprojSources(const std::string& source) {
+  std::vector<std::filesystem::path> result;
+  const std::regex reference(R"(<DCCReference\b[^>]*\bInclude\s*=\s*["']([^"']+\.pas)["'][^>]*>)",
+                             std::regex::icase);
+  for (std::sregex_iterator item(source.begin(), source.end(), reference), end; item != end; ++item)
+    result.emplace_back(xmlDecode((*item)[1].str()));
+  return result;
+}
+
 struct FoundUnit { std::filesystem::path path; std::string candidateName; };
 
 std::optional<FoundUnit> findUnit(const std::string& name,
@@ -505,6 +515,62 @@ std::string validationSeverity(std::string_view code, const ValidationPolicy& po
       "filesystem_path_encoding_error", "seed_without_export_evidence", "seed_missing_exports"};
   if (infos.contains(normalized)) return "info";
   return warnings.contains(normalized) ? "warning" : "error";
+}
+
+std::vector<UnitMappingSuggestion> loadUnitMappingCatalog(const std::filesystem::path& catalogFile) {
+  const auto source = readFile(catalogFile);
+  if (source.find("\"schema_version\"") == std::string::npos ||
+      source.find("\"mappings\"") == std::string::npos)
+    throw std::runtime_error("Invalid unit mapping catalog schema");
+  const auto stringField = [](std::string_view object, std::string_view key) {
+    const std::regex pattern("\\\"" + std::string(key) + "\\\"\\s*:\\s*\\\"([^\\\"]*)\\\"");
+    std::cmatch match;
+    const std::string value(object);
+    return std::regex_search(value.c_str(), match, pattern) ? match[1].str() : std::string{};
+  };
+  std::vector<UnitMappingSuggestion> result;
+  const auto mappings = source.find("\"mappings\"");
+  const auto open = source.find('[', mappings);
+  if (open == std::string::npos) throw std::runtime_error("Invalid unit mapping catalog mappings");
+  bool arrayQuoted = false;
+  int arrayDepth = 0;
+  std::size_t end = std::string::npos;
+  for (std::size_t i = open; i < source.size(); ++i) {
+    const char c = source[i];
+    if (c == '"' && (i == 0 || source[i - 1] != '\\')) arrayQuoted = !arrayQuoted;
+    if (arrayQuoted) continue;
+    if (c == '[') ++arrayDepth;
+    else if (c == ']' && --arrayDepth == 0) { end = i; break; }
+  }
+  if (end == std::string::npos) throw std::runtime_error("Invalid unit mapping catalog mappings");
+  std::size_t position = open + 1;
+  while (position < end) {
+    const auto objectOpen = source.find('{', position);
+    if (objectOpen == std::string::npos || objectOpen >= end) break;
+    int depth = 0;
+    bool quoted = false;
+    std::size_t objectClose = objectOpen;
+    for (; objectClose < end; ++objectClose) {
+      const char c = source[objectClose];
+      if (c == '"' && (objectClose == 0 || source[objectClose - 1] != '\\')) quoted = !quoted;
+      if (quoted) continue;
+      if (c == '{') ++depth;
+      else if (c == '}' && --depth == 0) break;
+    }
+    if (objectClose >= end) throw std::runtime_error("Invalid unit mapping catalog object");
+    const auto object = std::string_view(source).substr(objectOpen, objectClose - objectOpen + 1);
+    UnitMappingSuggestion mapping;
+    mapping.sourceUnit = stringField(object, "v500_unit");
+    mapping.targetUnit = stringField(object, "v600_unit");
+    mapping.mappingType = stringField(object, "mapping_type");
+    mapping.confidence = stringField(object, "confidence");
+    mapping.compatibility = stringField(object, "compatibility");
+    mapping.automaticAction = stringField(object, "automatic_action");
+    mapping.notes = stringField(object, "notes");
+    if (!mapping.sourceUnit.empty()) result.push_back(std::move(mapping));
+    position = objectClose + 1;
+  }
+  return result;
 }
 
 std::vector<IndexedUnit> loadSymbolIndex(const std::filesystem::path& indexFile) {
@@ -770,6 +836,7 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
   };
   std::vector<std::filesystem::path> files;
   std::vector<std::filesystem::path> packages;
+  std::vector<std::filesystem::path> projects;
   auto allSources = sources;
   allSources.insert(allSources.end(), options.sourceRoots.begin(), options.sourceRoots.end());
   for (const auto& source : allSources) {
@@ -791,6 +858,7 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
         const auto extension = lower(pathToUtf8(entry.path().extension()));
         if (extension == ".pas") files.push_back(entry.path());
         else if (extension == ".dpk") packages.push_back(entry.path());
+        else if (extension == ".dproj") projects.push_back(entry.path());
       }
     } else {
       const auto level = severity("missing_source_root", "error");
@@ -810,16 +878,37 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
   for (const auto& packageRoot : options.packageRoots)
     if (std::filesystem::is_directory(packageRoot))
       for (const auto& entry : std::filesystem::recursive_directory_iterator(packageRoot))
-        if (entry.is_regular_file() && lower(pathToUtf8(entry.path().extension())) == ".dpk") packages.push_back(entry.path());
+        if (entry.is_regular_file()) {
+          const auto extension = lower(pathToUtf8(entry.path().extension()));
+          if (extension == ".dpk") packages.push_back(entry.path());
+          else if (extension == ".dproj") projects.push_back(entry.path());
+        }
   std::sort(packages.begin(), packages.end(), [](const auto& left, const auto& right) {
     const auto leftText = pathToUtf8(left), rightText = pathToUtf8(right);
     const auto leftLower = lower(leftText), rightLower = lower(rightText);
     return leftLower == rightLower ? leftText < rightText : leftLower < rightLower;
   });
   packages.erase(std::unique(packages.begin(), packages.end()), packages.end());
+  std::sort(projects.begin(), projects.end());
+  projects.erase(std::unique(projects.begin(), projects.end()), projects.end());
   std::vector<UnitAst> units;
   struct PackageMetadata { std::string name, dcp, bpl; std::filesystem::path project; };
   std::unordered_map<std::string, PackageMetadata> packageByFile;
+  for (const auto& project : projects) {
+    try {
+      const auto packageName = pathToUtf8(project.stem());
+      for (auto relative : dprojSources(readFile(project))) {
+        if (relative.is_relative()) relative = project.parent_path() / relative;
+        const auto key = lower(pathToUtf8(std::filesystem::absolute(relative).lexically_normal()));
+        packageByFile.try_emplace(key, PackageMetadata{packageName, {}, {}, project});
+      }
+    } catch (const std::filesystem::filesystem_error&) {
+      const auto level = severity("filesystem_path_encoding_error", "warning");
+      result.hasBlockingErrors = result.hasBlockingErrors || level == "error";
+      result.diagnostics.push_back({project, "path_encoding_error", "filesystem_path_encoding_error", level,
+                                    "A DPROJ path could not be converted; package metadata was skipped."});
+    }
+  }
   for (const auto& package : packages) {
     try {
       const auto packageName = pathToUtf8(package.stem());
@@ -1109,10 +1198,12 @@ ProjectLoadResult loadPackage(const std::filesystem::path& packageFile, ProjectO
   result.analyzer.setPreprocessor(result.options.defines, result.options.includePaths);
   result.analyzer.setBuildContext(result.options.configuration, result.options.platform);
   if (!result.options.unitMappingCatalog.empty()) {
-    const auto catalog = readFile(result.options.unitMappingCatalog);
-    const auto valid = !catalog.empty() && catalog.find("\"schema_version\":\"1.0\"") != std::string::npos &&
-                       catalog.find("\"mappings\"") != std::string::npos;
-    result.analyzer.setUnitMappingCatalog(result.options.unitMappingCatalog, valid);
+    try {
+      auto mappings = loadUnitMappingCatalog(result.options.unitMappingCatalog);
+      result.analyzer.setUnitMappingCatalog(result.options.unitMappingCatalog, true, std::move(mappings));
+    } catch (const std::exception&) {
+      result.analyzer.setUnitMappingCatalog(result.options.unitMappingCatalog, false);
+    }
   }
 
   std::unordered_map<std::string, IndexedUnit> mergedIndex;

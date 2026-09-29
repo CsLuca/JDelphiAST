@@ -156,6 +156,16 @@ struct DependencyEdge {
   DependencyStatus status{DependencyStatus::Unknown};
 };
 
+struct UnitMappingSuggestion {
+  std::string sourceUnit;
+  std::string targetUnit;
+  std::string mappingType;
+  std::string confidence;
+  std::string compatibility;
+  std::string automaticAction;
+  std::string notes;
+};
+
 struct AnalysisResult {
   std::vector<UnitAnalysis> units;
   std::vector<DependencyEdge> graph;
@@ -169,6 +179,7 @@ struct AnalysisResult {
   std::vector<std::string> diagnostics;
   std::filesystem::path unitMappingCatalog;
   bool unitMappingCatalogValid{};
+  std::vector<UnitMappingSuggestion> unitMappings;
 };
 
 struct IndexedUnit {
@@ -199,7 +210,8 @@ class Analyzer {
                        std::vector<std::filesystem::path> includePaths);
   void setBuildContext(std::string configuration, std::string platform);
   void addDiagnostic(std::string diagnostic);
-  void setUnitMappingCatalog(std::filesystem::path catalog, bool valid);
+  void setUnitMappingCatalog(std::filesystem::path catalog, bool valid,
+                             std::vector<UnitMappingSuggestion> mappings = {});
   [[nodiscard]] AnalysisResult analyze() const;
 
  private:
@@ -218,6 +230,7 @@ class Analyzer {
   std::vector<std::string> diagnostics_;
   std::filesystem::path unitMappingCatalog_;
   bool unitMappingCatalogValid_{};
+  std::vector<UnitMappingSuggestion> unitMappings_;
 };
 
 [[nodiscard]] UnitAst parseUnit(std::filesystem::path path, const std::string& source);

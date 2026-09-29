@@ -95,7 +95,7 @@ end.)");
   jdelphiast::ProjectOptions options;
   options.indexFiles.push_back(root / "rtl.jdi");
   options.unitMappingCatalog = root / "uses-map.json";
-  write(root / "uses-map.json", "{\"schema_version\":\"1.0\",\"mappings\":[]}");
+  write(root / "uses-map.json", "{\"schema_version\":\"1.0\",\"mappings\":[{\"v500_unit\":\"SysUtils\",\"v600_unit\":\"System.SysUtils\",\"mapping_type\":\"namespace_migration\",\"confidence\":\"high\",\"compatibility\":\"full_compatible\",\"automatic_action\":\"replace_in_uses\"}],\"unmapped_units\":[]}");
   const auto loaded = jdelphiast::loadPackage(root / "Demo.dpk", options);
   require(loaded.diagnostics.empty(), "realistic Release Win32 DPROJ conditions are fully evaluated");
   require(loaded.sourceFiles.size() == 2, "DPK and DPROJ discover package sources recursively");
@@ -135,7 +135,9 @@ end.)");
           "automation recommendations are serialized");
   require(json.find("\"unit_mapping\":{\"available\":true") != std::string::npos &&
               json.find("uses-map.json") != std::string::npos,
-          "optional unit mapping catalog reference is serialized additively");
+           "optional unit mapping catalog reference is serialized additively");
+  require(json.find("\"suggestions\":[{\"source_unit\":\"SysUtils\",\"target_unit\":\"System.SysUtils\"") != std::string::npos,
+          "verified unit mapping suggestions are attached per analyzed unit");
   require(json.find("\"blockedRemovals\":[") != std::string::npos,
           "blocked removals are serialized");
   require(json.find("\"uses\":[") != std::string::npos && json.find("\"references\":[") != std::string::npos &&
@@ -167,6 +169,22 @@ end.)");
   require(mainIndexed != roundTrip.end() && mainIndexed->packageName == "Demo" &&
               mainIndexed->packageDcp == "Demo.dcp" && mainIndexed->packageBpl == "Demo.bpl",
           "index derives package metadata from an actual DPK");
+
+  const auto dprojOnly = root / "dproj-only";
+  write(dprojOnly / "OnlyProject.dproj", R"(<Project><ItemGroup>
+<DCCReference Include="Source\DprojUnit.pas"/>
+</ItemGroup></Project>)");
+  write(dprojOnly / "Source" / "DprojUnit.pas", "unit DprojUnit; interface implementation end.");
+  jdelphiast::IndexBuildOptions dprojOptions;
+  dprojOptions.version = "v600";
+  dprojOptions.packageRoots.push_back(dprojOnly);
+  const auto dprojIndex = jdelphiast::buildSymbolIndex({dprojOnly / "Source"}, dprojOptions);
+  write(dprojOnly / "generated.jdi", dprojIndex.content);
+  const auto dprojUnits = jdelphiast::loadSymbolIndex(dprojOnly / "generated.jdi");
+  require(!dprojUnits.empty() && dprojUnits.front().packageName == "OnlyProject" &&
+              dprojUnits.front().packageDcp.empty() && dprojUnits.front().packageBpl.empty() &&
+              dprojUnits.front().sourceProject.filename() == "OnlyProject.dproj",
+          "DPROJ references provide package identity without inventing DCP or BPL names");
 
   const auto unicodeDir = root / jdelphiast::pathFromSourceBytes("sorgenti-citt\xC3\xA0");
   const auto unicodeFile = unicodeDir / jdelphiast::pathFromSourceBytes("UnitAccentuata-\xC3\xA8.pas");

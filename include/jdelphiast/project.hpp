@@ -85,6 +85,8 @@ struct IndexLoadResult {
 [[nodiscard]] IndexLoadResult loadSymbolIndexValidated(const std::filesystem::path& indexFile);
 [[nodiscard]] ValidationPolicy loadValidationPolicy(const std::filesystem::path& policyFile);
 [[nodiscard]] std::string validationSeverity(std::string_view code, const ValidationPolicy& policy);
+[[nodiscard]] std::vector<UnitMappingSuggestion> loadUnitMappingCatalog(
+    const std::filesystem::path& catalogFile);
 [[nodiscard]] std::vector<IndexedUnit> bundledSymbolIndex();
 [[nodiscard]] std::string createSymbolIndex(const std::vector<std::filesystem::path>& sources);
 [[nodiscard]] std::string createSymbolIndex(const std::vector<std::filesystem::path>& sources,

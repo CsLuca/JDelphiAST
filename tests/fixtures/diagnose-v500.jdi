@@ -1,0 +1,3 @@
+# JDelphiAST symbol index v2
+UVariStd|SQLStr|partial|function,SQLStr,string,function%20SQLStr%28Value%3A%20string%29%3A%20string|source=K:/V0500/UVariStd.pas;version=v500
+CSStdExt|TCSFields,EnableOnChange,FieldValues,GetCsField,CSSeek,CSModify,CSResetCampi||class,TCSFields,,class%20TCSFields|source=K:/V0500/CSStdExt.pas;version=v500

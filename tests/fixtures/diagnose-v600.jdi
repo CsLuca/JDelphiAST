@@ -1,0 +1,6 @@
+# JDelphiAST symbol index v2
+PrdRT.Utils|GetColumnMaxLength||function,TUtils_Table.GetColumnMaxLength,Integer,function%20GetColumnMaxLength%28ADB%3A%20TAziendaStd%3B%20ATblName%3A%20string%3B%20AColName%3A%20string%29%3A%20Integer|source=K:/V0600/PrdRT/Utils.pas;version=v600;package=M_PrdRT;dcp=M_PrdRT.dcp;bpl=M_PrdRT.bpl
+Overload.Api|ResolveThing||function,ResolveThing,Integer,function%20ResolveThing%28Value%3A%20Integer%29%3A%20Integer,overload;function,ResolveThing,string,function%20ResolveThing%28Value%3A%20string%29%3A%20string,overload|source=K:/V0600/Overload/Api.pas;version=v600
+CSFields|TCSFields,EnableOnChange,FieldValues||class,TCSFields,,class%20TCSFields;property,TCSFields.EnableOnChange,Boolean,property%20EnableOnChange%3A%20Boolean;property,TCSFields.FieldValues,Variant,property%20FieldValues%3A%20Variant|source=K:/V0600/Core/CSCore/Source/CSFields.pas;version=v600
+CSData|ExecSql||function,TCSEDatabase.ExecSql,Integer,function%20ExecSql%28const%20SQL%3A%20string%29%3A%20Integer|source=K:/V0600/Core/CSData.pas;version=v600
+FireDAC.Comp.Client|ExecSQL||procedure,TFDQuery.ExecSQL,,procedure%20ExecSQL|source=K:/V0600/FireDAC/Comp/Client.pas;version=v600

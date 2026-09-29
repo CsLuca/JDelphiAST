@@ -87,6 +87,10 @@ USAGE
   DelphiAstTool.exe unit-info --unit <name> [--index <index.jdi>] --format json
   DelphiAstTool.exe compare-symbol --left-index <v500.jdi> --right-index <v600.jdi> --symbol <name> --format json
   DelphiAstTool.exe compare-units --left-index <v500.jdi> --right-index <v600.jdi> --output <catalog.json> [options]
+  DelphiAstTool.exe diagnose --file <unit.pas> --line <number> --error-code <code> --index <v600.jdi> [options]
+  DelphiAstTool.exe legacy-refs --file <unit.pas> --legacy-unit <name> --left-index <v500.jdi> --right-index <v600.jdi> [options]
+  DelphiAstTool.exe model-migration --file <unit.pas> --symbol <name> --left-index <v500.jdi> --right-index <v600.jdi> [options]
+  DelphiAstTool.exe compiler-log --input <dcc32-build-log.txt> --format json
 
 PROJECT ANALYSIS OPTIONS
   --project <file.dpk>       Delphi package to analyze.
@@ -128,6 +132,14 @@ COMPARE-UNITS OPTIONS
   --minimum-confidence <low|medium|high>
   --csv <file.csv>          Optional CSV report.
   --html <file.html>        Optional searchable HTML report.
+
+DIAGNOSTIC OPTIONS
+  --error-code <code>       Delphi compiler error associated with diagnose.
+  --symbol <name>           Optional compiler symbol or model name.
+  --legacy-unit <name>      Legacy owner inspected by legacy-refs.
+  --input <build.log>       DCC32 log parsed by compiler-log.
+  diagnose, legacy-refs, model-migration, and compiler-log emit additive schema 2.2 JSON.
+  These commands are read-only and never modify Delphi sources.
 
 ANALYSIS OUTPUT
   Project JSON preserves legacy schemaVersion=1 fields and adds schema_version="2.1".
@@ -186,14 +198,16 @@ EXAMPLES
 
 bool isQueryCommand(std::string_view command) {
   return command == "exports" || command == "symbol" || command == "expression" ||
-         command == "hierarchy" || command == "unit-info" || command == "compare-symbol";
+         command == "hierarchy" || command == "unit-info" || command == "compare-symbol" ||
+         command == "diagnose" || command == "legacy-refs" || command == "model-migration" ||
+         command == "compiler-log";
 }
 
 int runQuery(std::string_view command, int argc, char** argv) {
   std::vector<std::filesystem::path> indexes, leftIndexes, rightIndexes;
-  std::filesystem::path file;
+  std::filesystem::path file, input, unitMap;
   std::filesystem::path dproj;
-  std::string unit, name, kind, qualifiedName, className;
+  std::string unit, legacyUnit, name, kind, qualifiedName, className, errorCode;
   std::string configuration{"Release"}, platform{"Win32"};
   std::size_t line{};
   for (int i = 2; i < argc; ++i) {
@@ -208,11 +222,15 @@ int runQuery(std::string_view command, int argc, char** argv) {
     else if (argument == "--left-index") leftIndexes.emplace_back(value);
     else if (argument == "--right-index") rightIndexes.emplace_back(value);
     else if (argument == "--file") file = value;
+    else if (argument == "--input") input = value;
+    else if (argument == "--unit-map") unitMap = value;
     else if (argument == "--unit") unit = value;
+    else if (argument == "--legacy-unit") legacyUnit = value;
     else if (argument == "--name" || argument == "--symbol") name = value;
     else if (argument == "--kind") kind = value;
     else if (argument == "--qualified-name") qualifiedName = value;
     else if (argument == "--class") className = value;
+    else if (argument == "--error-code") errorCode = value;
     else if (argument == "--line") {
       try { line = std::stoull(value); } catch (...) { std::cerr << "Invalid line number\n"; return 2; }
     } else if (argument == "--dproj") dproj = value;
@@ -221,12 +239,46 @@ int runQuery(std::string_view command, int argc, char** argv) {
     else { std::cerr << "Unknown " << command << " option: " << argument << '\n'; return 2; }
   }
   try {
+    if (command == "compiler-log") {
+      if (input.empty()) { std::cerr << "compiler-log requires --input\n"; return 2; }
+      std::cout << jdelphiast::compilerLogJson(input) << '\n';
+      return 0;
+    }
     if (command == "compare-symbol") {
       if (name.empty() || leftIndexes.empty() || rightIndexes.empty()) { std::cerr << "compare-symbol requires --symbol, --left-index and --right-index\n"; return 2; }
       std::vector<jdelphiast::IndexedUnit> left, right;
       for (const auto& path : leftIndexes) { auto loaded = jdelphiast::loadSymbolIndex(path); left.insert(left.end(), loaded.begin(), loaded.end()); }
       for (const auto& path : rightIndexes) { auto loaded = jdelphiast::loadSymbolIndex(path); right.insert(right.end(), loaded.begin(), loaded.end()); }
       std::cout << jdelphiast::compareSymbolJson(name, left, right) << '\n';
+      return 0;
+    }
+    if (command == "legacy-refs" || command == "model-migration") {
+      if (file.empty() || leftIndexes.empty() || rightIndexes.empty() ||
+          (command == "legacy-refs" ? legacyUnit.empty() : name.empty())) {
+        std::cerr << command << " requires --file, --left-index, --right-index and "
+                  << (command == "legacy-refs" ? "--legacy-unit\n" : "--symbol\n");
+        return 2;
+      }
+      std::vector<jdelphiast::IndexedUnit> left, right;
+      for (const auto& path : leftIndexes) { auto loaded = jdelphiast::loadSymbolIndex(path); left.insert(left.end(), loaded.begin(), loaded.end()); }
+      for (const auto& path : rightIndexes) { auto loaded = jdelphiast::loadSymbolIndex(path); right.insert(right.end(), loaded.begin(), loaded.end()); }
+      if (command == "legacy-refs")
+        std::cout << jdelphiast::legacyReferencesJson(file, legacyUnit, left, right, unitMap) << '\n';
+      else std::cout << jdelphiast::modelMigrationJson(file, name, left, right, unitMap) << '\n';
+      return 0;
+    }
+    if (command == "diagnose") {
+      if (file.empty() || line == 0 || errorCode.empty() || indexes.empty()) {
+        std::cerr << "diagnose requires --file, --line, --error-code and --index\n";
+        return 2;
+      }
+      std::vector<jdelphiast::IndexedUnit> left;
+      for (const auto& path : leftIndexes) { auto loaded = jdelphiast::loadSymbolIndex(path); left.insert(left.end(), loaded.begin(), loaded.end()); }
+      jdelphiast::DiagnoseOptions options;
+      options.file = file; options.dproj = dproj; options.unitMap = unitMap;
+      options.configuration = configuration; options.platform = platform;
+      options.errorCode = errorCode; options.symbol = name; options.line = line;
+      std::cout << jdelphiast::diagnoseJson(options, loadIndexes(indexes), left) << '\n';
       return 0;
     }
     auto loaded = loadIndexes(indexes);

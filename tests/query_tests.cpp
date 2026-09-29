@@ -42,6 +42,104 @@ int main() {
           "UMarketing source path is returned");
   require(info.find("package_metadata_not_available") != std::string::npos,
           "missing package metadata is explicit");
+  require(info.find("\"build_classification\":\"build_path_required\"") != std::string::npos,
+          "indexed unit without package metadata still requires build path resolution");
+
+  const auto diagnosticLeft = jdelphiast::loadSymbolIndex(fixtures / "diagnose-v500.jdi");
+  const auto diagnosticRight = jdelphiast::loadSymbolIndex(fixtures / "diagnose-v600.jdi");
+  jdelphiast::DiagnoseOptions diagnoseOptions;
+  diagnoseOptions.file = fixtures / "DiagnosticCalls.pas";
+  diagnoseOptions.line = 16;
+  diagnoseOptions.errorCode = "E2010";
+  const auto diagnosis = jdelphiast::diagnoseJson(diagnoseOptions, diagnosticRight, diagnosticLeft);
+  require(diagnosis.find("PrdRT.Utils.GetColumnMaxLength") != std::string::npos &&
+              diagnosis.find("\"member\":\"GetColumnMaxLength\"") != std::string::npos &&
+              diagnosis.find("\"argument_count\":3") != std::string::npos &&
+              diagnosis.find("\"match_score\":100") != std::string::npos &&
+              diagnosis.find(".Add\"") == std::string::npos &&
+              diagnosis.find("\"inferred_type\":\"TAziendaStd\"") != std::string::npos &&
+              diagnosis.find("\"name\":\"M_PrdRT\"") != std::string::npos,
+          "diagnose returns call signature, argument type, and package metadata");
+  jdelphiast::DiagnoseOptions buildOptions;
+  buildOptions.file = fixtures / "DiagnosticCalls.pas";
+  buildOptions.line = 1;
+  buildOptions.errorCode = "F2613";
+  buildOptions.symbol = "Mask";
+  buildOptions.unitMap = fixtures / "diagnostic-unit-map.json";
+  const auto buildDiagnosis = jdelphiast::diagnoseJson(buildOptions, diagnosticRight, diagnosticLeft);
+  require(buildDiagnosis.find("\"classification\":\"namespace_mapping\"") != std::string::npos &&
+              buildDiagnosis.find("\"recommended_action\":\"replace_in_uses\"") != std::string::npos,
+          "F2613 uses only a verified namespace mapping");
+  buildOptions.errorCode = "E2003";
+  buildOptions.symbol = "CercaPrezzoStd";
+  const auto business = jdelphiast::diagnoseJson(buildOptions, diagnosticRight, diagnosticLeft);
+  require(business.find("business_api_manual_required") != std::string::npos &&
+              business.find("\"automatic_action\":\"manual_required\"") != std::string::npos &&
+              business.find("Price-list business semantics require verified replacement") != std::string::npos,
+          "business APIs are classified for manual migration without invented mappings");
+  buildOptions.symbol = "TCSEOLEDBRowset";
+  auto oleRight = diagnosticRight;
+  jdelphiast::IndexedUnit oleEvidence;
+  oleEvidence.name = "Legacy.Provider.Unknown";
+  oleEvidence.sourceFile = fixtures / "OleConsumer.pas";
+  oleRight.push_back(std::move(oleEvidence));
+  const auto oleDiagnosis = jdelphiast::diagnoseJson(buildOptions, oleRight, diagnosticLeft);
+  require(oleDiagnosis.find("\"classification\":\"ambiguous\"") != std::string::npos &&
+              oleDiagnosis.find("symbol_exists_in_v600_but_owner_unit_is_ambiguous") != std::string::npos,
+          "TCSEOLEDBRowset evidence in V600 is not classified as removed");
+  const auto oleSymbol = jdelphiast::symbolJson({"TCSEOLEDBRowset", {}, {}, {}}, oleRight);
+  require(oleSymbol.find("\"classification\":\"ambiguous\"") != std::string::npos &&
+              oleSymbol.find("symbol_exists_in_v600_but_owner_unit_is_ambiguous") != std::string::npos,
+          "symbol query reports ambiguous V600 source evidence without inventing a provider unit");
+
+  jdelphiast::DiagnoseOptions execOptions;
+  execOptions.file = fixtures / "ApiCalls.pas";
+  execOptions.line = 19;
+  execOptions.errorCode = "E2010";
+  const auto execSql = jdelphiast::diagnoseJson(execOptions, diagnosticRight, diagnosticLeft);
+  require(execSql.find("\"classification\":\"return_type_mismatch\"") != std::string::npos &&
+              execSql.find("\"automatic_migration_safe\":false") != std::string::npos &&
+              execSql.find("Return type changes error-handling semantics") != std::string::npos,
+          "ExecSql return changes remain review-required");
+  execOptions.line = 20;
+  const auto bareExecSql = jdelphiast::diagnoseJson(execOptions, diagnosticRight, diagnosticLeft);
+  require(bareExecSql.find("\"api_name\":\"ExecSQL\"") != std::string::npos &&
+              bareExecSql.find("\"classification\":\"return_type_mismatch\"") != std::string::npos,
+          "parameterless ExecSQL calls are diagnosed from assignment context");
+  diagnoseOptions.line = 17;
+  diagnoseOptions.errorCode = "E2250";
+  const auto overload = jdelphiast::diagnoseJson(diagnoseOptions, diagnosticRight, diagnosticLeft);
+  require(overload.find("\"classification\":\"ambiguous\"") != std::string::npos &&
+              overload.find("ResolveThing(Value: Integer)") != std::string::npos &&
+              overload.find("ResolveThing(Value: string)") != std::string::npos &&
+              overload.find("\"actual_type\":{\"type\":null}") != std::string::npos,
+          "diagnose retains ambiguous overloads without arbitrary selection");
+
+  const auto legacyRefs = jdelphiast::legacyReferencesJson(
+      fixtures / "LegacyRefs.pas", "UVariStd", diagnosticLeft, diagnosticRight,
+      fixtures / "diagnostic-unit-map.json");
+  require(legacyRefs.find("\"symbol\":\"ArrayCopia\"") != std::string::npos &&
+              legacyRefs.find("\"references\":[],\"unresolved_active_references\":[{") != std::string::npos &&
+              legacyRefs.find("\"mapping_status\":\"ambiguous\"") != std::string::npos &&
+              legacyRefs.find("\"allowed\":false") != std::string::npos,
+          "active references from a partial legacy index remain visible and block removal");
+
+  const auto model = jdelphiast::modelMigrationJson(
+      fixtures / "ModelMigration.pas", "TCSFields", diagnosticLeft, diagnosticRight,
+      fixtures / "diagnostic-unit-map.json");
+  require(model.find("EnableOnChange") != std::string::npos && model.find("FieldValues") != std::string::npos &&
+              model.find("\"type_exists\":true") != std::string::npos &&
+              model.find("K:/V0600/Core/CSCore/Source/CSFields.pas") != std::string::npos &&
+              model.find("GetCsField") != std::string::npos && model.find("CSSeek") != std::string::npos &&
+              model.find("\"classification\":\"legacy_model_migration_required\"") != std::string::npos,
+          "TCSFields model migration separates compatible and unresolved members");
+
+  const auto compilerLog = jdelphiast::compilerLogJson(fixtures / "dcc32-errors.log");
+  require(compilerLog.find("\"ordinal\":1,\"file\":\"PI_PulsarEngineering_GenPIeLV_Models.pas\",\"line\":391") != std::string::npos &&
+              compilerLog.find("\"code\":\"E2010\"") < compilerLog.find("\"code\":\"E2003\"") &&
+              compilerLog.find("\"first_actionable_error\":{\"ordinal\":1") != std::string::npos &&
+              compilerLog.find("\"error_groups\":[{\"file\":\"PI_PulsarEngineering_GenPIeLV_Models.pas\",\"code\":\"E2010\",\"count\":2,\"lines\":[391,429]") != std::string::npos,
+          "compiler log preserves output order and selects the first E2010 error");
 
   const auto exports = jdelphiast::exportsJson("CSControls.Theme", right);
   require(exports.find("CSGlobalTheme") != std::string::npos && exports.find("TCSTheme") != std::string::npos,

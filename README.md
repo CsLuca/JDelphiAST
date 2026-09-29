@@ -478,6 +478,30 @@ The authoritative catalog JSON contains deterministic, case-insensitively ordere
 
 `compare-units` works only from persistent indexes and never rescans the V500/V600 source trees. Approved seed mappings have priority but are validated against the right index; a missing seed target is downgraded and diagnosed. JSON is authoritative, while CSV and searchable HTML are optional views generated from the same deterministic mapping model.
 
+### Compiler diagnostics
+
+The read-only schema `2.2` diagnostic commands are designed for deterministic orchestration after a Delphi build failure:
+
+```powershell
+DelphiAstTool.exe compiler-log --input dcc32-build.log --format json
+DelphiAstTool.exe diagnose --dproj Plugin.dproj --config Release --platform Win32 `
+  --file UPIUtils.pas --line 529 --error-code E2010 `
+  --index delphi-v600-full.jdi --left-index delphi-v500-full.jdi `
+  --unit-map uses_v500_to_v600.json --format json
+DelphiAstTool.exe legacy-refs --file OExtLavGruppi.pas --legacy-unit UVariStd `
+  --left-index delphi-v500-full.jdi --right-index delphi-v600-full.jdi `
+  --unit-map uses_v500_to_v600.json --format json
+DelphiAstTool.exe model-migration --file OExtLavGruppi.pas --symbol TCSFields `
+  --left-index delphi-v500-full.jdi --right-index delphi-v600-full.jdi `
+  --unit-map uses_v500_to_v600.json --format json
+```
+
+`compiler-log` preserves compiler output order, identifies the first actionable error, and groups repeated file/code failures without changing their order. `diagnose` extracts the qualified callee, filters candidates by the exact source member, and reports only the highest-evidence callable set with receiver and argument types, package evidence, return-type conflicts, and approved unit mappings. Equal-scored overloads remain `ambiguous`; no owner is selected arbitrarily. `ExecSql`, `ExecSQL`, and `ExecuteScalar` return-type changes are always `review_required` unless an explicit future catalog records their semantics. No source patch is generated.
+
+`legacy-refs` blocks removal when an indexed legacy export is referenced or when partial index evidence leaves active calls in `unresolved_active_references`. `model-migration` searches the complete V600 index and its recorded source files, separates compatible `TCSFields` members from unresolved model APIs, and always classifies mixed legacy flows as `legacy_model_migration_required` with `manual_required`. If `symbol` finds active V600 source evidence but cannot prove the provider unit, it reports `ambiguous` rather than inventing a replacement.
+
+Allowed diagnosis classifications are `namespace_mapping`, `unit_mapping`, `signature_mismatch`, `return_type_mismatch`, `legacy_symbol_unmapped`, `legacy_model_migration_required`, `business_api_manual_required`, `build_path_required`, `package_dependency_required`, `ambiguous`, and `unresolved`. Recommended actions are limited to `add_uses`, `replace_in_uses`, `conditional_replace`, `replace_argument`, `replace_signature`, `remove_legacy_gate`, `manual_required`, `review_required`, and `none`.
+
 Validation defaults preserve usable legacy evidence: `no_unit_declaration`, recoverable `incomplete_unit`, and duplicate unit candidates are warnings. Unrecoverable parse failures, invalid seed data, missing seed targets, and incompatible approved signatures remain blocking errors. Use `--validation-policy <file>` to override individual codes with `code=info`, `code=warning`, or `code=error` lines. Blocking validation errors return a non-zero exit code and prevent publishing the requested index or mapping catalog.
 
 Default severity table:

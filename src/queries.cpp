@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iterator>
 #include <optional>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <unordered_set>
@@ -393,8 +394,28 @@ std::string symbolJson(const SymbolQuery& query, const std::vector<IndexedUnit>&
       writeDeclaration(output, unit, declaration);
     }
   }
-  output << "],\"diagnostics\":[";
-  if (first) writeDiagnostic(output, "unresolved_symbol", "Symbol not found in the persistent index.");
+  std::vector<std::string> sourceEvidence;
+  if (first && !query.name.empty()) {
+    const std::regex token("\\b" + query.name + "\\b", std::regex::icase);
+    for (const auto& unit : index) {
+      if (unit.sourceFile.empty() || !std::filesystem::is_regular_file(unit.sourceFile)) continue;
+      const auto source = readFile(unit.sourceFile);
+      if (std::regex_search(source, token)) sourceEvidence.push_back(unit.sourceFile.generic_string());
+      if (sourceEvidence.size() >= 8) break;
+    }
+  }
+  output << "],\"source_evidence\":[";
+  for (std::size_t i = 0; i < sourceEvidence.size(); ++i) {
+    if (i) output << ',';
+    output << '"' << escape(sourceEvidence[i]) << '"';
+  }
+  output << "],\"classification\":";
+  if (!sourceEvidence.empty()) output << "\"ambiguous\",\"recommended_action\":\"review_required\",\"reason\":\"symbol_exists_in_v600_but_owner_unit_is_ambiguous\"";
+  else output << "null,\"recommended_action\":\"none\",\"reason\":null";
+  output << ",\"diagnostics\":[";
+  if (first) writeDiagnostic(output, sourceEvidence.empty() ? "unresolved_symbol" : "ambiguous_symbol_owner",
+                             sourceEvidence.empty() ? "Symbol not found in the persistent index."
+                                                    : "Symbol exists in indexed V600 sources but its owner unit is ambiguous.");
   output << "]}";
   return output.str();
 }
@@ -418,7 +439,9 @@ std::string unitInfoJson(std::string_view requested, const std::vector<IndexedUn
     if (i) output << ',';
     output << '"' << escape(unit->dependencies[i]) << '"';
   }
-  output << "],\"search_path_hints\":[";
+  output << "],\"build_classification\":";
+  if (unit) output << "\"build_path_required\""; else output << "null";
+  output << ",\"search_path_hints\":[";
   if (unit && !unit->sourceFile.empty()) output << '"' << escape(unit->sourceFile.parent_path().generic_string()) << '"';
   output << "],\"diagnostics\":[";
   if (!unit) writeDiagnostic(output, "source_unit_not_indexed", "Unit not found in the persistent index.");
