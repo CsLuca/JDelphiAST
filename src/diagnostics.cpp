@@ -171,6 +171,13 @@ std::string usageFor(const UnitAst& ast, const SymbolReference& reference) {
   return "type_reference";
 }
 
+bool genericLegacySymbol(std::string_view symbol) {
+  static const std::unordered_set<std::string> generic = {
+      "add", "create", "destroy", "format", "indexof", "fieldbyname", "open", "close",
+      "free", "freeandnil", "assigned", "inttostr", "vartostr"};
+  return generic.contains(lower(std::string(symbol)));
+}
+
 std::string businessClassification(std::string_view symbol) {
   const auto key = lower(std::string(symbol));
   static const std::unordered_set<std::string> business = {
@@ -261,6 +268,7 @@ std::string legacyReferencesJson(const std::filesystem::path& file, std::string_
   const auto source = readFile(file);
   const auto ast = parseUnit(file, source);
   const auto legacy = findUnit(left, legacyUnit);
+  const auto unitStatus = mappingStatus(unitMap, legacyUnit);
   const bool importsLegacy = std::any_of(ast.uses.begin(), ast.uses.end(), [&](const UsesItem& item) {
     return lower(item.name) == lower(std::string(legacyUnit));
   });
@@ -269,6 +277,7 @@ std::string legacyReferencesJson(const std::filesystem::path& file, std::string_
   struct Ref { std::string symbol, kind, usage, status; SourceRange range; std::vector<std::string> candidates; };
   std::vector<Ref> references;
   std::vector<Ref> unresolvedReferences;
+  std::size_t ignoredGenericReferences = 0;
   for (const auto& reference : ast.references) {
     const auto simple = simpleName(reference.name);
     const bool exactLegacyOwner = legacy && unitDeclaresSymbol(*legacy, simple);
@@ -279,6 +288,10 @@ std::string legacyReferencesJson(const std::filesystem::path& file, std::string_
     const bool qualifiedLegacy = reference.name.find('.') != std::string::npos &&
         lower(reference.name.substr(0, reference.name.find('.'))) == lower(std::string(legacyUnit));
     if (!exactLegacyOwner && !qualifiedLegacy && call == ast.calls.end()) continue;
+    if (!exactLegacyOwner && !qualifiedLegacy && genericLegacySymbol(simple)) {
+      ++ignoredGenericReferences;
+      continue;
+    }
     Ref item{simple, "unknown", usageFor(ast, reference), exactLegacyOwner ? "legacy_symbol_unmapped" : "ambiguous",
              reference.range, {}};
     if (legacy) for (const auto& declaration : legacy->declarations)
@@ -286,13 +299,17 @@ std::string legacyReferencesJson(const std::filesystem::path& file, std::string_
     if (exactLegacyOwner) for (const auto& unit : right)
       if (unitDeclaresSymbol(unit, simple)) item.candidates.push_back(unit.name);
     const auto sourceEvidence = item.candidates.empty() ? activeSourceEvidence(right, simple) : std::vector<std::string>{};
-    if (exactLegacyOwner && item.candidates.size() == 1) item.status = "relocated_symbols";
+    if (exactLegacyOwner && item.candidates.size() == 1 && unitStatus == "relocated_symbols")
+      item.status = "relocated_symbols";
     else if (!item.candidates.empty() || !sourceEvidence.empty()) item.status = "ambiguous";
-    unresolvedReferences.push_back(std::move(item));
+    if (exactLegacyOwner) references.push_back(std::move(item));
+    else unresolvedReferences.push_back(std::move(item));
   }
-  if (unresolvedReferences.empty() && importsLegacy && (!legacy || !legacy->complete)) {
+  if (unresolvedReferences.empty() && importsLegacy && (!legacy || !legacy->complete) &&
+      (unitStatus == "relocated_symbols" || unitStatus == "semantic_migration_required")) {
     for (const auto& call : ast.calls) {
       const auto member = simpleName(call.name);
+      if (genericLegacySymbol(member)) { ++ignoredGenericReferences; continue; }
       bool knownElsewhere = false;
       for (const auto& unit : left)
         if (lower(unit.name) != lower(std::string(legacyUnit)) && unitDeclaresSymbol(unit, member)) {
@@ -312,7 +329,7 @@ std::string legacyReferencesJson(const std::filesystem::path& file, std::string_
   std::ostringstream output;
   output << "{\"schema_version\":\"2.2\",\"file\":\"" << escape(file.filename().string())
          << "\",\"legacy_unit\":\"" << escape(legacyUnit) << "\",\"legacy_unit_status\":\""
-         << escape(mappingStatus(unitMap, legacyUnit)) << "\",\"references\":[";
+         << escape(unitStatus) << "\",\"references\":[";
   for (std::size_t i = 0; i < references.size(); ++i) {
     if (i) output << ',';
     const auto& reference = references[i];
@@ -342,10 +359,12 @@ std::string legacyReferencesJson(const std::filesystem::path& file, std::string_
     }
     output << "]}";
   }
-  const bool removalAllowed = references.empty() && unresolvedReferences.empty();
-  output << "],\"removal\":{\"allowed\":" << (removalAllowed ? "true" : "false") << ",\"reason\":";
+  const bool removalAllowed = references.empty() && unresolvedReferences.empty() && !importsLegacy;
+  output << "],\"ignored_generic_references_count\":" << ignoredGenericReferences
+         << ",\"removal\":{\"allowed\":" << (removalAllowed ? "true" : "false") << ",\"reason\":";
   const auto* blocker = !references.empty() ? &references.front() : !unresolvedReferences.empty() ? &unresolvedReferences.front() : nullptr;
-  if (!blocker) output << "null";
+  if (!blocker && importsLegacy) output << "\"legacy_unit_exports_incomplete\"";
+  else if (!blocker) output << "null";
   else output << '"' << escape(blocker->status + ":" + blocker->symbol) << '"';
   output << "}}";
   return output.str();
@@ -422,10 +441,41 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
   const auto source = readFile(options.file);
   const auto ast = parseUnit(options.file, source);
   const AstCall* selected = nullptr;
+  std::size_t selectedDepth = 0;
+  int selectedEvidence = -1;
+  bool callSelectionAmbiguous = false;
   for (const auto& call : ast.calls) {
     if (call.range.begin.line > options.line || call.range.end.line < options.line) continue;
     if (!options.symbol.empty() && lower(simpleName(call.name)) != lower(options.symbol)) continue;
-    if (!selected || call.range.begin.offset < selected->range.begin.offset) selected = &call;
+    std::size_t depth = 0;
+    for (const auto& parent : ast.calls)
+      if (&parent != &call && parent.range.begin.offset <= call.range.begin.offset &&
+          parent.range.end.offset >= call.range.end.offset) ++depth;
+    int evidence = static_cast<int>(depth) * 100;
+    bool hasArityMatch = false;
+    bool hasTypedMismatch = false;
+    for (const auto& unit : right) for (const auto& declaration : unit.declarations) {
+      if (lower(simpleName(declaration.name)) != lower(simpleName(call.name))) continue;
+      if (declaration.parameters.size() != call.arguments.size()) continue;
+      hasArityMatch = true;
+      for (std::size_t i = 0; i < call.arguments.size(); ++i) {
+        auto actual = call.arguments[i].resolvedType;
+        if (actual.empty()) actual = inferIdentifierType(ast, call.arguments[i].text);
+        if (!actual.empty() && !declaration.parameters[i].type.empty() &&
+            !typeCompatible(actual, declaration.parameters[i].type)) hasTypedMismatch = true;
+      }
+    }
+    if (hasArityMatch) evidence += 10;
+    if (options.errorCode == "E2010" && hasTypedMismatch) evidence += 20;
+    if (!selected || evidence > selectedEvidence) {
+      selected = &call;
+      selectedDepth = depth;
+      selectedEvidence = evidence;
+      callSelectionAmbiguous = false;
+    } else if (evidence == selectedEvidence && depth == selectedDepth &&
+               call.range.begin.offset != selected->range.begin.offset) {
+      callSelectionAmbiguous = true;
+    }
   }
   std::optional<AstCall> implicitCall;
   if (!selected) for (const auto& assignment : ast.assignments) {
@@ -446,6 +496,9 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
         assignment.left.find('.') == std::string::npos ? "identifier" : "property",
         assignment.left, assignment.targetType};
     selected = &*implicitCall;
+    selectedDepth = 0;
+    selectedEvidence = 0;
+    callSelectionAmbiguous = false;
     break;
   }
   const std::string requested = !options.symbol.empty() ? options.symbol : selected ? simpleName(selected->name) : std::string{};
@@ -596,6 +649,12 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
        !typeCompatible(selected->assignmentTarget.resolvedType, selectedCandidate->declaration->type))) {
     classification = "return_type_mismatch"; confidence = "high"; action = "review_required";
   }
+  if (callSelectionAmbiguous) {
+    classification = "ambiguous";
+    confidence = "low";
+    action = "review_required";
+    selectedCandidate = nullptr;
+  }
   bool safeConnectionReplacement = false;
   if (selectedCandidate && selected) {
     for (std::size_t i = 0; i < selected->arguments.size() && i < selectedCandidate->declaration->parameters.size(); ++i) {
@@ -646,7 +705,8 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
   output << ",\"callee\":{\"qualifier\":"; writeNullable(output, receiverExpression);
   output << ",\"member\":"; writeNullable(output, sourceMember);
   output << ",\"qualified_source_name\":"; writeNullable(output, selected ? selected->name : "");
-  output << ",\"argument_count\":" << (selected ? selected->arguments.size() : 0) << '}';
+  output << ",\"argument_count\":" << (selected ? selected->arguments.size() : 0)
+         << ",\"nesting_depth\":" << selectedDepth << '}';
   output << ",\"classification\":\"" << classification << "\",\"confidence\":\"" << confidence
          << "\",\"recommended_action\":\"" << action << "\",\"reason\":";
   writeNullable(output, diagnosisReason);

@@ -4,3 +4,4 @@ Overload.Api|ResolveThing||function,ResolveThing,Integer,function%20ResolveThing
 CSFields|TCSFields,EnableOnChange,FieldValues||class,TCSFields,,class%20TCSFields;property,TCSFields.EnableOnChange,Boolean,property%20EnableOnChange%3A%20Boolean;property,TCSFields.FieldValues,Variant,property%20FieldValues%3A%20Variant|source=K:/V0600/Core/CSCore/Source/CSFields.pas;version=v600
 CSData|ExecSql||function,TCSEDatabase.ExecSql,Integer,function%20ExecSql%28const%20SQL%3A%20string%29%3A%20Integer|source=K:/V0600/Core/CSData.pas;version=v600
 FireDAC.Comp.Client|ExecSQL||procedure,TFDQuery.ExecSQL,,procedure%20ExecSQL|source=K:/V0600/FireDAC/Comp/Client.pas;version=v600
+Data.DB|Add||procedure,TFieldDefs.Add,,procedure%20Add%28Name%3A%20string%3B%20DataType%3A%20TFieldType%3B%20Size%3A%20Integer%3B%20Required%3A%20Boolean%29|source=K:/V0600/Data/DB.pas;version=v600

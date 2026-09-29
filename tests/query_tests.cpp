@@ -60,6 +60,12 @@ int main() {
               diagnosis.find("\"inferred_type\":\"TAziendaStd\"") != std::string::npos &&
               diagnosis.find("\"name\":\"M_PrdRT\"") != std::string::npos,
           "diagnose returns call signature, argument type, and package metadata");
+  diagnoseOptions.line = 21;
+  const auto nestedDiagnosis = jdelphiast::diagnoseJson(diagnoseOptions, diagnosticRight, diagnosticLeft);
+  require(nestedDiagnosis.find("\"member\":\"GetColumnMaxLength\"") != std::string::npos &&
+              nestedDiagnosis.find("\"nesting_depth\":1") != std::string::npos &&
+              nestedDiagnosis.find("Data.DB.Add") == std::string::npos,
+          "diagnose selects the inner incompatible call and excludes outer Add candidates");
   jdelphiast::DiagnoseOptions buildOptions;
   buildOptions.file = fixtures / "DiagnosticCalls.pas";
   buildOptions.line = 1;
@@ -121,8 +127,27 @@ int main() {
   require(legacyRefs.find("\"symbol\":\"ArrayCopia\"") != std::string::npos &&
               legacyRefs.find("\"references\":[],\"unresolved_active_references\":[{") != std::string::npos &&
               legacyRefs.find("\"mapping_status\":\"ambiguous\"") != std::string::npos &&
+              legacyRefs.find("\"symbol\":\"Add\"") == std::string::npos &&
+              legacyRefs.find("ambiguous:Add") == std::string::npos &&
+              legacyRefs.find("\"ignored_generic_references_count\":") != std::string::npos &&
               legacyRefs.find("\"allowed\":false") != std::string::npos,
           "active references from a partial legacy index remain visible and block removal");
+  auto completeLegacy = diagnosticLeft;
+  for (auto& unit : completeLegacy) if (unit.name == "UVariStd") {
+    unit.complete = true;
+    unit.symbols.push_back("ArrayCopia");
+    jdelphiast::AstDeclaration declaration;
+    declaration.name = "ArrayCopia";
+    declaration.kind = "function";
+    unit.declarations.push_back(std::move(declaration));
+  }
+  const auto provenLegacyRefs = jdelphiast::legacyReferencesJson(
+      fixtures / "LegacyRefs.pas", "UVariStd", completeLegacy, diagnosticRight,
+      fixtures / "diagnostic-unit-map.json");
+  require(provenLegacyRefs.find("\"references\":[{\"symbol\":\"ArrayCopia\"") != std::string::npos &&
+              provenLegacyRefs.find("\"mapping_status\":\"legacy_symbol_unmapped\"") != std::string::npos &&
+              provenLegacyRefs.find("\"reason\":\"legacy_symbol_unmapped:ArrayCopia\"") != std::string::npos,
+          "a proven legacy export is reported without treating an unrelated V600 homonym as a relocation");
 
   const auto model = jdelphiast::modelMigrationJson(
       fixtures / "ModelMigration.pas", "TCSFields", diagnosticLeft, diagnosticRight,

@@ -15,6 +15,12 @@ var
 begin
   L := TUtils_Table.GetColumnMaxLength(Azienda, 'AnaLav', 'Codice');
   ResolveThing(UnknownValue);
+  Add(
+    'CodLav',
+    ftWideString,
+    TUtils_Table.GetColumnMaxLength(Azienda, 'AnaLav', 'Codice'),
+    False
+  );
 end;
 
 end.
