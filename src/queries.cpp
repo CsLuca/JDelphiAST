@@ -372,6 +372,7 @@ std::string exportsJson(const std::filesystem::path& requested, const std::vecto
 std::string symbolJson(const SymbolQuery& query, const std::vector<IndexedUnit>& index,
                        QueryPerformance performance) {
   const auto started = std::chrono::steady_clock::now();
+  const auto lookupStarted = std::chrono::steady_clock::now();
   std::ostringstream output;
   output << "{\"schema_version\":\"2.1\",\"query\":{\"name\":\"" << escape(query.name) << "\"},\"matches\":[";
   bool first = true;
@@ -400,6 +401,8 @@ std::string symbolJson(const SymbolQuery& query, const std::vector<IndexedUnit>&
       writeDeclaration(output, unit, declaration);
     }
   }
+  performance.symbolLookupMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - lookupStarted).count();
   std::vector<std::string> sourceEvidence;
   if (first && !query.name.empty()) {
     for (const auto& unit : index) {
@@ -428,11 +431,15 @@ std::string symbolJson(const SymbolQuery& query, const std::vector<IndexedUnit>&
   performance.totalMs += std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - started).count() + performance.indexLoadMs + performance.packageEnrichmentMs;
   output << "],\"query_performance\":{\"index_load_ms\":" << performance.indexLoadMs
+         << ",\"cache_status\":\"" << escape(performance.cacheStatus) << "\""
+         << ",\"startup_ms\":" << performance.startupMs << ",\"index_open_ms\":" << performance.indexOpenMs
+         << ",\"index_parse_ms\":" << performance.indexParseMs << ",\"cache_load_ms\":" << performance.cacheLoadMs
+         << ",\"cache_build_ms\":" << performance.cacheBuildMs << ",\"symbol_lookup_ms\":" << performance.symbolLookupMs
          << ",\"index_lookup_ms\":" << performance.indexLookupMs
          << ",\"source_parse_ms\":" << performance.sourceParseMs
          << ",\"source_scan_ms\":" << performance.sourceScanMs
          << ",\"package_enrichment_ms\":" << performance.packageEnrichmentMs
-         << ",\"total_ms\":" << performance.totalMs
+         << ",\"json_serialize_ms\":0,\"total_ms\":" << performance.totalMs
          << ",\"cache_hit\":" << (performance.cacheHit ? "true" : "false") << "}}";
   return output.str();
 }
@@ -440,7 +447,10 @@ std::string symbolJson(const SymbolQuery& query, const std::vector<IndexedUnit>&
 std::string unitInfoJson(std::string_view requested, const std::vector<IndexedUnit>& index,
                          QueryPerformance performance) {
   const auto started = std::chrono::steady_clock::now();
+  const auto lookupStarted = std::chrono::steady_clock::now();
   const auto* unit = findUnit(index, requested);
+  performance.indexLookupMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - lookupStarted).count();
   std::ostringstream output;
   output << "{\"schema_version\":\"2.1\",\"unit\":\"" << escape(requested)
          << "\",\"normalized_unit\":\"" << escape(lower(std::string(requested))) << "\",\"source_file\":";
@@ -468,11 +478,15 @@ std::string unitInfoJson(std::string_view requested, const std::vector<IndexedUn
   performance.totalMs += std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - started).count() + performance.indexLoadMs + performance.packageEnrichmentMs;
   output << "],\"query_performance\":{\"index_load_ms\":" << performance.indexLoadMs
+         << ",\"cache_status\":\"" << escape(performance.cacheStatus) << "\""
+         << ",\"startup_ms\":" << performance.startupMs << ",\"index_open_ms\":" << performance.indexOpenMs
+         << ",\"index_parse_ms\":" << performance.indexParseMs << ",\"cache_load_ms\":" << performance.cacheLoadMs
+         << ",\"cache_build_ms\":" << performance.cacheBuildMs << ",\"symbol_lookup_ms\":" << performance.symbolLookupMs
          << ",\"index_lookup_ms\":" << performance.indexLookupMs
          << ",\"source_parse_ms\":" << performance.sourceParseMs
          << ",\"source_scan_ms\":" << performance.sourceScanMs
          << ",\"package_enrichment_ms\":" << performance.packageEnrichmentMs
-         << ",\"total_ms\":" << performance.totalMs
+         << ",\"json_serialize_ms\":0,\"total_ms\":" << performance.totalMs
          << ",\"cache_hit\":" << (performance.cacheHit ? "true" : "false") << "}}";
   return output.str();
 }

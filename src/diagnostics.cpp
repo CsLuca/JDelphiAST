@@ -237,6 +237,13 @@ void writePerformance(std::ostringstream& output, QueryPerformance performance,
   performance.totalMs += std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - started).count() + performance.indexLoadMs + performance.packageEnrichmentMs;
   output << "\"query_performance\":{\"index_load_ms\":" << performance.indexLoadMs
+         << ",\"cache_status\":\"" << escape(performance.cacheStatus) << "\""
+         << ",\"startup_ms\":" << performance.startupMs
+         << ",\"index_open_ms\":" << performance.indexOpenMs
+         << ",\"index_parse_ms\":" << performance.indexParseMs
+         << ",\"cache_load_ms\":" << performance.cacheLoadMs
+         << ",\"cache_build_ms\":" << performance.cacheBuildMs
+         << ",\"symbol_lookup_ms\":" << performance.symbolLookupMs
          << ",\"index_lookup_ms\":" << performance.indexLookupMs
          << ",\"source_parse_ms\":" << performance.sourceParseMs
          << ",\"source_scan_ms\":" << performance.sourceScanMs
@@ -246,7 +253,7 @@ void writePerformance(std::ostringstream& output, QueryPerformance performance,
          << ",\"v500_type_lookup_ms\":" << performance.v500TypeLookupMs
          << ",\"v600_type_lookup_ms\":" << performance.v600TypeLookupMs
          << ",\"target_member_analysis_ms\":" << performance.targetMemberAnalysisMs
-         << ",\"total_ms\":" << performance.totalMs
+         << ",\"json_serialize_ms\":0,\"total_ms\":" << performance.totalMs
          << ",\"cache_hit\":" << (performance.cacheHit ? "true" : "false") << '}';
 }
 
@@ -1012,6 +1019,7 @@ std::string typeInfoJson(std::string_view requested, const std::vector<IndexedUn
                          bool includeInherited, bool includeOverloads, QueryPerformance performance) {
   const auto started = std::chrono::steady_clock::now();
   std::vector<const IndexedUnit*> owners;
+  std::vector<const IndexedUnit*> exactOwners;
   for (const auto& unit : index) {
     const bool declaredType = std::any_of(unit.declarations.begin(), unit.declarations.end(), [&](const AstDeclaration& declaration) {
       const auto kind = lower(declaration.kind);
@@ -1023,8 +1031,10 @@ std::string typeInfoJson(std::string_view requested, const std::vector<IndexedUn
     }) || std::any_of(unit.inheritance.begin(), unit.inheritance.end(), [&](const InheritanceRelation& relation) {
       return lower(relation.type) == lower(std::string(requested));
     });
+    if (declaredType) exactOwners.push_back(&unit);
     if (declaredType || indexedTypeCandidate) owners.push_back(&unit);
   }
+  if (!exactOwners.empty()) owners = std::move(exactOwners);
   const IndexedUnit* owner = owners.size() == 1 ? owners.front() : nullptr;
   std::vector<std::string> ancestors;
   if (owner) for (const auto& relation : owner->inheritance)
@@ -1105,17 +1115,24 @@ std::string typeInfoJson(std::string_view requested, const std::vector<IndexedUn
 std::string symbolOriginJson(std::string_view name, const std::vector<IndexedUnit>& index,
                              QueryPerformance performance) {
   const auto started = std::chrono::steady_clock::now();
+  const bool hasV600 = std::any_of(index.begin(), index.end(), [](const IndexedUnit& unit) {
+    return lower(unit.indexVersion) == "v600";
+  });
   std::vector<const IndexedUnit*> providers;
-  for (const auto& unit : index) if (unitDeclaresSymbol(unit, name) ||
+  for (const auto& unit : index) if ((!hasV600 || lower(unit.indexVersion) != "v500") &&
+      (unitDeclaresSymbol(unit, name) ||
       std::any_of(unit.inheritance.begin(), unit.inheritance.end(), [&](const auto& relation) {
         return lower(relation.type) == lower(std::string(name));
-      })) providers.push_back(&unit);
+      }))) providers.push_back(&unit);
   struct Evidence { std::string file, usage, unit; std::size_t line{}, column{}; };
   std::vector<Evidence> evidence;
-  for (const auto& unit : index) for (const auto& item : unit.sourceEvidence) {
+  for (const auto& unit : index) {
+    if (hasV600 && lower(unit.indexVersion) == "v500") continue;
+    for (const auto& item : unit.sourceEvidence) {
     if (lower(simpleName(item.symbol)) != lower(std::string(name))) continue;
     evidence.push_back({unit.sourceFile.generic_string(), item.usage, unit.name, item.line, item.column});
     if (evidence.size() >= 32) break;
+    }
   }
   const std::string classification = providers.size() == 1 ? "provider_resolved" :
                                      (!providers.empty() || !evidence.empty()) ? "ambiguous" : "unresolved";
@@ -1230,7 +1247,10 @@ std::string batchDiagnoseJson(const std::filesystem::path& input,
   output << "{\"schema_version\":\"2.3\",\"results\":[";
   for (std::size_t i = 0; i < results.size(); ++i) { if (i) output << ','; output << results[i]; }
   output << "],\"request_count\":" << results.size() << ",\"index_load_count\":" << (right.empty() ? 0 : 1)
-         << ',';
+         << ",\"v500_index_load_ms\":" << performance.v500IndexLoadMs
+         << ",\"v600_index_load_ms\":" << performance.v600IndexLoadMs
+         << ",\"unit_map_load_ms\":" << performance.unitMapLoadMs
+         << ",\"cache_hits\":" << performance.cacheHits << ',';
   writePerformance(output, performance, started);
   output << '}';
   return output.str();

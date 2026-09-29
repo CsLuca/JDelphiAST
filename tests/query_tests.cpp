@@ -243,6 +243,9 @@ int main() {
           "compiler log preserves output order and selects the first E2010 error");
   require(compilerLog.find("\"query_performance\":{") != std::string::npos,
           "diagnostic queries expose additive performance metrics");
+  require(diagnosis.find("\"suggested_fixes\":[]") != std::string::npos &&
+              diagnosis.find("\"query_performance\":{") != std::string::npos,
+          "ambiguous diagnostic decisions do not emit automatic edits and expose timings");
 
   const auto exports = jdelphiast::exportsJson("CSControls.Theme", right);
   require(exports.find("CSGlobalTheme") != std::string::npos && exports.find("TCSTheme") != std::string::npos,

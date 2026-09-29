@@ -3,7 +3,10 @@
 #include "jdelphiast/path.hpp"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cctype>
+#include <cstdint>
 #include <fstream>
 #include <iterator>
 #include <optional>
@@ -14,6 +17,7 @@
 #include <stdexcept>
 #include <unordered_set>
 #include <unordered_map>
+#include <thread>
 
 namespace jdelphiast {
 namespace {
@@ -36,6 +40,207 @@ std::string trim(std::string value) {
   if (first == std::string::npos) return {};
   const auto last = value.find_last_not_of(" \t\r\n");
   return value.substr(first, last - first + 1);
+}
+
+std::string jsonEscape(std::string_view value) {
+  std::string result;
+  for (const unsigned char c : value) {
+    if (c == '\\') result += "\\\\";
+    else if (c == '"') result += "\\\"";
+    else if (c == '\n') result += "\\n";
+    else if (c == '\r') result += "\\r";
+    else if (c == '\t') result += "\\t";
+    else result += static_cast<char>(c);
+  }
+  return result;
+}
+
+std::vector<std::string> split(std::string_view value, char delimiter);
+std::vector<std::string> splitPreservingEmpty(std::string_view value, char delimiter);
+std::string percentDecode(std::string value);
+
+constexpr std::array<char, 8> queryIndexMagic{'J', 'D', 'I', 'Q', 'I', 'D', 'X', '1'};
+constexpr std::uint32_t queryIndexVersion = 1;
+
+struct QueryIndexRecord {
+  std::uint64_t hash{};
+  std::uint64_t offset{};
+  std::uint32_t length{};
+};
+
+std::uint64_t hashText(std::string_view value) {
+  std::uint64_t hash = 1469598103934665603ULL;
+  for (const unsigned char c : value) {
+    hash ^= static_cast<unsigned char>(std::tolower(c));
+    hash *= 1099511628211ULL;
+  }
+  return hash;
+}
+
+std::uint64_t quickFingerprint(const std::filesystem::path& path, std::uintmax_t size) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) throw std::runtime_error("Cannot read " + pathToUtf8(path));
+  constexpr std::size_t blockSize = 65536;
+  std::array<char, blockSize> buffer{};
+  std::uint64_t hash = 1469598103934665603ULL;
+  auto consume = [&](std::streamoff offset, std::size_t count) {
+    input.clear();
+    input.seekg(offset);
+    input.read(buffer.data(), static_cast<std::streamsize>(count));
+    for (std::streamsize i = 0; i < input.gcount(); ++i) {
+      hash ^= static_cast<unsigned char>(buffer[static_cast<std::size_t>(i)]);
+      hash *= 1099511628211ULL;
+    }
+  };
+  const auto firstCount = static_cast<std::size_t>(std::min<std::uintmax_t>(size, blockSize));
+  consume(0, firstCount);
+  if (size > blockSize * 2) consume(static_cast<std::streamoff>(size / 2 - blockSize / 2), blockSize);
+  if (size > blockSize) consume(static_cast<std::streamoff>(size - blockSize), blockSize);
+  hash ^= size;
+  return hash;
+}
+
+std::int64_t timestampValue(const std::filesystem::path& path) {
+  return std::filesystem::last_write_time(path).time_since_epoch().count();
+}
+
+std::filesystem::path queryIndexPath(const std::filesystem::path& indexFile) {
+  auto result = indexFile;
+  result += ".qidx";
+  return result;
+}
+
+void appendQueryKey(std::vector<QueryIndexRecord>& records, std::unordered_set<std::uint64_t>& lineKeys,
+                    std::string_view value, std::uint64_t offset, std::uint32_t length) {
+  if (value.empty()) return;
+  const auto hash = hashText(value);
+  if (lineKeys.insert(hash).second) records.push_back({hash, offset, length});
+}
+
+void indexJdiLine(std::string_view line, std::uint64_t offset, std::vector<QueryIndexRecord>& records) {
+  if (line.empty() || line.front() == '#') return;
+  std::vector<std::string> fields;
+  std::size_t start = 0;
+  while (start <= line.size()) {
+    const auto separator = line.find('|', start);
+    fields.emplace_back(line.substr(start, separator == std::string_view::npos ? std::string_view::npos : separator - start));
+    if (separator == std::string_view::npos) break;
+    start = separator + 1;
+  }
+  if (fields.empty()) return;
+  std::unordered_set<std::uint64_t> keys;
+  const auto length = static_cast<std::uint32_t>(line.size());
+  appendQueryKey(records, keys, fields[0], offset, length);
+  if (fields.size() > 1) for (const auto& symbol : split(fields[1], ',')) appendQueryKey(records, keys, symbol, offset, length);
+  if (fields.size() > 3) for (const auto& encoded : split(fields[3], ';')) {
+    const auto parts = splitPreservingEmpty(encoded, ',');
+    if (parts.size() < 2) continue;
+    const auto name = percentDecode(parts[1]);
+    appendQueryKey(records, keys, name, offset, length);
+    appendQueryKey(records, keys, name.substr(name.find_last_of('.') == std::string::npos ? 0 : name.find_last_of('.') + 1), offset, length);
+  }
+  if (fields.size() > 5) for (const auto& encoded : split(fields[5], ';')) {
+    const auto parts = splitPreservingEmpty(encoded, ',');
+    if (!parts.empty()) appendQueryKey(records, keys, percentDecode(parts[0]), offset, length);
+    if (parts.size() > 2) appendQueryKey(records, keys, percentDecode(parts[2]), offset, length);
+  }
+  if (fields.size() > 7) for (const auto& encoded : split(fields[7], ';')) {
+    const auto parts = splitPreservingEmpty(encoded, ',');
+    if (!parts.empty()) {
+      const auto symbol = percentDecode(parts[0]);
+      appendQueryKey(records, keys, symbol, offset, length);
+      appendQueryKey(records, keys, symbol.substr(symbol.find_last_of('.') == std::string::npos ? 0 : symbol.find_last_of('.') + 1), offset, length);
+    }
+  }
+}
+
+template <typename T>
+void writeBinary(std::ostream& output, const T& value) {
+  output.write(reinterpret_cast<const char*>(&value), sizeof(value));
+}
+
+template <typename T>
+bool readBinary(std::istream& input, T& value) {
+  return static_cast<bool>(input.read(reinterpret_cast<char*>(&value), sizeof(value)));
+}
+
+bool readQueryIndex(const std::filesystem::path& indexFile, const std::filesystem::path& sidecar,
+                    std::uintmax_t size, std::int64_t timestamp, std::uint64_t fingerprint,
+                    std::vector<QueryIndexRecord>& records) {
+  std::ifstream input(sidecar, std::ios::binary);
+  std::array<char, 8> magic{};
+  std::uint32_t version{};
+  std::uint64_t pathHash{}, storedSize{}, storedFingerprint{}, count{};
+  std::int64_t storedTimestamp{};
+  if (!input.read(magic.data(), magic.size()) || !readBinary(input, version) || !readBinary(input, pathHash) ||
+      !readBinary(input, storedSize) || !readBinary(input, storedTimestamp) ||
+      !readBinary(input, storedFingerprint) || !readBinary(input, count)) return false;
+  std::error_code error;
+  const auto absolute = std::filesystem::weakly_canonical(indexFile, error);
+  const auto normalized = error ? std::filesystem::absolute(indexFile).lexically_normal() : absolute;
+  if (magic != queryIndexMagic || version != queryIndexVersion || pathHash != hashText(pathToUtf8(normalized)) ||
+      storedSize != size || storedTimestamp != timestamp || storedFingerprint != fingerprint || count > size) return false;
+  records.resize(static_cast<std::size_t>(count));
+  return count == 0 || static_cast<bool>(input.read(reinterpret_cast<char*>(records.data()),
+      static_cast<std::streamsize>(records.size() * sizeof(QueryIndexRecord))));
+}
+
+bool createQueryIndex(const std::filesystem::path& indexFile, const std::filesystem::path& sidecar,
+                      std::uintmax_t size, std::int64_t timestamp, std::uint64_t fingerprint,
+                      std::vector<QueryIndexRecord>& records, std::size_t timeoutMs = 0) {
+  const auto started = std::chrono::steady_clock::now();
+  std::ifstream input(indexFile, std::ios::binary);
+  if (!input) throw std::runtime_error("Cannot read " + pathToUtf8(indexFile));
+  std::string line;
+  while (true) {
+    if (timeoutMs && std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count() >= static_cast<long long>(timeoutMs)) return false;
+    const auto position = input.tellg();
+    if (!std::getline(input, line)) break;
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    indexJdiLine(line, static_cast<std::uint64_t>(position), records);
+  }
+  std::sort(records.begin(), records.end(), [](const auto& left, const auto& right) {
+    return left.hash == right.hash ? left.offset < right.offset : left.hash < right.hash;
+  });
+  records.erase(std::unique(records.begin(), records.end(), [](const auto& left, const auto& right) {
+    return left.hash == right.hash && left.offset == right.offset;
+  }), records.end());
+  const auto lock = std::filesystem::path(sidecar.string() + ".lock");
+  bool ownsLock = false;
+  for (int attempt = 0; attempt < 200 && !(ownsLock = std::filesystem::create_directory(lock)); ++attempt)
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  if (!ownsLock) throw std::runtime_error("Cannot acquire query index lock: " + pathToUtf8(lock));
+  const auto temporary = std::filesystem::path(sidecar.string() + ".tmp." +
+      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  try {
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    if (!output) throw std::runtime_error("Cannot write query index: " + pathToUtf8(temporary));
+    output.write(queryIndexMagic.data(), queryIndexMagic.size());
+    const auto pathHash = hashText(pathToUtf8(std::filesystem::absolute(indexFile).lexically_normal()));
+    const auto count = static_cast<std::uint64_t>(records.size());
+    writeBinary(output, queryIndexVersion);
+    writeBinary(output, pathHash);
+    writeBinary(output, static_cast<std::uint64_t>(size));
+    writeBinary(output, timestamp);
+    writeBinary(output, fingerprint);
+    writeBinary(output, count);
+    if (!records.empty()) output.write(reinterpret_cast<const char*>(records.data()),
+        static_cast<std::streamsize>(records.size() * sizeof(QueryIndexRecord)));
+    output.flush();
+    if (!output) throw std::runtime_error("Failed writing query index: " + pathToUtf8(temporary));
+    output.close();
+    std::error_code error;
+    std::filesystem::remove(sidecar, error);
+    std::filesystem::rename(temporary, sidecar);
+    std::filesystem::remove(lock, error);
+  } catch (...) {
+    std::error_code error;
+    std::filesystem::remove(temporary, error);
+    std::filesystem::remove(lock, error);
+    throw;
+  }
+  return true;
 }
 
 std::vector<std::string> split(std::string_view value, char delimiter) {
@@ -601,15 +806,33 @@ void enrichPackageMetadata(std::vector<IndexedUnit>& units,
                            const std::vector<std::filesystem::path>& packageRoots) {
   struct Metadata { std::string name, dcp, bpl; std::filesystem::path project; };
   std::unordered_map<std::string, Metadata> bySource;
-  for (const auto& root : packageRoots) {
-    if (!std::filesystem::is_directory(root)) continue;
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(
-             root, std::filesystem::directory_options::skip_permission_denied)) {
-      if (!entry.is_regular_file()) continue;
-      const auto extension = lower(pathToUtf8(entry.path().extension()));
-      if (extension != ".dpk" && extension != ".dproj") continue;
+  std::set<std::filesystem::path> projectFiles;
+  for (const auto& unit : units) {
+    if (unit.sourceFile.empty() || !unit.packageName.empty()) continue;
+    auto directory = std::filesystem::absolute(unit.sourceFile).parent_path();
+    while (!directory.empty()) {
+      bool insideRoot = false;
+      for (const auto& root : packageRoots) {
+        const auto rootText = lower(pathToUtf8(std::filesystem::absolute(root).lexically_normal()));
+        const auto directoryText = lower(pathToUtf8(directory.lexically_normal()));
+        if (directoryText.starts_with(rootText)) { insideRoot = true; break; }
+      }
+      if (!insideRoot) break;
+      std::error_code iteratorError;
+      for (const auto& entry : std::filesystem::directory_iterator(directory,
+               std::filesystem::directory_options::skip_permission_denied, iteratorError)) {
+        if (iteratorError || !entry.is_regular_file()) continue;
+        const auto extension = lower(pathToUtf8(entry.path().extension()));
+        if (extension == ".dpk" || extension == ".dproj") projectFiles.insert(entry.path());
+      }
+      const auto parent = directory.parent_path();
+      if (parent == directory) break;
+      directory = parent;
+    }
+  }
+  for (const auto& project : projectFiles) {
+      const auto extension = lower(pathToUtf8(project.extension()));
       try {
-        const auto project = entry.path();
         const auto packageName = pathToUtf8(project.stem());
         const auto sources = extension == ".dpk" ? packageSources(readFile(project)) : dprojSources(readFile(project));
         for (auto source : sources) {
@@ -624,7 +847,6 @@ void enrichPackageMetadata(std::vector<IndexedUnit>& units,
           else bySource.try_emplace(key, std::move(metadata));
         }
       } catch (...) {}
-    }
   }
   for (auto& unit : units) {
     if (unit.sourceFile.empty()) continue;
@@ -776,34 +998,111 @@ std::vector<IndexedUnit> loadSymbolIndex(const std::filesystem::path& indexFile)
 }
 
 std::vector<IndexedUnit> loadSymbolIndexFiltered(const std::filesystem::path& indexFile,
-                                                 const std::vector<std::string>& terms) {
+                                                 const std::vector<std::string>& terms,
+                                                 QueryPerformance* performance) {
+  const auto started = std::chrono::steady_clock::now();
   if (terms.empty()) return loadSymbolIndex(indexFile);
   std::vector<std::string> normalizedTerms;
   for (const auto& term : terms) if (!term.empty()) normalizedTerms.push_back(lower(term));
+  const auto size = std::filesystem::file_size(indexFile);
+  const auto timestamp = timestampValue(indexFile);
+  const auto fingerprint = quickFingerprint(indexFile, size);
+  const auto sidecar = queryIndexPath(indexFile);
+  std::vector<QueryIndexRecord> records;
+  const auto cacheStarted = std::chrono::steady_clock::now();
+  const bool hit = readQueryIndex(indexFile, sidecar, size, timestamp, fingerprint, records);
+  if (performance) performance->cacheLoadMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - cacheStarted).count();
+  if (!hit) {
+    const auto buildStarted = std::chrono::steady_clock::now();
+    if (!createQueryIndex(indexFile, sidecar, size, timestamp, fingerprint, records,
+                          performance ? performance->timeoutMs : 0)) {
+      if (performance) {
+        performance->cacheStatus = "miss";
+        performance->indexLoadMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+      }
+      return {};
+    }
+    if (performance) performance->cacheBuildMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - buildStarted).count();
+  }
+  if (performance) performance->cacheStatus = hit ? "hit" : "rebuilt";
+  std::vector<QueryIndexRecord> selectedRecords;
+  for (const auto& term : normalizedTerms) {
+    const auto hash = hashText(term);
+    const auto first = std::lower_bound(records.begin(), records.end(), hash,
+        [](const QueryIndexRecord& record, std::uint64_t value) { return record.hash < value; });
+    for (auto current = first; current != records.end() && current->hash == hash; ++current)
+      selectedRecords.push_back(*current);
+  }
+  std::sort(selectedRecords.begin(), selectedRecords.end(), [](const auto& left, const auto& right) {
+    return left.offset < right.offset;
+  });
+  selectedRecords.erase(std::unique(selectedRecords.begin(), selectedRecords.end(), [](const auto& left, const auto& right) {
+    return left.offset == right.offset;
+  }), selectedRecords.end());
+  const auto openStarted = std::chrono::steady_clock::now();
   std::ifstream input(indexFile, std::ios::binary);
   if (!input) throw std::runtime_error("Cannot read " + pathToUtf8(indexFile));
+  if (performance) performance->indexOpenMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - openStarted).count();
   std::stringstream selected;
-  std::string line;
-  while (std::getline(input, line)) {
-    if (line.empty() || line[0] == '#') continue;
-    bool matches = false;
-    for (const auto& term : normalizedTerms) {
-      auto at = line.begin();
-      while ((at = std::search(at, line.end(), term.begin(), term.end(),
-                  [](unsigned char left, unsigned char right) { return std::tolower(left) == std::tolower(right); })) != line.end()) {
-        const auto index = static_cast<std::size_t>(std::distance(line.begin(), at));
-        const auto identifier = [](unsigned char c) { return std::isalnum(c) || c == '_'; };
-        const bool leftBoundary = index == 0 || !identifier(static_cast<unsigned char>(line[index - 1]));
-        const auto after = index + term.size();
-        const bool rightBoundary = after >= line.size() || !identifier(static_cast<unsigned char>(line[after]));
-        if (leftBoundary && rightBoundary) { matches = true; break; }
-        ++at;
-      }
-      if (matches) break;
-    }
-    if (matches) selected << line << '\n';
+  for (const auto& record : selectedRecords) {
+    input.clear();
+    input.seekg(static_cast<std::streamoff>(record.offset));
+    std::string line(record.length, '\0');
+    input.read(line.data(), static_cast<std::streamsize>(record.length));
+    if (input.gcount() == static_cast<std::streamsize>(record.length)) selected << line << '\n';
   }
-  return parseSymbolIndex(selected);
+  const auto parseStarted = std::chrono::steady_clock::now();
+  auto result = parseSymbolIndex(selected);
+  if (performance) {
+    performance->indexParseMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - parseStarted).count();
+    performance->indexLoadMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    performance->cacheHit = hit;
+  }
+  return result;
+}
+
+std::string buildQueryIndex(const std::filesystem::path& indexFile, QueryPerformance* performance) {
+  const auto started = std::chrono::steady_clock::now();
+  const auto size = std::filesystem::file_size(indexFile);
+  const auto timestamp = timestampValue(indexFile);
+  const auto fingerprint = quickFingerprint(indexFile, size);
+  const auto sidecar = queryIndexPath(indexFile);
+  std::vector<QueryIndexRecord> records;
+  const auto cacheStarted = std::chrono::steady_clock::now();
+  const bool hit = readQueryIndex(indexFile, sidecar, size, timestamp, fingerprint, records);
+  const auto cacheLoadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - cacheStarted).count();
+  long long cacheBuildMs = 0;
+  if (!hit) {
+    const auto buildStarted = std::chrono::steady_clock::now();
+    (void)createQueryIndex(indexFile, sidecar, size, timestamp, fingerprint, records);
+    cacheBuildMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - buildStarted).count();
+  }
+  const auto total = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started).count();
+  if (performance) {
+    performance->cacheStatus = hit ? "hit" : "rebuilt";
+    performance->cacheHit = hit;
+    performance->cacheLoadMs = cacheLoadMs;
+    performance->cacheBuildMs = cacheBuildMs;
+    performance->totalMs = total;
+  }
+  std::ostringstream output;
+  output << "{\"schema_version\":\"2.3\",\"command\":\"build-query-index\",\"status\":\"ok\","
+         << "\"index\":\"" << jsonEscape(pathToUtf8(indexFile)) << "\",\"sidecar\":\"" << jsonEscape(pathToUtf8(sidecar))
+         << "\",\"index_size\":" << size << ",\"record_count\":" << records.size()
+         << ",\"query_performance\":{\"cache_status\":\"" << (hit ? "hit" : "rebuilt")
+         << "\",\"index_open_ms\":0,\"index_parse_ms\":0,\"cache_load_ms\":" << cacheLoadMs
+         << ",\"cache_build_ms\":" << cacheBuildMs << ",\"symbol_lookup_ms\":0,"
+            "\"source_scan_ms\":0,\"json_serialize_ms\":0,\"total_ms\":" << total << "}}";
+  return output.str();
 }
 
 std::vector<IndexedUnit> loadSymbolIndexCached(const std::filesystem::path& indexFile, bool* cacheHit) {

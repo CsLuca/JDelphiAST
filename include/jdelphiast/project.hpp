@@ -51,6 +51,13 @@ struct ValidationPolicy {
 };
 
 struct QueryPerformance {
+  std::string cacheStatus{"disabled"};
+  long long startupMs{};
+  long long indexOpenMs{};
+  long long indexParseMs{};
+  long long cacheLoadMs{};
+  long long cacheBuildMs{};
+  long long symbolLookupMs{};
   long long indexLoadMs{};
   long long indexLookupMs{};
   long long sourceParseMs{};
@@ -61,6 +68,10 @@ struct QueryPerformance {
   long long v500TypeLookupMs{};
   long long v600TypeLookupMs{};
   long long targetMemberAnalysisMs{};
+  long long v500IndexLoadMs{};
+  long long v600IndexLoadMs{};
+  long long unitMapLoadMs{};
+  std::size_t cacheHits{};
   long long totalMs{};
   std::size_t timeoutMs{10000};
   bool cacheHit{};
@@ -104,7 +115,10 @@ struct IndexLoadResult {
 [[nodiscard]] std::shared_ptr<const std::vector<IndexedUnit>> loadSymbolIndexShared(
     const std::filesystem::path& indexFile, bool* cacheHit = nullptr);
 [[nodiscard]] std::vector<IndexedUnit> loadSymbolIndexFiltered(
-    const std::filesystem::path& indexFile, const std::vector<std::string>& terms);
+    const std::filesystem::path& indexFile, const std::vector<std::string>& terms,
+    QueryPerformance* performance = nullptr);
+[[nodiscard]] std::string buildQueryIndex(const std::filesystem::path& indexFile,
+                                          QueryPerformance* performance = nullptr);
 [[nodiscard]] IndexLoadResult loadSymbolIndexValidated(const std::filesystem::path& indexFile);
 [[nodiscard]] ValidationPolicy loadValidationPolicy(const std::filesystem::path& policyFile);
 [[nodiscard]] std::string validationSeverity(std::string_view code, const ValidationPolicy& policy);

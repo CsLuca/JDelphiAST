@@ -201,6 +201,15 @@ end.)");
   (void)jdelphiast::loadSymbolIndexCached(cachedIndex, &invalidatedCacheHit);
   require(!firstCacheHit && secondCacheHit && !invalidatedCacheHit,
           "JDI cache uses path, size, and timestamp and invalidates changed files");
+  jdelphiast::QueryPerformance firstQueryIndex, secondQueryIndex;
+  (void)jdelphiast::buildQueryIndex(cachedIndex, &firstQueryIndex);
+  (void)jdelphiast::buildQueryIndex(cachedIndex, &secondQueryIndex);
+  require(firstQueryIndex.cacheStatus == "rebuilt" && secondQueryIndex.cacheStatus == "hit",
+          "persistent query sidecar is built once and reused while the JDI fingerprint is unchanged");
+  write(cachedIndex, "Cached.Unit|TOne,TTwo,TThree|||version=v600\n");
+  jdelphiast::QueryPerformance rebuiltQueryIndex;
+  (void)jdelphiast::buildQueryIndex(cachedIndex, &rebuiltQueryIndex);
+  require(rebuiltQueryIndex.cacheStatus == "rebuilt", "persistent query sidecar invalidates after a JDI change");
 
   const auto unicodeDir = root / jdelphiast::pathFromSourceBytes("sorgenti-citt\xC3\xA0");
   const auto unicodeFile = unicodeDir / jdelphiast::pathFromSourceBytes("UnitAccentuata-\xC3\xA8.pas");

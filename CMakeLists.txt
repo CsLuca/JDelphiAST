@@ -223,7 +223,7 @@ if(JDELPHIAST_BUILD_TESTS)
       --unit-map ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnostic-unit-map.json
       --output ${CMAKE_CURRENT_BINARY_DIR}/batch-diagnose-result.json --query-timeout-ms 10000 --format json)
   set_tests_properties(jdelphiast_cli_batch_diagnose PROPERTIES
-    PASS_REGULAR_EXPRESSION "request_count.*10.*index_load_count.*1")
+    PASS_REGULAR_EXPRESSION "request_count.*10.*index_load_count.*1.*v500_index_load_ms.*v600_index_load_ms.*unit_map_load_ms.*cache_hits")
   add_test(NAME jdelphiast_cli_batch_diagnose_error_isolation
     COMMAND ${CMAKE_COMMAND}
       -DTOOL=$<TARGET_FILE:DelphiAstTool> -DEXPECT_EXIT=0 -DEXPECT_TEXT=query_execution_failed
@@ -231,4 +231,16 @@ if(JDELPHIAST_BUILD_TESTS)
       -DEXPECT_FILE_TEXT=GetColumnMaxLength.*request_count.*10
       "-DARGS=batch-diagnose;--input;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/batch-diagnose.json;--index;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnose-v600.jdi;--left-index;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnose-v500.jdi;--unit-map;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnostic-unit-map.json;--output;${CMAKE_CURRENT_BINARY_DIR}/batch-diagnose-isolation.json;--format;json"
       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_command.cmake)
+  add_test(NAME jdelphiast_cli_build_query_index
+    COMMAND DelphiAstTool build-query-index --index ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnose-v600.jdi --format json)
+  set_tests_properties(jdelphiast_cli_build_query_index PROPERTIES PASS_REGULAR_EXPRESSION "build-query-index.*cache_status")
+  add_test(NAME jdelphiast_cli_query_sidecar_cache
+    COMMAND ${CMAKE_COMMAND} -DTOOL=$<TARGET_FILE:DelphiAstTool>
+      -DINDEX=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnose-v600.jdi
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_query_cache.cmake)
+  add_test(NAME jdelphiast_cli_query_performance
+    COMMAND ${CMAKE_COMMAND} -DTOOL=$<TARGET_FILE:DelphiAstTool>
+      -DFIXTURES=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures
+      -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/batch-performance.json
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_query_performance.cmake)
 endif()

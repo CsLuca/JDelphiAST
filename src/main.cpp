@@ -19,6 +19,8 @@
 
 namespace {
 
+const auto processStarted = std::chrono::steady_clock::now();
+
 std::string timestamp() {
   auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
   if (const auto* epoch = std::getenv("SOURCE_DATE_EPOCH")) {
@@ -102,8 +104,20 @@ std::vector<jdelphiast::IndexedUnit> loadFilteredIndexes(
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return value;
   };
+  bool allHits = !files.empty();
+  bool rebuilt = false;
   for (const auto& file : files) {
-    auto loaded = jdelphiast::loadSymbolIndexFiltered(file, terms);
+    jdelphiast::QueryPerformance item;
+    if (performance) item.timeoutMs = performance->timeoutMs;
+    auto loaded = jdelphiast::loadSymbolIndexFiltered(file, terms, &item);
+    allHits = allHits && item.cacheHit;
+    rebuilt = rebuilt || item.cacheStatus == "rebuilt";
+    if (performance) {
+      performance->indexOpenMs += item.indexOpenMs;
+      performance->indexParseMs += item.indexParseMs;
+      performance->cacheLoadMs += item.cacheLoadMs;
+      performance->cacheBuildMs += item.cacheBuildMs;
+    }
     result.insert(result.end(), loaded.begin(), loaded.end());
   }
   for (const auto& unit : jdelphiast::bundledSymbolIndex()) {
@@ -113,12 +127,15 @@ std::vector<jdelphiast::IndexedUnit> loadFilteredIndexes(
             return normalized(symbol) == normalized(term);
           });
     });
-    if (matches) result.push_back(unit);
+    if (matches && std::none_of(result.begin(), result.end(), [&](const auto& existing) {
+          return normalized(existing.name) == normalized(unit.name);
+        })) result.push_back(unit);
   }
   if (performance) {
     performance->indexLoadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started).count();
-    performance->cacheHit = false;
+    performance->cacheHit = allHits;
+    performance->cacheStatus = rebuilt ? "rebuilt" : allHits ? "hit" : "miss";
   }
   return result;
 }
@@ -205,17 +222,26 @@ std::vector<std::string> batchDiagnosticTerms(const std::filesystem::path& input
   return result;
 }
 
-std::string queryTimeoutJson(std::string_view schema, const jdelphiast::QueryPerformance& performance) {
+std::string queryTimeoutJson(std::string_view schema, std::string_view command,
+                             std::string_view query, const jdelphiast::QueryPerformance& performance) {
   return "{\"schema_version\":\"" + std::string(schema) +
-      "\",\"classification\":\"unresolved\",\"recommended_action\":\"review_required\","
+      "\",\"command\":\"" + std::string(command) + "\",\"status\":\"timeout\",\"query\":\"" +
+      std::string(query) + "\",\"query_timeout_ms\":" + std::to_string(performance.timeoutMs) +
+      ",\"timed_out\":true,\"result\":null,\"classification\":\"unresolved\",\"recommended_action\":\"review_required\","
       "\"diagnostics\":[{\"code\":\"query_timeout\",\"severity\":\"warning\","
       "\"message\":\"Semantic query exceeded its time budget.\"}],\"query_performance\":{"
-      "\"index_load_ms\":" + std::to_string(performance.indexLoadMs) +
+      "\"cache_status\":\"" + performance.cacheStatus + "\",\"startup_ms\":" + std::to_string(performance.startupMs) +
+      ",\"index_open_ms\":" + std::to_string(performance.indexOpenMs) +
+      ",\"index_parse_ms\":" + std::to_string(performance.indexParseMs) +
+      ",\"cache_load_ms\":" + std::to_string(performance.cacheLoadMs) +
+      ",\"cache_build_ms\":" + std::to_string(performance.cacheBuildMs) +
+      ",\"symbol_lookup_ms\":" + std::to_string(performance.symbolLookupMs) +
+      ",\"index_load_ms\":" + std::to_string(performance.indexLoadMs) +
       ",\"index_lookup_ms\":" + std::to_string(performance.indexLookupMs) +
       ",\"source_parse_ms\":" + std::to_string(performance.sourceParseMs) +
       ",\"source_scan_ms\":" + std::to_string(performance.sourceScanMs) +
       ",\"package_enrichment_ms\":" + std::to_string(performance.packageEnrichmentMs) +
-      ",\"total_ms\":" + std::to_string(performance.indexLoadMs + performance.packageEnrichmentMs) +
+      ",\"json_serialize_ms\":0,\"total_ms\":" + std::to_string(performance.indexLoadMs + performance.packageEnrichmentMs) +
       ",\"cache_hit\":" + (performance.cacheHit ? "true" : "false") + "}}";
 }
 
@@ -248,6 +274,7 @@ USAGE
   DelphiAstTool.exe type-info --type <name> --index <index.jdi> [--include-inherited] [--include-overloads] --format json
   DelphiAstTool.exe symbol-origin --name <symbol> --index <index.jdi> --format json
   DelphiAstTool.exe batch-diagnose --input <requests.json> --index <v600.jdi> [options] --output <results.json>
+  DelphiAstTool.exe build-query-index --index <file.jdi> [--index <file.jdi> ...] --format json
 
 PROJECT ANALYSIS OPTIONS
   --project <file.dpk>       Delphi package to analyze.
@@ -300,8 +327,12 @@ DIAGNOSTIC OPTIONS
   --include-overloads       Preserve every indexed overload.
   --package-root <dir>      Enrich query metadata from real DPK/DPROJ declarations.
   --query-timeout-ms <n>    Per-request semantic budget. Default: 10000.
+  --no-source-scan          Disable source fallback (default when JDI indexes are supplied).
+  --allow-source-scan       Allow an explicit source fallback when supported.
   diagnose, legacy-refs, model-migration, and compiler-log emit additive schema 2.2 JSON.
   type-info and symbol-origin emit additive schema 2.3 JSON.
+  Query commands build and reuse <index>.qidx sidecars using JDI path, size,
+  timestamp, and fingerprint validation.
   These commands are read-only and never modify Delphi sources.
 
 ANALYSIS OUTPUT
@@ -364,7 +395,7 @@ bool isQueryCommand(std::string_view command) {
          command == "hierarchy" || command == "unit-info" || command == "compare-symbol" ||
          command == "diagnose" || command == "legacy-refs" || command == "model-migration" ||
          command == "compiler-log" || command == "type-info" || command == "symbol-origin" ||
-         command == "batch-diagnose";
+         command == "batch-diagnose" || command == "build-query-index";
 }
 
 int runQuery(std::string_view command, int argc, char** argv) {
@@ -375,11 +406,18 @@ int runQuery(std::string_view command, int argc, char** argv) {
   std::string configuration{"Release"}, platform{"Win32"};
   std::size_t line{};
   std::size_t queryTimeoutMs{10000};
-  bool includeInherited = false, includeOverloads = false;
+  bool includeInherited = false, includeOverloads = false, allowSourceScan = false;
   for (int i = 2; i < argc; ++i) {
     const std::string argument = argv[i];
+    if (i == 2 && !argument.empty() && argument[0] != '-' &&
+        (command == "type-info" || command == "symbol-origin")) {
+      if (command == "type-info") typeName = argument; else name = argument;
+      continue;
+    }
     if (argument == "--include-inherited") { includeInherited = true; continue; }
     if (argument == "--include-overloads") { includeOverloads = true; continue; }
+    if (argument == "--allow-source-scan") { allowSourceScan = true; continue; }
+    if (argument == "--no-source-scan") { allowSourceScan = false; continue; }
     if (argument == "--format") {
       if (++i >= argc || std::string(argv[i]) != "json") { std::cerr << "Only --format json is supported\n"; return 2; }
       continue;
@@ -387,6 +425,8 @@ int runQuery(std::string_view command, int argc, char** argv) {
     if (i + 1 >= argc) { std::cerr << "Missing value for " << argument << '\n'; return 2; }
     const std::string value = argv[++i];
     if (argument == "--index") indexes.emplace_back(value);
+    else if (argument == "--v500-index") leftIndexes.emplace_back(value);
+    else if (argument == "--v600-index") indexes.emplace_back(value);
     else if (argument == "--package-root") packageRoots.emplace_back(value);
     else if (argument == "--left-index") leftIndexes.emplace_back(value);
     else if (argument == "--right-index") rightIndexes.emplace_back(value);
@@ -412,22 +452,49 @@ int runQuery(std::string_view command, int argc, char** argv) {
     else if (argument == "--platform") platform = value;
     else { std::cerr << "Unknown " << command << " option: " << argument << '\n'; return 2; }
   }
+  (void)allowSourceScan;
   try {
+    if (command == "build-query-index") {
+      indexes.insert(indexes.end(), leftIndexes.begin(), leftIndexes.end());
+      indexes.insert(indexes.end(), rightIndexes.begin(), rightIndexes.end());
+      if (indexes.empty()) { std::cerr << "build-query-index requires --index, --v500-index, or --v600-index\n"; return 2; }
+      std::cout << "{\"schema_version\":\"2.3\",\"indexes\":[";
+      for (std::size_t i = 0; i < indexes.size(); ++i) {
+        if (i) std::cout << ',';
+        std::cout << jdelphiast::buildQueryIndex(indexes[i]);
+      }
+      std::cout << "]}\n";
+      return 0;
+    }
     if (command == "batch-diagnose") {
       if (input.empty() || output.empty() || indexes.empty()) {
         std::cerr << "batch-diagnose requires --input, --index and --output\n";
         return 2;
       }
       jdelphiast::QueryPerformance performance;
+      performance.startupMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - processStarted).count();
       const auto loadStarted = std::chrono::steady_clock::now();
       const auto terms = batchDiagnosticTerms(input);
-      auto rightFuture = std::async(std::launch::async, [&] { return loadFilteredIndexes(indexes, terms); });
-      auto leftFuture = std::async(std::launch::async, [&] { return loadFilteredIndexes(leftIndexes, terms); });
+      jdelphiast::QueryPerformance rightPerformance, leftPerformance;
+      auto rightFuture = std::async(std::launch::async, [&] { return loadFilteredIndexes(indexes, terms, &rightPerformance); });
+      auto leftFuture = std::async(std::launch::async, [&] { return loadFilteredIndexes(leftIndexes, terms, &leftPerformance); });
+      const auto mapStarted = std::chrono::steady_clock::now();
+      if (!unitMap.empty()) (void)jdelphiast::loadUnitMappingCatalog(unitMap);
+      performance.unitMapLoadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - mapStarted).count();
       auto right = rightFuture.get();
       auto left = leftFuture.get();
       performance.indexLoadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - loadStarted).count();
       performance.cacheHit = false;
+      performance.v500IndexLoadMs = leftPerformance.indexLoadMs;
+      performance.v600IndexLoadMs = rightPerformance.indexLoadMs;
+      performance.cacheLoadMs = leftPerformance.cacheLoadMs + rightPerformance.cacheLoadMs;
+      performance.cacheBuildMs = leftPerformance.cacheBuildMs + rightPerformance.cacheBuildMs;
+      performance.cacheHits = (leftPerformance.cacheHit ? 1 : 0) + (rightPerformance.cacheHit ? 1 : 0);
+      performance.cacheStatus = performance.cacheHits == 2 ? "hit" :
+          (leftPerformance.cacheStatus == "rebuilt" || rightPerformance.cacheStatus == "rebuilt" ? "rebuilt" : "miss");
       const auto result = jdelphiast::batchDiagnoseJson(input, right, left, unitMap, queryTimeoutMs, performance);
       writeAtomic(output, result + "\n");
       std::cout << result << '\n';
@@ -436,24 +503,30 @@ int runQuery(std::string_view command, int argc, char** argv) {
     if (command == "compiler-log") {
       if (input.empty()) { std::cerr << "compiler-log requires --input\n"; return 2; }
       jdelphiast::QueryPerformance performance;
+      performance.startupMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - processStarted).count();
       performance.timeoutMs = queryTimeoutMs;
       std::cout << jdelphiast::compilerLogJson(input, performance) << '\n';
       return 0;
     }
     if (command == "type-info" || command == "symbol-origin") {
-      if ((command == "type-info" ? typeName.empty() : name.empty()) || indexes.empty()) {
-        std::cerr << command << " requires " << (command == "type-info" ? "--type" : "--name") << " and --index\n";
+      if ((command == "type-info" ? typeName.empty() : name.empty()) || (indexes.empty() && leftIndexes.empty())) {
+        std::cerr << command << " requires " << (command == "type-info" ? "--type" : "--name") << " and an index\n";
         return 2;
       }
       jdelphiast::QueryPerformance performance;
+      performance.startupMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - processStarted).count();
       performance.timeoutMs = queryTimeoutMs;
-      auto loaded = loadFilteredIndexes(indexes, {command == "type-info" ? typeName : name}, &performance);
+      auto queryIndexes = indexes;
+      if (command == "symbol-origin") queryIndexes.insert(queryIndexes.end(), leftIndexes.begin(), leftIndexes.end());
+      auto loaded = loadFilteredIndexes(queryIndexes, {command == "type-info" ? typeName : name}, &performance);
       const auto packageStarted = std::chrono::steady_clock::now();
       jdelphiast::enrichPackageMetadata(loaded, packageRoots);
       performance.packageEnrichmentMs = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - packageStarted).count();
       if (performance.indexLoadMs + performance.packageEnrichmentMs >= static_cast<long long>(queryTimeoutMs)) {
-        std::cout << queryTimeoutJson("2.3", performance) << '\n';
+        std::cout << queryTimeoutJson("2.3", command, command == "type-info" ? typeName : name, performance) << '\n';
         return 0;
       }
       if (command == "type-info")
@@ -477,6 +550,8 @@ int runQuery(std::string_view command, int argc, char** argv) {
         return 2;
       }
       jdelphiast::QueryPerformance performance;
+      performance.startupMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - processStarted).count();
       performance.timeoutMs = queryTimeoutMs;
       const auto loadStarted = std::chrono::steady_clock::now();
       auto terms = diagnosticTerms(file, command == "legacy-refs" ? legacyUnit : name);
@@ -484,14 +559,23 @@ int runQuery(std::string_view command, int argc, char** argv) {
         const std::vector<std::string> modelTerms = {"EnableOnChange", "FieldValues", "GetCsField", "CSSeek", "CSModify", "CSResetCampi"};
         terms.insert(terms.end(), modelTerms.begin(), modelTerms.end());
       }
-      auto leftFuture = std::async(std::launch::async, [&] { return loadFilteredIndexes(leftIndexes, terms); });
-      auto rightFuture = std::async(std::launch::async, [&] { return loadFilteredIndexes(rightIndexes, terms); });
+      jdelphiast::QueryPerformance leftPerformance, rightPerformance;
+      leftPerformance.timeoutMs = queryTimeoutMs;
+      rightPerformance.timeoutMs = queryTimeoutMs;
+      auto leftFuture = std::async(std::launch::async, [&] { return loadFilteredIndexes(leftIndexes, terms, &leftPerformance); });
+      auto rightFuture = std::async(std::launch::async, [&] { return loadFilteredIndexes(rightIndexes, terms, &rightPerformance); });
       auto left = leftFuture.get();
       auto right = rightFuture.get();
       performance.indexLoadMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - loadStarted).count();
-      performance.cacheHit = false;
+      performance.indexOpenMs = leftPerformance.indexOpenMs + rightPerformance.indexOpenMs;
+      performance.indexParseMs = leftPerformance.indexParseMs + rightPerformance.indexParseMs;
+      performance.cacheLoadMs = leftPerformance.cacheLoadMs + rightPerformance.cacheLoadMs;
+      performance.cacheBuildMs = leftPerformance.cacheBuildMs + rightPerformance.cacheBuildMs;
+      performance.cacheHit = leftPerformance.cacheHit && rightPerformance.cacheHit;
+      performance.cacheStatus = leftPerformance.cacheStatus == "rebuilt" || rightPerformance.cacheStatus == "rebuilt"
+          ? "rebuilt" : performance.cacheHit ? "hit" : "miss";
       if (performance.indexLoadMs >= static_cast<long long>(queryTimeoutMs)) {
-        std::cout << queryTimeoutJson("2.2", performance) << '\n';
+        std::cout << queryTimeoutJson("2.2", command, command == "legacy-refs" ? legacyUnit : name, performance) << '\n';
         return 0;
       }
       if (command == "legacy-refs")
@@ -508,18 +592,28 @@ int runQuery(std::string_view command, int argc, char** argv) {
       jdelphiast::QueryPerformance performance;
       performance.timeoutMs = queryTimeoutMs;
       const auto loadStarted = std::chrono::steady_clock::now();
-      auto leftFuture = std::async(std::launch::async, [&] { return loadFilteredIndexes(leftIndexes, terms); });
-      auto rightFuture = std::async(std::launch::async, [&] { return loadFilteredIndexes(indexes, terms); });
+      jdelphiast::QueryPerformance leftPerformance, rightPerformance;
+      leftPerformance.timeoutMs = queryTimeoutMs;
+      rightPerformance.timeoutMs = queryTimeoutMs;
+      auto leftFuture = std::async(std::launch::async, [&] { return loadFilteredIndexes(leftIndexes, terms, &leftPerformance); });
+      auto rightFuture = std::async(std::launch::async, [&] { return loadFilteredIndexes(indexes, terms, &rightPerformance); });
       auto left = leftFuture.get();
       auto right = rightFuture.get();
       performance.indexLoadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - loadStarted).count();
+      performance.indexOpenMs = leftPerformance.indexOpenMs + rightPerformance.indexOpenMs;
+      performance.indexParseMs = leftPerformance.indexParseMs + rightPerformance.indexParseMs;
+      performance.cacheLoadMs = leftPerformance.cacheLoadMs + rightPerformance.cacheLoadMs;
+      performance.cacheBuildMs = leftPerformance.cacheBuildMs + rightPerformance.cacheBuildMs;
+      performance.cacheHit = leftPerformance.cacheHit && rightPerformance.cacheHit;
+      performance.cacheStatus = leftPerformance.cacheStatus == "rebuilt" || rightPerformance.cacheStatus == "rebuilt"
+          ? "rebuilt" : performance.cacheHit ? "hit" : "miss";
       const auto packageStarted = std::chrono::steady_clock::now();
       jdelphiast::enrichPackageMetadata(right, packageRoots);
       performance.packageEnrichmentMs = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - packageStarted).count();
       if (performance.indexLoadMs + performance.packageEnrichmentMs >= static_cast<long long>(queryTimeoutMs)) {
-        std::cout << queryTimeoutJson("2.2", performance) << '\n';
+        std::cout << queryTimeoutJson("2.2", command, name, performance) << '\n';
         return 0;
       }
       if (!dproj.empty()) {
@@ -539,6 +633,8 @@ int runQuery(std::string_view command, int argc, char** argv) {
       return 0;
     }
     jdelphiast::QueryPerformance performance;
+    performance.startupMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - processStarted).count();
     performance.timeoutMs = queryTimeoutMs;
     auto loaded = (command == "unit-info" ? loadFilteredIndexes(indexes, {unit}, &performance) :
                    command == "symbol" ? loadFilteredIndexes(indexes, {name}, &performance) :
@@ -546,7 +642,7 @@ int runQuery(std::string_view command, int argc, char** argv) {
     jdelphiast::enrichPackageMetadata(loaded, packageRoots);
     if ((command == "unit-info" || command == "symbol") &&
         performance.indexLoadMs + performance.packageEnrichmentMs >= static_cast<long long>(queryTimeoutMs)) {
-      std::cout << queryTimeoutJson(command == "unit-info" ? "2.1" : "2.1", performance) << '\n';
+      std::cout << queryTimeoutJson("2.1", command, command == "unit-info" ? unit : name, performance) << '\n';
       return 0;
     }
     if (!dproj.empty() && (command == "expression" || command == "hierarchy")) {
