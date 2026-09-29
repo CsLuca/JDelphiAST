@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <fstream>
 #include <iterator>
 #include <optional>
@@ -86,40 +87,17 @@ bool unitDeclaresSymbol(const IndexedUnit& unit, std::string_view symbol) {
   });
 }
 
-bool sourceDeclaresType(const IndexedUnit& unit, std::string_view symbol) {
-  if (unit.sourceFile.empty() || !std::filesystem::is_regular_file(unit.sourceFile)) return false;
-  try {
-    const auto source = readFile(unit.sourceFile);
-    const auto ast = parseUnit(unit.sourceFile, source);
-    const bool parsed = std::any_of(ast.exports.begin(), ast.exports.end(), [&](const SymbolDeclaration& declaration) {
-      return lower(declaration.name) == lower(std::string(symbol)) && lower(declaration.kind) == "class";
-    }) || std::any_of(ast.declarations.begin(), ast.declarations.end(), [&](const AstDeclaration& declaration) {
-      return lower(simpleName(declaration.name)) == lower(std::string(symbol)) && lower(declaration.kind) == "class";
-    });
-    if (parsed) return true;
-    const std::regex declaration("\\b" + std::string(symbol) + "\\s*=\\s*class\\b", std::regex::icase);
-    return std::regex_search(source, declaration);
-  } catch (...) { return false; }
-}
-
 std::vector<std::string> activeSourceEvidence(const std::vector<IndexedUnit>& units,
                                               std::string_view symbol,
                                               std::size_t limit = 8) {
   std::vector<std::string> result;
   const auto key = lower(std::string(symbol));
   for (const auto& unit : units) {
-    if (unit.sourceFile.empty() || !std::filesystem::is_regular_file(unit.sourceFile)) continue;
-    try {
-      const auto source = readFile(unit.sourceFile);
-      if (lower(source).find(key) == std::string::npos) continue;
-      const auto ast = parseUnit(unit.sourceFile, source);
-      const bool found = unitDeclaresSymbol(unit, symbol) ||
-          std::any_of(ast.references.begin(), ast.references.end(), [&](const SymbolReference& reference) {
-            return lower(simpleName(reference.name)) == key;
-          });
-      if (found) result.push_back(unit.sourceFile.generic_string());
-      if (result.size() >= limit) break;
-    } catch (...) {}
+    const auto found = std::any_of(unit.sourceEvidence.begin(), unit.sourceEvidence.end(), [&](const auto& evidence) {
+      return lower(simpleName(evidence.symbol)) == key && evidence.usage != "inactive";
+    });
+    if (found && !unit.sourceFile.empty()) result.push_back(unit.sourceFile.generic_string());
+    if (result.size() >= limit) break;
   }
   return result;
 }
@@ -134,6 +112,82 @@ std::string inferIdentifierType(const UnitAst& ast, std::string expression) {
       if (lower(parameter.name) == key) return parameter.type;
   }
   return {};
+}
+
+struct InferredType {
+  std::string type;
+  std::string source;
+  std::string confidence{"low"};
+};
+
+InferredType inferType(const UnitAst& ast, std::string expression,
+                       const std::vector<IndexedUnit>& index, std::size_t sourceOffset = 0) {
+  std::vector<std::string> parts;
+  std::size_t start = 0;
+  while (start <= expression.size()) {
+    const auto dot = expression.find('.', start);
+    parts.push_back(expression.substr(start, dot == std::string::npos ? std::string::npos : dot - start));
+    if (dot == std::string::npos) break;
+    start = dot + 1;
+  }
+  if (parts.empty()) return {};
+  const auto key = lower(parts.front());
+  std::vector<InferredType> matches;
+  const AstDeclaration* enclosingRoutine = nullptr;
+  for (const auto& declaration : ast.declarations) {
+    const auto kind = lower(declaration.kind);
+    if (kind != "procedure" && kind != "function" && kind != "constructor" && kind != "destructor") continue;
+    if (declaration.range.begin.offset <= sourceOffset &&
+        (!enclosingRoutine || declaration.range.begin.offset >= enclosingRoutine->range.begin.offset))
+      enclosingRoutine = &declaration;
+  }
+  if (enclosingRoutine) for (const auto& parameter : enclosingRoutine->parameters)
+    if (lower(parameter.name) == key && !parameter.type.empty())
+      matches.push_back({parameter.type, "parameter", "high"});
+  for (const auto& declaration : ast.declarations) {
+    if (lower(simpleName(declaration.name)) == key && !declaration.type.empty() &&
+        (lower(declaration.kind) != "localvariable" ||
+         (enclosingRoutine && lower(declaration.scope) == lower(enclosingRoutine->name)))) {
+      const auto kind = lower(declaration.kind);
+      matches.push_back({declaration.type,
+          kind == "property" ? "property" : kind == "field" ? "field" :
+          declaration.visibility == "private" ? "local_variable" : "global", "high"});
+    }
+  }
+  if (matches.empty()) for (const auto& unit : index) for (const auto& declaration : unit.declarations) {
+    if (lower(simpleName(declaration.name)) != key || declaration.type.empty()) continue;
+    const auto kind = lower(declaration.kind);
+    if (kind == "variable" || kind == "field" || kind == "property")
+      matches.push_back({declaration.type, kind == "property" ? "property" : kind == "field" ? "field" : "global", "high"});
+  }
+  if (matches.empty()) return {};
+  const auto type = lower(matches.front().type);
+  if (std::any_of(matches.begin() + 1, matches.end(), [&](const InferredType& item) {
+        return lower(item.type) != type;
+      })) return {};
+  auto result = matches.front();
+  for (std::size_t part = 1; part < parts.size(); ++part) {
+    std::vector<std::string> memberTypes;
+    std::set<std::string> acceptedOwners{lower(result.type)};
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (const auto& unit : index) for (const auto& relation : unit.inheritance)
+        if (acceptedOwners.contains(lower(relation.type)) && !relation.baseType.empty() &&
+            acceptedOwners.insert(lower(relation.baseType)).second) changed = true;
+    }
+    for (const auto& unit : index) for (const auto& declaration : unit.declarations)
+      if (acceptedOwners.contains(lower(declaration.ownerType)) &&
+          lower(simpleName(declaration.name)) == lower(parts[part]) && !declaration.type.empty())
+        memberTypes.push_back(declaration.type);
+    if (memberTypes.empty()) return {};
+    const auto memberType = lower(memberTypes.front());
+    if (std::any_of(memberTypes.begin() + 1, memberTypes.end(), [&](const std::string& candidate) {
+          return lower(candidate) != memberType;
+        })) return {};
+    result = {memberTypes.front(), "property", "high"};
+  }
+  return result;
 }
 
 bool typeCompatible(std::string_view actual, std::string_view expected) {
@@ -190,9 +244,39 @@ void writeNullable(std::ostringstream& output, std::string_view value) {
   if (value.empty()) output << "null"; else output << '"' << escape(value) << '"';
 }
 
+void writePerformance(std::ostringstream& output, QueryPerformance performance,
+                      std::chrono::steady_clock::time_point started) {
+  performance.totalMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started).count() + performance.indexLoadMs + performance.packageEnrichmentMs;
+  output << "\"query_performance\":{\"index_load_ms\":" << performance.indexLoadMs
+         << ",\"index_lookup_ms\":" << performance.indexLookupMs
+         << ",\"source_parse_ms\":" << performance.sourceParseMs
+         << ",\"source_scan_ms\":" << performance.sourceScanMs
+         << ",\"package_enrichment_ms\":" << performance.packageEnrichmentMs
+         << ",\"legacy_export_lookup_ms\":" << performance.legacyExportLookupMs
+         << ",\"mapping_lookup_ms\":" << performance.mappingLookupMs
+         << ",\"v500_type_lookup_ms\":" << performance.v500TypeLookupMs
+         << ",\"v600_type_lookup_ms\":" << performance.v600TypeLookupMs
+         << ",\"target_member_analysis_ms\":" << performance.targetMemberAnalysisMs
+         << ",\"total_ms\":" << performance.totalMs
+         << ",\"cache_hit\":" << (performance.cacheHit ? "true" : "false") << '}';
+}
+
+std::string timeoutJson(QueryPerformance performance, std::chrono::steady_clock::time_point started) {
+  std::ostringstream output;
+  output << "{\"schema_version\":\"2.2\",\"diagnosis\":{\"classification\":\"unresolved\","
+            "\"confidence\":\"low\",\"recommended_action\":\"review_required\",\"diagnostics\":[{"
+            "\"code\":\"query_timeout\",\"severity\":\"warning\","
+            "\"message\":\"Semantic query exceeded its time budget.\"}]},";
+  writePerformance(output, performance, started);
+  output << '}';
+  return output.str();
+}
+
 }  // namespace
 
-std::string compilerLogJson(const std::filesystem::path& input) {
+std::string compilerLogJson(const std::filesystem::path& input, QueryPerformance performance) {
+  const auto started = std::chrono::steady_clock::now();
   const auto source = readFile(input);
   struct Error { std::string file, column, severity, code, message, symbol; std::size_t line{}; };
   std::vector<Error> errors;
@@ -258,23 +342,37 @@ std::string compilerLogJson(const std::filesystem::path& input) {
     }
     output << "]}";
   }
-  output << "]}";
+  output << "],"; writePerformance(output, performance, started); output << '}';
   return output.str();
 }
 
 std::string legacyReferencesJson(const std::filesystem::path& file, std::string_view legacyUnit,
                                  const std::vector<IndexedUnit>& left, const std::vector<IndexedUnit>& right,
-                                 const std::filesystem::path& unitMap) {
+                                 const std::filesystem::path& unitMap, QueryPerformance performance) {
+  const auto started = std::chrono::steady_clock::now();
+  const auto parseStarted = std::chrono::steady_clock::now();
   const auto source = readFile(file);
   const auto ast = parseUnit(file, source);
+  performance.sourceParseMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - parseStarted).count();
+  const auto lookupStarted = std::chrono::steady_clock::now();
   const auto legacy = findUnit(left, legacyUnit);
+  performance.legacyExportLookupMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - lookupStarted).count();
+  const auto mappingStarted = std::chrono::steady_clock::now();
   const auto unitStatus = mappingStatus(unitMap, legacyUnit);
+  performance.mappingLookupMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - mappingStarted).count();
   const bool importsLegacy = std::any_of(ast.uses.begin(), ast.uses.end(), [&](const UsesItem& item) {
     return lower(item.name) == lower(std::string(legacyUnit));
   });
   std::unordered_set<std::string> exports;
   if (legacy) for (const auto& symbol : legacy->symbols) exports.insert(lower(symbol));
-  struct Ref { std::string symbol, kind, usage, status; SourceRange range; std::vector<std::string> candidates; };
+  struct Ref {
+    std::string symbol, kind, usage, status, ownerUnit, ownerSource, targetUnit, action;
+    SourceRange range;
+    std::vector<std::string> candidates;
+  };
   std::vector<Ref> references;
   std::vector<Ref> unresolvedReferences;
   std::size_t ignoredGenericReferences = 0;
@@ -287,22 +385,31 @@ std::string legacyReferencesJson(const std::filesystem::path& file, std::string_
     });
     const bool qualifiedLegacy = reference.name.find('.') != std::string::npos &&
         lower(reference.name.substr(0, reference.name.find('.'))) == lower(std::string(legacyUnit));
-    if (!exactLegacyOwner && !qualifiedLegacy && call == ast.calls.end()) continue;
-    if (!exactLegacyOwner && !qualifiedLegacy && genericLegacySymbol(simple)) {
+    std::vector<const IndexedUnit*> v500Owners;
+    for (const auto& unit : left) if (unitDeclaresSymbol(unit, simple)) v500Owners.push_back(&unit);
+    const IndexedUnit* provenOwner = v500Owners.size() == 1 ? v500Owners.front() : nullptr;
+    if (!exactLegacyOwner && !qualifiedLegacy && !provenOwner && call == ast.calls.end()) continue;
+    if (genericLegacySymbol(simple) && (!exactLegacyOwner || v500Owners.size() != 1)) {
       ++ignoredGenericReferences;
       continue;
     }
-    Ref item{simple, "unknown", usageFor(ast, reference), exactLegacyOwner ? "legacy_symbol_unmapped" : "ambiguous",
+    Ref item{simple, "unknown", usageFor(ast, reference), provenOwner ? "legacy_symbol_unmapped" : "ambiguous",
+             provenOwner ? provenOwner->name : qualifiedLegacy ? std::string(legacyUnit) : std::string{},
+             provenOwner ? provenOwner->sourceFile.generic_string() : std::string{}, {}, "manual_required",
              reference.range, {}};
-    if (legacy) for (const auto& declaration : legacy->declarations)
+    const auto* declarationOwner = provenOwner ? provenOwner : legacy;
+    if (declarationOwner) for (const auto& declaration : declarationOwner->declarations)
       if (lower(simpleName(declaration.name)) == lower(simple)) { item.kind = declaration.kind; break; }
-    if (exactLegacyOwner) for (const auto& unit : right)
+    if (provenOwner) for (const auto& unit : right)
       if (unitDeclaresSymbol(unit, simple)) item.candidates.push_back(unit.name);
-    const auto sourceEvidence = item.candidates.empty() ? activeSourceEvidence(right, simple) : std::vector<std::string>{};
-    if (exactLegacyOwner && item.candidates.size() == 1 && unitStatus == "relocated_symbols")
-      item.status = "relocated_symbols";
+    const auto sourceEvidence = provenOwner && item.candidates.empty() ? activeSourceEvidence(right, simple) : std::vector<std::string>{};
+    if (provenOwner && item.candidates.size() == 1) {
+      item.status = "verified";
+      item.targetUnit = item.candidates.front();
+      item.action = "add_uses";
+    }
     else if (!item.candidates.empty() || !sourceEvidence.empty()) item.status = "ambiguous";
-    if (exactLegacyOwner) references.push_back(std::move(item));
+    if (provenOwner || qualifiedLegacy) references.push_back(std::move(item));
     else unresolvedReferences.push_back(std::move(item));
   }
   if (unresolvedReferences.empty() && importsLegacy && (!legacy || !legacy->complete) &&
@@ -317,7 +424,7 @@ std::string legacyReferencesJson(const std::filesystem::path& file, std::string_
           break;
         }
       if (knownElsewhere) continue;
-      Ref item{member, "unknown", "invocation", "ambiguous", call.range, {}};
+      Ref item{member, "unknown", "invocation", "ambiguous", {}, {}, {}, "manual_required", call.range, {}};
       for (const auto& unit : right) if (unitDeclaresSymbol(unit, member)) item.candidates.push_back(unit.name);
       if (item.candidates.size() == 1) item.status = "relocated_symbols";
       unresolvedReferences.push_back(std::move(item));
@@ -335,14 +442,19 @@ std::string legacyReferencesJson(const std::filesystem::path& file, std::string_
     const auto& reference = references[i];
     output << "{\"symbol\":\"" << escape(reference.symbol) << "\",\"kind\":\"" << escape(reference.kind)
            << "\",\"line\":" << reference.range.begin.line << ",\"column\":" << reference.range.begin.column
-           << ",\"usage\":\"" << reference.usage << "\",\"v500_owner\":\"" << escape(legacyUnit)
-           << "\",\"v600_candidates\":[";
+           << ",\"usage\":\"" << reference.usage << "\",\"v500_owner\":";
+    writeNullable(output, reference.ownerUnit);
+    output << ",\"v500_owner_unit\":"; writeNullable(output, reference.ownerUnit);
+    output << ",\"v500_owner_source\":"; writeNullable(output, reference.ownerSource);
+    output << ",\"v600_owner_unit\":"; writeNullable(output, reference.targetUnit);
+    output << ",\"v600_symbol\":"; writeNullable(output, reference.targetUnit.empty() ? "" : reference.symbol);
+    output << ",\"v600_candidates\":[";
     for (std::size_t c = 0; c < reference.candidates.size(); ++c) {
       if (c) output << ',';
       output << '"' << escape(reference.candidates[c]) << '"';
     }
     output << "],\"mapping_status\":\"" << reference.status
-            << "\",\"automatic_action\":\"manual_required\"}";
+           << "\",\"automatic_action\":\"" << reference.action << "\"}";
   }
   output << "],\"unresolved_active_references\":[";
   for (std::size_t i = 0; i < unresolvedReferences.size(); ++i) {
@@ -351,7 +463,7 @@ std::string legacyReferencesJson(const std::filesystem::path& file, std::string_
     output << "{\"symbol\":\"" << escape(reference.symbol) << "\",\"line\":" << reference.range.begin.line
            << ",\"column\":" << reference.range.begin.column << ",\"usage\":\"" << reference.usage
            << "\",\"possible_v500_owner\":";
-    if (reference.status == "ambiguous") output << "null"; else output << '"' << escape(legacyUnit) << '"';
+    writeNullable(output, reference.ownerUnit);
     output << ",\"mapping_status\":\"" << reference.status << "\",\"v600_candidates\":[";
     for (std::size_t c = 0; c < reference.candidates.size(); ++c) {
       if (c) output << ',';
@@ -362,37 +474,53 @@ std::string legacyReferencesJson(const std::filesystem::path& file, std::string_
   const bool removalAllowed = references.empty() && unresolvedReferences.empty() && !importsLegacy;
   output << "],\"ignored_generic_references_count\":" << ignoredGenericReferences
          << ",\"removal\":{\"allowed\":" << (removalAllowed ? "true" : "false") << ",\"reason\":";
-  const auto* blocker = !references.empty() ? &references.front() : !unresolvedReferences.empty() ? &unresolvedReferences.front() : nullptr;
+  const Ref* blocker = nullptr;
+  for (const auto& reference : references)
+    if (reference.status == "legacy_symbol_unmapped") { blocker = &reference; break; }
+  if (!blocker && !unresolvedReferences.empty()) blocker = &unresolvedReferences.front();
   if (!blocker && importsLegacy) output << "\"legacy_unit_exports_incomplete\"";
   else if (!blocker) output << "null";
   else output << '"' << escape(blocker->status + ":" + blocker->symbol) << '"';
-  output << "}}";
+  output << "},"; writePerformance(output, performance, started); output << '}';
   return output.str();
 }
 
 std::string modelMigrationJson(const std::filesystem::path& file, std::string_view symbol,
                                const std::vector<IndexedUnit>& left, const std::vector<IndexedUnit>& right,
-                               const std::filesystem::path&) {
+                               const std::filesystem::path&, QueryPerformance performance) {
+  const auto started = std::chrono::steady_clock::now();
+  const auto parseStarted = std::chrono::steady_clock::now();
   const auto source = readFile(file);
   const auto ast = parseUnit(file, source);
+  performance.sourceParseMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - parseStarted).count();
   const IndexedUnit* oldOwner = nullptr;
   const IndexedUnit* newOwner = nullptr;
+  const auto leftLookupStarted = std::chrono::steady_clock::now();
   for (const auto& used : ast.uses) {
     const auto* unit = findUnit(left, used.name);
-    if (unit && (unitDeclaresSymbol(*unit, symbol) || sourceDeclaresType(*unit, symbol))) {
+    if (unit && (unitDeclaresSymbol(*unit, symbol) || std::any_of(unit->inheritance.begin(), unit->inheritance.end(), [&](const auto& relation) {
+          return lower(relation.type) == lower(std::string(symbol));
+        }))) {
       oldOwner = unit;
       break;
     }
   }
   for (const auto& unit : left)
     if (!oldOwner && unitDeclaresSymbol(unit, symbol)) { oldOwner = &unit; break; }
+  performance.v500TypeLookupMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - leftLookupStarted).count();
+  const auto rightLookupStarted = std::chrono::steady_clock::now();
   for (const auto& unit : right)
     if (unitDeclaresSymbol(unit, symbol)) { newOwner = &unit; break; }
   const auto probableUnit = lower(std::string(symbol).starts_with("T") ? std::string(symbol).substr(1) : std::string(symbol));
   for (const auto& unit : left)
-    if (!oldOwner && lower(simpleName(unit.name)) == probableUnit && sourceDeclaresType(unit, symbol)) { oldOwner = &unit; break; }
+    if (!oldOwner && lower(simpleName(unit.name)) == probableUnit && unitDeclaresSymbol(unit, symbol)) { oldOwner = &unit; break; }
   for (const auto& unit : right)
-    if (!newOwner && lower(simpleName(unit.name)) == probableUnit && sourceDeclaresType(unit, symbol)) { newOwner = &unit; break; }
+    if (!newOwner && lower(simpleName(unit.name)) == probableUnit && unitDeclaresSymbol(unit, symbol)) { newOwner = &unit; break; }
+  performance.v600TypeLookupMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - rightLookupStarted).count();
+  const auto memberStarted = std::chrono::steady_clock::now();
   static const std::vector<std::string> modelMembers = {
       "EnableOnChange", "FieldValues", "GetCsField", "CSSeek", "CSModify", "CSResetCampi"};
   std::vector<std::string> used;
@@ -401,22 +529,19 @@ std::string modelMigrationJson(const std::filesystem::path& file, std::string_vi
     if (std::regex_search(source, token)) used.push_back(member);
   }
   std::vector<std::string> compatible, missing;
+  std::vector<std::string> exported;
+  if (oldOwner) for (const auto& member : modelMembers)
+    if (unitDeclaresSymbol(*oldOwner, member)) exported.push_back(member);
   for (const auto& member : used) {
     const bool exists = newOwner && (std::any_of(newOwner->symbols.begin(), newOwner->symbols.end(), [&](const std::string& name) {
       return lower(name) == lower(member);
     }) || std::any_of(newOwner->declarations.begin(), newOwner->declarations.end(), [&](const AstDeclaration& declaration) {
       return lower(simpleName(declaration.name)) == lower(member);
-    }) || (!newOwner->sourceFile.empty() && std::filesystem::is_regular_file(newOwner->sourceFile) && [&] {
-      try {
-        const auto targetAst = parseUnit(newOwner->sourceFile, readFile(newOwner->sourceFile));
-        return std::any_of(targetAst.declarations.begin(), targetAst.declarations.end(), [&](const AstDeclaration& declaration) {
-          return lower(simpleName(declaration.name)) == lower(member) &&
-                 (declaration.ownerType.empty() || lower(declaration.ownerType) == lower(std::string(symbol)));
-        });
-      } catch (...) { return false; }
-    }()));
+    }));
     (exists ? compatible : missing).push_back(member);
   }
+  performance.targetMemberAnalysisMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - memberStarted).count();
   const auto writeArray = [](std::ostringstream& out, const std::vector<std::string>& values) {
     for (std::size_t i = 0; i < values.size(); ++i) { if (i) out << ','; out << '"' << escape(values[i]) << '"'; }
   };
@@ -425,21 +550,30 @@ std::string modelMigrationJson(const std::filesystem::path& file, std::string_vi
   writeNullable(output, oldOwner ? oldOwner->name : "");
   output << ",\"source_file\":";
   writeNullable(output, oldOwner ? oldOwner->sourceFile.generic_string() : "");
-  output << ",\"members_used\":["; writeArray(output, used);
+  output << ",\"type_exists\":" << (oldOwner ? "true" : "false") << ",\"members_used\":["; writeArray(output, used);
+  output << "],\"exported_members\":["; writeArray(output, exported);
   output << "]},\"v600\":{\"type_exists\":" << (newOwner ? "true" : "false") << ",\"unit\":";
   writeNullable(output, newOwner ? newOwner->name : "");
   output << ",\"source_file\":";
   writeNullable(output, newOwner ? newOwner->sourceFile.generic_string() : "");
   output << ",\"compatible_members\":["; writeArray(output, compatible);
   output << "],\"missing_or_unresolved_members\":["; writeArray(output, missing);
-  output << "]},\"classification\":\"legacy_model_migration_required\",\"automatic_action\":\"manual_required\"}";
+  output << "]},\"classification\":\"legacy_model_migration_required\",\"automatic_action\":\"manual_required\",";
+  writePerformance(output, performance, started); output << '}';
   return output.str();
 }
 
 std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<IndexedUnit>& right,
                          const std::vector<IndexedUnit>& left) {
+  const auto started = std::chrono::steady_clock::now();
+  auto performance = options.performance;
+  const auto parseStarted = std::chrono::steady_clock::now();
   const auto source = readFile(options.file);
   const auto ast = parseUnit(options.file, source);
+  performance.sourceParseMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - parseStarted).count();
+  if (performance.indexLoadMs + performance.packageEnrichmentMs + performance.sourceParseMs >=
+      static_cast<long long>(options.timeoutMs)) return timeoutJson(performance, started);
   const AstCall* selected = nullptr;
   std::size_t selectedDepth = 0;
   int selectedEvidence = -1;
@@ -460,7 +594,7 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
       hasArityMatch = true;
       for (std::size_t i = 0; i < call.arguments.size(); ++i) {
         auto actual = call.arguments[i].resolvedType;
-        if (actual.empty()) actual = inferIdentifierType(ast, call.arguments[i].text);
+        if (actual.empty()) actual = inferType(ast, call.arguments[i].text, right, call.range.begin.offset).type;
         if (!actual.empty() && !declaration.parameters[i].type.empty() &&
             !typeCompatible(actual, declaration.parameters[i].type)) hasTypedMismatch = true;
       }
@@ -507,17 +641,21 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
     try { return options.unitMap.empty() ? std::vector<UnitMappingSuggestion>{} : loadUnitMappingCatalog(options.unitMap); }
     catch (...) { return std::vector<UnitMappingSuggestion>{}; }
   }();
-  std::unordered_set<std::string> mappedTargetUnits;
-  for (const auto& mapping : mappings)
-    if (!mapping.targetUnit.empty()) mappedTargetUnits.insert(lower(mapping.targetUnit));
-  struct Candidate { const IndexedUnit* unit; const AstDeclaration* declaration; int score; std::string compatibility; };
+  struct Candidate {
+    const IndexedUnit* unit;
+    const AstDeclaration* declaration;
+    int score;
+    std::string compatibility;
+    std::string qualifierMatch;
+  };
   std::vector<Candidate> candidates;
   std::set<std::string> uses;
   for (const auto& used : ast.uses) uses.insert(lower(used.name));
   const std::string receiverExpression = selected && selected->name.find('.') != std::string::npos
       ? selected->name.substr(0, selected->name.rfind('.')) : std::string{};
   const auto sourceMember = selected ? simpleName(selected->name) : requested;
-  auto receiverType = inferIdentifierType(ast, receiverExpression);
+  auto receiverInfo = inferType(ast, receiverExpression, right, selected ? selected->range.begin.offset : 0);
+  auto receiverType = receiverInfo.type;
   if (receiverType.empty() && !receiverExpression.empty()) {
     const auto receiverName = simpleName(receiverExpression);
     const auto classReceiver = std::any_of(right.begin(), right.end(), [&](const IndexedUnit& unit) {
@@ -526,6 +664,15 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
       });
     });
     if (classReceiver) receiverType = receiverName;
+  }
+  const IndexedUnit* sourceOwner = nullptr;
+  if (!receiverExpression.empty()) for (const auto& unit : left) {
+    if (!unitDeclaresSymbol(unit, simpleName(receiverExpression)) &&
+        !std::any_of(unit.inheritance.begin(), unit.inheritance.end(), [&](const auto& relation) {
+          return lower(relation.type) == lower(simpleName(receiverExpression));
+        })) continue;
+    if (sourceOwner) { sourceOwner = nullptr; break; }
+    sourceOwner = &unit;
   }
   for (const auto& unit : right) for (const auto& declaration : unit.declarations) {
     if (lower(simpleName(declaration.name)) != lower(sourceMember)) continue;
@@ -538,8 +685,11 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
         (lower(unit.name) == qualifier || lower(simpleName(unit.name)) == qualifierSimple);
     if (!qualifier.empty() && !declaration.ownerType.empty() && !ownerMatch && !unitMatch &&
         !receiverType.empty() && lower(receiverType) != lower(declaration.ownerType)) continue;
+    const bool mappedOwner = sourceOwner && std::any_of(mappings.begin(), mappings.end(), [&](const UnitMappingSuggestion& mapping) {
+      return lower(mapping.sourceUnit) == lower(sourceOwner->name) && lower(mapping.targetUnit) == lower(unit.name);
+    });
     if (uses.contains(lower(unit.name))) score += 20;
-    if (mappedTargetUnits.contains(lower(unit.name))) score += 10;
+    if (mappedOwner) score += 30;
     if (ownerMatch || unitMatch) score += 35;
     if (!receiverType.empty() && !declaration.ownerType.empty()) {
       if (lower(receiverType) == lower(declaration.ownerType)) score += 20;
@@ -563,7 +713,8 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
       if (compatible && known) score += 10;
     }
     if (!declaration.signature.empty()) score += 5;
-    candidates.push_back({&unit, &declaration, std::min(score, 100), compatibility});
+    candidates.push_back({&unit, &declaration, std::min(score, 100), compatibility,
+                          ownerMatch || unitMatch ? "exact" : mappedOwner ? "mapped" : "none"});
   }
   std::stable_sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
     return a.score > b.score;
@@ -576,17 +727,15 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
     }), candidates.end());
   }
   const auto topScore = candidates.empty() ? 0 : candidates.front().score;
-  candidates.erase(std::remove_if(candidates.begin(), candidates.end(), [&](const Candidate& candidate) {
-    return candidate.score < topScore;
-  }), candidates.end());
   const Candidate* selectedCandidate = candidates.empty() ||
       (candidates.size() > 1 && candidates[0].score == candidates[1].score) ? nullptr : &candidates.front();
   if (selectedCandidate && selected && !selected->arguments.empty()) {
     const auto actualFirst = selected->arguments.front().resolvedType.empty()
-        ? inferIdentifierType(ast, selected->arguments.front().text) : selected->arguments.front().resolvedType;
+        ? inferType(ast, selected->arguments.front().text, right, selected->range.begin.offset).type : selected->arguments.front().resolvedType;
     bool acceptsCurrent = false, acceptsConnection = false;
     for (const auto& candidate : candidates) {
-      if (candidate.score != candidates.front().score) continue;
+      if (candidate.unit != selectedCandidate->unit ||
+          candidate.declaration->parameters.size() != selected->arguments.size()) continue;
       if (candidate.declaration->parameters.empty()) continue;
       const auto expected = lower(candidate.declaration->parameters.front().type);
       acceptsCurrent = acceptsCurrent || typeCompatible(actualFirst, expected);
@@ -618,10 +767,18 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
     classification = "signature_mismatch"; action = "replace_signature"; confidence = candidates.empty() ? "low" : "high";
   }
   else if (options.errorCode == "E2003") {
-    bool legacyFound = false, currentFound = false;
+    bool legacyFound = false;
+    std::size_t currentOwners = 0;
     for (const auto& unit : left) legacyFound = legacyFound || unitDeclaresSymbol(unit, requested);
-    for (const auto& unit : right) currentFound = currentFound || unitDeclaresSymbol(unit, requested);
+    for (const auto& unit : right) if (unitDeclaresSymbol(unit, requested)) ++currentOwners;
+    const bool currentFound = currentOwners > 0;
     const auto currentSourceEvidence = currentFound ? std::vector<std::string>{} : activeSourceEvidence(right, requested);
+    if (currentOwners > 1) {
+      v600OwnerAmbiguous = true;
+      classification = "ambiguous"; action = "review_required"; confidence = "medium";
+    } else if (currentOwners == 1 && !legacyFound) {
+      classification = "unit_mapping"; action = "add_uses"; confidence = "high";
+    }
     if (!currentFound && !currentSourceEvidence.empty()) {
       v600OwnerAmbiguous = true;
       classification = "ambiguous"; action = "review_required"; confidence = "medium";
@@ -656,10 +813,11 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
     selectedCandidate = nullptr;
   }
   bool safeConnectionReplacement = false;
+  std::size_t safeArgumentIndex = 0;
   if (selectedCandidate && selected) {
     for (std::size_t i = 0; i < selected->arguments.size() && i < selectedCandidate->declaration->parameters.size(); ++i) {
       auto actual = selected->arguments[i].resolvedType;
-      if (actual.empty()) actual = inferIdentifierType(ast, selected->arguments[i].text);
+      if (actual.empty()) actual = inferType(ast, selected->arguments[i].text, right, selected->range.begin.offset).type;
       const auto expected = selectedCandidate->declaration->parameters[i].type;
       if (lower(actual) != "taziendastd" ||
           (lower(expected) != "tcsedatabase" && lower(expected) != "ierpconnection")) continue;
@@ -668,13 +826,12 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
                i < candidate.declaration->parameters.size() &&
                typeCompatible(actual, candidate.declaration->parameters[i].type);
       });
-      const bool connectionResolved = std::any_of(right.begin(), right.end(), [&](const IndexedUnit& unit) {
-        return std::any_of(unit.declarations.begin(), unit.declarations.end(), [&](const AstDeclaration& declaration) {
-          return lower(declaration.ownerType) == "taziendastd" && lower(simpleName(declaration.name)) == "connection" &&
-                 typeCompatible(declaration.type, expected);
-        });
-      });
-      if (!acceptsCurrent && connectionResolved) safeConnectionReplacement = true;
+      const auto connection = inferType(ast, selected->arguments[i].text + ".Connection", right,
+                                        selected->range.begin.offset);
+      if (!acceptsCurrent && typeCompatible(connection.type, expected)) {
+        safeConnectionReplacement = true;
+        safeArgumentIndex = i;
+      }
     }
   }
   if (safeConnectionReplacement) {
@@ -711,7 +868,31 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
          << "\",\"recommended_action\":\"" << action << "\",\"reason\":";
   writeNullable(output, diagnosisReason);
   output << ",\"diagnostics\":[]},\"receiver\":{\"expression\":";
-  writeNullable(output, receiverExpression); output << ",\"type\":"; writeNullable(output, receiverType); output << "},\"callee_candidates\":[";
+  writeNullable(output, receiverExpression); output << ",\"type\":"; writeNullable(output, receiverType);
+  output << ",\"type_confidence\":\"" << (receiverType.empty() ? "low" : "high")
+         << "\",\"type_source\":";
+  writeNullable(output, receiverType.empty() ? "" : receiverInfo.source.empty() ? "inferred" : receiverInfo.source);
+  output << "},\"source_owner\":{\"name\":";
+  writeNullable(output, sourceOwner ? simpleName(receiverExpression) : "");
+  output << ",\"kind\":"; writeNullable(output, sourceOwner ? "class" : "");
+  output << ",\"v500_unit\":"; writeNullable(output, sourceOwner ? sourceOwner->name : "");
+  output << ",\"v500_source_file\":"; writeNullable(output, sourceOwner ? sourceOwner->sourceFile.generic_string() : "");
+  output << ",\"v500_package\":{\"name\":"; writeNullable(output, sourceOwner ? sourceOwner->packageName : "");
+  output << ",\"dcp\":"; writeNullable(output, sourceOwner ? sourceOwner->packageDcp : "");
+  output << ",\"bpl\":"; writeNullable(output, sourceOwner ? sourceOwner->packageBpl : "");
+  output << "}},\"mapped_owner_candidates\":[";
+  for (std::size_t i = 0; i < candidates.size(); ++i) {
+    if (i) output << ',';
+    const auto& candidate = candidates[i];
+    const bool mappedOwner = sourceOwner && std::any_of(mappings.begin(), mappings.end(), [&](const UnitMappingSuggestion& mapping) {
+      return lower(mapping.sourceUnit) == lower(sourceOwner->name) && lower(mapping.targetUnit) == lower(candidate.unit->name);
+    });
+    output << "{\"v600_owner\":\"" << escape(candidate.unit->name) << "\",\"v600_unit\":\""
+           << escape(candidate.unit->name) << "\",\"mapping_source\":\""
+           << (mappedOwner ? "unit_map" : !candidate.unit->packageName.empty() ? "package_relation" : "export_match")
+           << "\",\"confidence\":\"" << (selectedCandidate == &candidate ? "high" : "low") << "\"}";
+  }
+  output << "],\"callee_candidates\":[";
   for (std::size_t c = 0; c < candidates.size(); ++c) {
     if (c) output << ',';
     const auto& candidate = candidates[c];
@@ -730,13 +911,15 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
     output << ",\"bpl\":"; writeNullable(output, candidate.unit->packageBpl);
     const auto normalizedScore = topScore > 0 ? candidate.score * 100 / topScore : 0;
     output << "},\"match_score\":" << normalizedScore << ",\"argument_compatibility\":\""
-           << candidate.compatibility << "\"}";
+           << candidate.compatibility << "\",\"qualifier_match\":\"" << candidate.qualifierMatch << "\"}";
   }
   output << "],\"arguments\":[";
   if (selected) for (std::size_t i = 0; i < selected->arguments.size(); ++i) {
     if (i) output << ',';
-    auto actual = selected->arguments[i].resolvedType;
-    if (actual.empty()) actual = inferIdentifierType(ast, selected->arguments[i].text);
+    auto inferred = inferType(ast, selected->arguments[i].text, right, selected->range.begin.offset);
+    auto actual = selected->arguments[i].resolvedType.empty() ? inferred.type : selected->arguments[i].resolvedType;
+    if (!selected->arguments[i].resolvedType.empty() && inferred.type.empty())
+      inferred = {selected->arguments[i].resolvedType, "inferred", "high"};
     const auto expected = selectedCandidate && i < selectedCandidate->declaration->parameters.size()
         ? selectedCandidate->declaration->parameters[i].type : std::string{};
     const bool compatible = typeCompatible(actual, expected);
@@ -747,6 +930,9 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
     }
     output << "{\"position\":" << i + 1 << ",\"expression\":\"" << escape(selected->arguments[i].text)
            << "\",\"inferred_type\":"; writeNullable(output, actual);
+    output << ",\"type_confidence\":\"" << (actual.empty() ? "low" : inferred.confidence)
+           << "\",\"type_source\":";
+    writeNullable(output, actual.empty() ? "" : inferred.source.empty() ? "inferred" : inferred.source);
     output << ",\"expected_type\":"; writeNullable(output, expected);
     output << ",\"compatible\":" << (compatible ? "true" : "false") << ",\"suggested_expression\":";
     writeNullable(output, suggestion);
@@ -788,8 +974,259 @@ std::string diagnoseJson(const DiagnoseOptions& options, const std::vector<Index
     output << ",\"legacy_assignment_target\":"; writeNullable(output, selected ? selected->assignmentTarget.text : "");
     output << ",\"legacy_assignment_type\":"; writeNullable(output, selected ? selected->assignmentTarget.resolvedType : "");
     output << ",\"classification\":\"" << classification
-           << "\",\"automatic_migration_safe\":false,\"reason\":\"Return type changes error-handling semantics.\"}";
+           << "\",\"assignment_target\":"; writeNullable(output, selected ? selected->assignmentTarget.text : "");
+    output << ",\"assignment_target_type\":"; writeNullable(output, selected ? selected->assignmentTarget.resolvedType : "");
+    output << ",\"unit\":"; writeNullable(output, selectedCandidate ? selectedCandidate->unit->name : "");
+    output << ",\"package\":{\"name\":"; writeNullable(output, selectedCandidate ? selectedCandidate->unit->packageName : "");
+    output << ",\"dcp\":"; writeNullable(output, selectedCandidate ? selectedCandidate->unit->packageDcp : "");
+    output << ",\"bpl\":"; writeNullable(output, selectedCandidate ? selectedCandidate->unit->packageBpl : "");
+    output << "},\"automatic_migration_safe\":false,\"recommended_action\":\"review_required\","
+              "\"reason\":\"Return type changes error-handling semantics.\"}";
   }
+  output << ",\"suggested_fixes\":[";
+  bool wroteFix = false;
+  if (safeConnectionReplacement && selected && safeArgumentIndex < selected->arguments.size()) {
+    const auto& argument = selected->arguments[safeArgumentIndex];
+    output << "{\"kind\":\"replace_argument\",\"confidence\":\"high\",\"file\":\""
+           << escape(options.file.generic_string()) << "\",\"range\":{\"start_offset\":" << argument.range.begin.offset
+           << ",\"end_offset\":" << argument.range.end.offset << ",\"start_line\":" << argument.range.begin.line
+           << ",\"start_column\":" << argument.range.begin.column << ",\"end_line\":" << argument.range.end.line
+           << ",\"end_column\":" << argument.range.end.column << "},\"replacement\":\""
+           << escape(argument.text + ".Connection") << "\",\"preconditions\":[\"unique_callee\","
+              "\"exact_member_match\",\"matching_argument_count\",\"source_type_proven\","
+              "\"target_type_proven\",\"connection_property_resolved\",\"no_compatible_source_overload\"],"
+              "\"evidence\":{\"source_type\":\"TAziendaStd\",\"target_type\":\""
+           << escape(selectedCandidate->declaration->parameters[safeArgumentIndex].type) << "\"}}";
+    wroteFix = true;
+  }
+  if (!wroteFix && options.errorCode == "F2613" && mapped != mappings.end() &&
+      !mapped->targetUnit.empty() && mapped->confidence == "high" &&
+      mapped->compatibility == "full_compatible" && mapped->automaticAction == "replace_in_uses") {
+    const auto used = std::find_if(ast.uses.begin(), ast.uses.end(), [&](const UsesItem& item) {
+      return lower(item.name) == lower(mapped->sourceUnit);
+    });
+    if (used != ast.uses.end()) {
+      output << "{\"kind\":\"replace_in_uses\",\"confidence\":\"high\",\"file\":\""
+             << escape(options.file.generic_string()) << "\",\"range\":{\"start_offset\":" << used->range.begin.offset
+             << ",\"end_offset\":" << used->range.end.offset << ",\"start_line\":" << used->range.begin.line
+             << ",\"start_column\":" << used->range.begin.column << ",\"end_line\":" << used->range.end.line
+             << ",\"end_column\":" << used->range.end.column << "},\"replacement\":\""
+             << escape(mapped->targetUnit) << "\",\"preconditions\":[\"approved_unit_mapping\","
+                "\"full_compatible\",\"exact_uses_range\"]}";
+    }
+  }
+  output << ']';
+  output << ','; writePerformance(output, performance, started); output << '}';
+  return output.str();
+}
+
+std::string typeInfoJson(std::string_view requested, const std::vector<IndexedUnit>& index,
+                         bool includeInherited, bool includeOverloads, QueryPerformance performance) {
+  const auto started = std::chrono::steady_clock::now();
+  std::vector<const IndexedUnit*> owners;
+  for (const auto& unit : index) {
+    const bool declaredType = std::any_of(unit.declarations.begin(), unit.declarations.end(), [&](const AstDeclaration& declaration) {
+      const auto kind = lower(declaration.kind);
+      return lower(simpleName(declaration.name)) == lower(std::string(requested)) &&
+             (kind == "class" || kind == "interface");
+    });
+    const bool indexedTypeCandidate = std::any_of(unit.declarations.begin(), unit.declarations.end(), [&](const AstDeclaration& declaration) {
+      return lower(simpleName(declaration.name)) == lower(std::string(requested)) && lower(declaration.kind) == "type";
+    }) || std::any_of(unit.inheritance.begin(), unit.inheritance.end(), [&](const InheritanceRelation& relation) {
+      return lower(relation.type) == lower(std::string(requested));
+    });
+    if (declaredType || indexedTypeCandidate) owners.push_back(&unit);
+  }
+  const IndexedUnit* owner = owners.size() == 1 ? owners.front() : nullptr;
+  std::vector<std::string> ancestors;
+  if (owner) for (const auto& relation : owner->inheritance)
+    if (lower(relation.type) == lower(std::string(requested))) ancestors.push_back(relation.baseType);
+
+  struct Member { const IndexedUnit* unit; AstDeclaration declaration; bool inherited; };
+  std::vector<Member> methods, properties;
+  std::set<std::string> acceptedOwners{lower(std::string(requested))};
+  if (includeInherited) for (const auto& ancestor : ancestors) acceptedOwners.insert(lower(ancestor));
+  auto collect = [&](const IndexedUnit& unit, const AstDeclaration& declaration) {
+    if (declaration.ownerType.empty() || !acceptedOwners.contains(lower(declaration.ownerType))) return;
+    const bool inherited = lower(declaration.ownerType) != lower(std::string(requested));
+    if (inherited && !includeInherited) return;
+    if (!inherited && &unit != owner) return;
+    const auto duplicate = [&](const Member& member) {
+      return lower(declarationSignature(member.declaration)) == lower(declarationSignature(declaration)) &&
+             lower(member.unit->name) == lower(unit.name);
+    };
+    if (std::any_of(methods.begin(), methods.end(), duplicate) ||
+        std::any_of(properties.begin(), properties.end(), duplicate)) return;
+    if (lower(declaration.kind) == "property" || lower(declaration.kind) == "field")
+      properties.push_back({&unit, declaration, inherited});
+    else if (includeOverloads || !std::any_of(methods.begin(), methods.end(), [&](const Member& member) {
+      return lower(simpleName(member.declaration.name)) == lower(simpleName(declaration.name));
+    })) methods.push_back({&unit, declaration, inherited});
+  };
+  if (owner) {
+    for (const auto& unit : index) for (const auto& declaration : unit.declarations) collect(unit, declaration);
+  }
+  std::ostringstream output;
+  output << "{\"schema_version\":\"2.3\",\"type\":\"" << escape(requested) << "\",\"unit\":";
+  writeNullable(output, owner ? owner->name : "");
+  output << ",\"source_file\":"; writeNullable(output, owner ? owner->sourceFile.generic_string() : "");
+  output << ",\"package\":{\"name\":"; writeNullable(output, owner ? owner->packageName : "");
+  output << ",\"dcp\":"; writeNullable(output, owner ? owner->packageDcp : "");
+  output << ",\"bpl\":"; writeNullable(output, owner ? owner->packageBpl : "");
+  output << ",\"source_project\":"; writeNullable(output, owner ? owner->sourceProject.generic_string() : "");
+  output << "},\"ancestors\":[";
+  for (std::size_t i = 0; i < ancestors.size(); ++i) { if (i) output << ','; output << '"' << escape(ancestors[i]) << '"'; }
+  output << "],\"methods\":[";
+  for (std::size_t i = 0; i < methods.size(); ++i) {
+    if (i) output << ',';
+    const auto& member = methods[i];
+    output << "{\"name\":\"" << escape(simpleName(member.declaration.name)) << "\",\"signature\":\""
+           << escape(declarationSignature(member.declaration)) << "\",\"return_type\":";
+    writeNullable(output, member.declaration.type);
+    output << ",\"declared_in\":\"" << escape(member.unit->name) << "\",\"inherited\":"
+           << (member.inherited ? "true" : "false") << ",\"overload\":"
+           << (member.declaration.overload ? "true" : "false") << ",\"reintroduced\":"
+           << (member.declaration.reintroduced ? "true" : "false") << ",\"deprecated\":"
+           << (member.declaration.deprecated ? "true" : "false") << "}";
+  }
+  output << "],\"properties\":[";
+  for (std::size_t i = 0; i < properties.size(); ++i) {
+    if (i) output << ',';
+    output << "{\"name\":\"" << escape(simpleName(properties[i].declaration.name)) << "\",\"type\":";
+    writeNullable(output, properties[i].declaration.type);
+    output << ",\"declared_in\":\"" << escape(properties[i].unit->name) << "\",\"inherited\":"
+           << (properties[i].inherited ? "true" : "false") << "}";
+  }
+  output << "],\"classification\":\"" << (owner ? "provider_resolved" : owners.empty() ? "unresolved" : "ambiguous")
+         << "\",\"diagnostics\":[";
+  if (owners.size() > 1) output << "{\"code\":\"ambiguous_symbol_owner\",\"severity\":\"warning\",\"message\":\"Multiple units declare the requested type.\"}";
+  else if (!owner) output << "{\"code\":\"unresolved_symbol\",\"severity\":\"warning\",\"message\":\"Type was not found in the persistent index or its recorded sources.\"}";
+  output << "],"; writePerformance(output, performance, started); output << '}';
+  return output.str();
+}
+
+std::string symbolOriginJson(std::string_view name, const std::vector<IndexedUnit>& index,
+                             QueryPerformance performance) {
+  const auto started = std::chrono::steady_clock::now();
+  std::vector<const IndexedUnit*> providers;
+  for (const auto& unit : index) if (unitDeclaresSymbol(unit, name) ||
+      std::any_of(unit.inheritance.begin(), unit.inheritance.end(), [&](const auto& relation) {
+        return lower(relation.type) == lower(std::string(name));
+      })) providers.push_back(&unit);
+  const auto evidence = activeSourceEvidence(index, name, 32);
+  const std::string classification = providers.size() == 1 ? "provider_resolved" :
+                                     (!providers.empty() || !evidence.empty()) ? "ambiguous" : "unresolved";
+  std::ostringstream output;
+  output << "{\"schema_version\":\"2.3\",\"symbol\":\"" << escape(name) << "\",\"active_source_evidence\":[";
+  for (std::size_t i = 0; i < evidence.size(); ++i) {
+    if (i) output << ',';
+    output << "{\"file\":\"" << escape(evidence[i]) << "\",\"usage\":\"type_reference\"}";
+  }
+  output << "],\"provider_candidates\":[";
+  for (std::size_t i = 0; i < providers.size(); ++i) {
+    if (i) output << ',';
+    output << "{\"unit\":\"" << escape(providers[i]->name) << "\",\"source_file\":";
+    writeNullable(output, providers[i]->sourceFile.generic_string());
+    output << ",\"exported\":true,\"confidence\":\"" << (providers.size() == 1 ? "high" : "low") << "\"}";
+  }
+  output << "],\"classification\":\"" << classification
+         << "\",\"recommended_action\":\"review_required\",\"reason\":";
+  if (classification == "ambiguous") output << "\"symbol_exists_in_v600_but_owner_unit_is_ambiguous\"";
+  else output << "null";
+  output << ','; writePerformance(output, performance, started); output << '}';
+  return output.str();
+}
+
+std::string batchDiagnoseJson(const std::filesystem::path& input,
+                              const std::vector<IndexedUnit>& right,
+                              const std::vector<IndexedUnit>& left,
+                              const std::filesystem::path& unitMap,
+                              std::size_t timeoutMs,
+                              QueryPerformance performance) {
+  const auto started = std::chrono::steady_clock::now();
+  const auto source = readFile(input);
+  const auto stringField = [](std::string_view object, std::string_view key) {
+    const std::regex pattern("\\\"" + std::string(key) + "\\\"\\s*:\\s*\\\"([^\\\"]*)\\\"");
+    std::cmatch match;
+    const std::string text(object);
+    return std::regex_search(text.c_str(), match, pattern) ? match[1].str() : std::string{};
+  };
+  const auto numberField = [](std::string_view object, std::string_view key) {
+    const std::regex pattern("\\\"" + std::string(key) + "\\\"\\s*:\\s*(\\d+)");
+    std::cmatch match;
+    const std::string text(object);
+    return std::regex_search(text.c_str(), match, pattern) ? static_cast<std::size_t>(std::stoull(match[1].str())) : 0;
+  };
+  const auto requests = source.find("\"requests\"");
+  const auto open = source.find('[', requests);
+  if (requests == std::string::npos || open == std::string::npos)
+    throw std::runtime_error("Invalid batch diagnose input");
+  std::vector<std::string> results;
+  std::unordered_map<std::string, std::vector<IndexedUnit>> projectEnvironments;
+  std::unordered_map<std::string, std::string> requestCache;
+  std::size_t position = open + 1;
+  while (position < source.size()) {
+    const auto objectOpen = source.find('{', position);
+    if (objectOpen == std::string::npos) break;
+    const auto objectClose = source.find('}', objectOpen);
+    if (objectClose == std::string::npos) break;
+    const auto object = std::string_view(source).substr(objectOpen, objectClose - objectOpen + 1);
+    DiagnoseOptions options;
+    options.file = stringField(object, "file");
+    options.dproj = stringField(object, "dproj");
+    if (options.file.is_relative()) options.file = input.parent_path() / options.file;
+    if (!options.dproj.empty() && options.dproj.is_relative()) options.dproj = input.parent_path() / options.dproj;
+    options.errorCode = stringField(object, "error_code");
+    options.symbol = stringField(object, "symbol");
+    options.line = numberField(object, "line");
+    options.unitMap = unitMap;
+    options.timeoutMs = timeoutMs;
+    options.performance.cacheHit = true;
+    try {
+      if (options.file.empty() || options.line == 0 || options.errorCode.empty())
+        throw std::runtime_error("Batch request requires file, line, and error_code");
+      const std::vector<IndexedUnit>* environment = &right;
+      if (!options.dproj.empty()) {
+        const auto key = lower(std::filesystem::absolute(options.dproj).lexically_normal().generic_string());
+        auto found = projectEnvironments.find(key);
+        if (found == projectEnvironments.end()) {
+          auto merged = right;
+          ProjectOptions projectOptions;
+          projectOptions.dprojFile = options.dproj;
+          auto package = options.dproj;
+          package.replace_extension(".dpk");
+          const auto project = loadPackage(package, projectOptions);
+          mergeProjectSymbols(merged, project.analyzer.analyze());
+          found = projectEnvironments.emplace(key, std::move(merged)).first;
+        }
+        environment = &found->second;
+      }
+      const auto requestKey = lower(options.file.generic_string()) + "|" + std::to_string(options.line) + "|" +
+          lower(options.errorCode) + "|" + lower(options.symbol) + "|" + lower(options.dproj.generic_string());
+      const auto cached = requestCache.find(requestKey);
+      if (cached != requestCache.end()) results.push_back(cached->second);
+      else {
+        auto result = diagnoseJson(options, *environment, left);
+        requestCache.emplace(requestKey, result);
+        results.push_back(std::move(result));
+      }
+    } catch (const std::exception& error) {
+      results.push_back("{\"schema_version\":\"2.2\",\"diagnosis\":{\"classification\":\"unresolved\","
+                        "\"confidence\":\"low\",\"recommended_action\":\"review_required\","
+                        "\"diagnostics\":[{\"code\":\"query_execution_failed\",\"severity\":\"warning\","
+                        "\"message\":\"" + escape(error.what()) + "\"}]},\"suggested_fixes\":[]}");
+    }
+    position = objectClose + 1;
+    const auto arrayClose = source.find(']', position);
+    const auto nextObject = source.find('{', position);
+    if (arrayClose != std::string::npos && (nextObject == std::string::npos || arrayClose < nextObject)) break;
+  }
+  std::ostringstream output;
+  output << "{\"schema_version\":\"2.3\",\"results\":[";
+  for (std::size_t i = 0; i < results.size(); ++i) { if (i) output << ','; output << results[i]; }
+  output << "],\"request_count\":" << results.size() << ",\"index_load_count\":" << (right.empty() ? 0 : 1)
+         << ',';
+  writePerformance(output, performance, started);
   output << '}';
   return output.str();
 }

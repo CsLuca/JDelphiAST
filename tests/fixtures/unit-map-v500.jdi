@@ -10,3 +10,5 @@ ActnList|TActionList,TAction|||source=K:/V0500/ActnList.pas;version=v500
 Generics.Collections|TList,TDictionary|||source=K:/V0500/Generics.Collections.pas;version=v500
 ComObj|CreateOleObject|||source=K:/V0500/ComObj.pas;version=v500
 Clipbrd|Clipboard,TClipboard|||source=K:/V0500/Clipbrd.pas;version=v500
+Mask|TMaskEdit|||source=K:/V0500/Mask.pas;version=v500
+Generics.Defaults|IComparer|||source=K:/V0500/Generics.Defaults.pas;version=v500

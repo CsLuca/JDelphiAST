@@ -494,11 +494,21 @@ DelphiAstTool.exe legacy-refs --file OExtLavGruppi.pas --legacy-unit UVariStd `
 DelphiAstTool.exe model-migration --file OExtLavGruppi.pas --symbol TCSFields `
   --left-index delphi-v500-full.jdi --right-index delphi-v600-full.jdi `
   --unit-map uses_v500_to_v600.json --format json
+DelphiAstTool.exe type-info --type TCSEDatabase --index delphi-v600-full.jdi `
+  --include-inherited --include-overloads --package-root K:\V0600 --format json
+DelphiAstTool.exe symbol-origin --name TCSEOLEDBRowset `
+  --index delphi-v600-full.jdi --package-root K:\V0600 --format json
 ```
 
 `compiler-log` preserves compiler output order, identifies the first actionable error, and groups repeated file/code failures without changing their order. `diagnose` extracts every call intersecting the requested line, ranks nested calls by semantic mismatch evidence and nesting depth, filters candidates by the exact source member, and reports only the highest-evidence callable set with receiver and argument types, package evidence, return-type conflicts, and approved unit mappings. Equal-scored overloads remain `ambiguous`; no owner is selected arbitrarily. `ExecSql`, `ExecSQL`, and `ExecuteScalar` return-type changes are always `review_required` unless an explicit future catalog records their semantics. No source patch is generated.
 
 `legacy-refs` blocks removal when an indexed legacy export is referenced or when partial index evidence leaves plausible active calls in `unresolved_active_references`. Generic multi-owner names such as `Add`, `Create`, `Format`, and `FieldByName` are excluded and counted in `ignored_generic_references_count`. `model-migration` searches the complete V600 index and its recorded source files, separates compatible `TCSFields` members from unresolved model APIs, and always classifies mixed legacy flows as `legacy_model_migration_required` with `manual_required`. If `symbol` finds active V600 source evidence but cannot prove the provider unit, it reports `ambiguous` rather than inventing a replacement.
+
+`type-info` reports indexed methods, overloads, return types, properties, ancestors and real package metadata for a requested type. `symbol-origin` separates active source evidence from verified provider candidates. Query-time `--package-root` enrichment reads real DPK declarations and DPROJ `DCCReference` items; DCP/BPL names are emitted only when backed by a DPK.
+
+`diagnose` reports inferred types with `type_confidence` and `type_source` (`parameter`, `local_variable`, `field`, `property`, `global`, or `inferred`). Conflicting declarations are not selected. When available, `source_owner` identifies the V500 type owner and `mapped_owner_candidates` records whether a V600 owner came from the unit map, package relation, or export evidence.
+
+The approved seed includes the standard namespace migrations `Mask -> Vcl.Mask`, `ComCtrls -> Vcl.ComCtrls`, `ActnList -> Vcl.ActnList`, `Generics.Defaults -> System.Generics.Defaults`, `Generics.Collections -> System.Generics.Collections`, `ComObj -> System.Win.ComObj`, and `Clipbrd -> Vcl.Clipbrd` as high-confidence, fully compatible `replace_in_uses` mappings.
 
 Allowed diagnosis classifications are `namespace_mapping`, `unit_mapping`, `signature_mismatch`, `return_type_mismatch`, `legacy_symbol_unmapped`, `legacy_model_migration_required`, `business_api_manual_required`, `build_path_required`, `package_dependency_required`, `ambiguous`, and `unresolved`. Recommended actions are limited to `add_uses`, `replace_in_uses`, `conditional_replace`, `replace_argument`, `replace_signature`, `remove_legacy_gate`, `manual_required`, `review_required`, and `none`.
 

@@ -8,6 +8,7 @@
 #include <iterator>
 #include <optional>
 #include <regex>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -518,6 +519,25 @@ std::string validationSeverity(std::string_view code, const ValidationPolicy& po
 }
 
 std::vector<UnitMappingSuggestion> loadUnitMappingCatalog(const std::filesystem::path& catalogFile) {
+  struct Entry {
+    std::uintmax_t size{};
+    std::filesystem::file_time_type timestamp{};
+    std::vector<UnitMappingSuggestion> mappings;
+  };
+  static std::mutex mutex;
+  static std::unordered_map<std::string, Entry> cache;
+  std::error_code pathError;
+  const auto absolute = std::filesystem::weakly_canonical(catalogFile, pathError);
+  const auto normalized = pathError ? std::filesystem::absolute(catalogFile).lexically_normal() : absolute;
+  const auto key = lower(pathToUtf8(normalized));
+  const auto size = std::filesystem::file_size(catalogFile);
+  const auto timestamp = std::filesystem::last_write_time(catalogFile);
+  {
+    std::lock_guard lock(mutex);
+    const auto found = cache.find(key);
+    if (found != cache.end() && found->second.size == size && found->second.timestamp == timestamp)
+      return found->second.mappings;
+  }
   const auto source = readFile(catalogFile);
   if (source.find("\"schema_version\"") == std::string::npos ||
       source.find("\"mappings\"") == std::string::npos)
@@ -570,12 +590,83 @@ std::vector<UnitMappingSuggestion> loadUnitMappingCatalog(const std::filesystem:
     if (!mapping.sourceUnit.empty()) result.push_back(std::move(mapping));
     position = objectClose + 1;
   }
+  {
+    std::lock_guard lock(mutex);
+    cache[key] = {size, timestamp, result};
+  }
   return result;
 }
 
-std::vector<IndexedUnit> loadSymbolIndex(const std::filesystem::path& indexFile) {
+void enrichPackageMetadata(std::vector<IndexedUnit>& units,
+                           const std::vector<std::filesystem::path>& packageRoots) {
+  struct Metadata { std::string name, dcp, bpl; std::filesystem::path project; };
+  std::unordered_map<std::string, Metadata> bySource;
+  for (const auto& root : packageRoots) {
+    if (!std::filesystem::is_directory(root)) continue;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(
+             root, std::filesystem::directory_options::skip_permission_denied)) {
+      if (!entry.is_regular_file()) continue;
+      const auto extension = lower(pathToUtf8(entry.path().extension()));
+      if (extension != ".dpk" && extension != ".dproj") continue;
+      try {
+        const auto project = entry.path();
+        const auto packageName = pathToUtf8(project.stem());
+        const auto sources = extension == ".dpk" ? packageSources(readFile(project)) : dprojSources(readFile(project));
+        for (auto source : sources) {
+          if (source.is_relative()) source = project.parent_path() / source;
+          Metadata metadata{packageName, {}, {}, project};
+          if (extension == ".dpk") {
+            metadata.dcp = packageName + ".dcp";
+            metadata.bpl = packageName + ".bpl";
+          }
+          const auto key = lower(pathToUtf8(std::filesystem::absolute(source).lexically_normal()));
+          if (extension == ".dpk") bySource[key] = std::move(metadata);
+          else bySource.try_emplace(key, std::move(metadata));
+        }
+      } catch (...) {}
+    }
+  }
+  for (auto& unit : units) {
+    if (unit.sourceFile.empty()) continue;
+    const auto key = lower(pathToUtf8(std::filesystem::absolute(unit.sourceFile).lexically_normal()));
+    const auto found = bySource.find(key);
+    if (found == bySource.end()) continue;
+    unit.packageName = found->second.name;
+    unit.packageDcp = found->second.dcp;
+    unit.packageBpl = found->second.bpl;
+    unit.sourceProject = found->second.project;
+  }
+}
+
+void mergeProjectSymbols(std::vector<IndexedUnit>& units, const AnalysisResult& project) {
+  for (const auto& analyzed : project.units) {
+    if (analyzed.ast.indexOnly) continue;
+    IndexedUnit sourceUnit;
+    sourceUnit.name = analyzed.ast.name;
+    sourceUnit.sourceFile = analyzed.ast.file;
+    sourceUnit.indexVersion = "project";
+    sourceUnit.complete = analyzed.ast.complete;
+    sourceUnit.hasInitialization = analyzed.ast.hasInitialization;
+    sourceUnit.hasFinalization = analyzed.ast.hasFinalization;
+    sourceUnit.inheritance = analyzed.ast.inheritance;
+    for (const auto& symbol : analyzed.ast.exports) sourceUnit.symbols.push_back(symbol.name);
+    for (const auto& declaration : analyzed.ast.declarations) {
+      const auto visibility = lower(declaration.visibility);
+      if (visibility == "public" || visibility == "interface" || visibility == "published" ||
+          (visibility == "protected" && !declaration.ownerType.empty()))
+        sourceUnit.declarations.push_back(declaration);
+    }
+    for (const auto& used : analyzed.ast.uses) sourceUnit.dependencies.push_back(used.name);
+    const auto key = lower(sourceUnit.name);
+    units.erase(std::remove_if(units.begin(), units.end(), [&](const IndexedUnit& unit) {
+      return lower(unit.name) == key;
+    }), units.end());
+    units.push_back(std::move(sourceUnit));
+  }
+}
+
+static std::vector<IndexedUnit> parseSymbolIndex(std::istream& input) {
   std::vector<IndexedUnit> result;
-  std::istringstream input(readFile(indexFile));
   std::string line;
   while (std::getline(input, line)) {
     line = trim(line);
@@ -630,6 +721,8 @@ std::vector<IndexedUnit> loadSymbolIndex(const std::filesystem::path& indexFile)
           }
           if (parts.size() >= 5) declaration.overload = lower(decode(parts[4])) == "overload";
           if (parts.size() >= 6) declaration.isOverride = lower(decode(parts[5])) == "override";
+          if (parts.size() >= 7) declaration.reintroduced = lower(decode(parts[6])) == "reintroduce";
+          if (parts.size() >= 8) declaration.deprecated = lower(decode(parts[7])) == "deprecated";
           const auto ownerSeparator = declaration.name.find_last_of('.');
           if (ownerSeparator != std::string::npos) declaration.ownerType = declaration.name.substr(0, ownerSeparator);
           unit.declarations.push_back(std::move(declaration));
@@ -660,9 +753,93 @@ std::vector<IndexedUnit> loadSymbolIndex(const std::filesystem::path& indexFile)
       }
     }
     if (fields.size() > 6) unit.dependencies = split(fields[6], ',');
+    if (fields.size() > 7) for (const auto& encoded : split(fields[7], ';')) {
+      const auto parts = splitPreservingEmpty(encoded, ',');
+      if (parts.size() < 4) continue;
+      IndexedUnit::SourceEvidence evidence;
+      evidence.symbol = percentDecode(parts[0]);
+      try {
+        evidence.line = static_cast<std::size_t>(std::stoull(parts[1]));
+        evidence.column = static_cast<std::size_t>(std::stoull(parts[2]));
+      } catch (...) { continue; }
+      evidence.usage = percentDecode(parts[3]);
+      unit.sourceEvidence.push_back(std::move(evidence));
+    }
     result.push_back(std::move(unit));
   }
   return result;
+}
+
+std::vector<IndexedUnit> loadSymbolIndex(const std::filesystem::path& indexFile) {
+  std::istringstream input(readFile(indexFile));
+  return parseSymbolIndex(input);
+}
+
+std::vector<IndexedUnit> loadSymbolIndexFiltered(const std::filesystem::path& indexFile,
+                                                 const std::vector<std::string>& terms) {
+  if (terms.empty()) return loadSymbolIndex(indexFile);
+  std::vector<std::string> normalizedTerms;
+  for (const auto& term : terms) if (!term.empty()) normalizedTerms.push_back(lower(term));
+  std::ifstream input(indexFile, std::ios::binary);
+  if (!input) throw std::runtime_error("Cannot read " + pathToUtf8(indexFile));
+  std::stringstream selected;
+  std::string line;
+  while (std::getline(input, line)) {
+    if (line.empty() || line[0] == '#') continue;
+    bool matches = false;
+    for (const auto& term : normalizedTerms) {
+      auto at = line.begin();
+      while ((at = std::search(at, line.end(), term.begin(), term.end(),
+                  [](unsigned char left, unsigned char right) { return std::tolower(left) == std::tolower(right); })) != line.end()) {
+        const auto index = static_cast<std::size_t>(std::distance(line.begin(), at));
+        const auto identifier = [](unsigned char c) { return std::isalnum(c) || c == '_'; };
+        const bool leftBoundary = index == 0 || !identifier(static_cast<unsigned char>(line[index - 1]));
+        const auto after = index + term.size();
+        const bool rightBoundary = after >= line.size() || !identifier(static_cast<unsigned char>(line[after]));
+        if (leftBoundary && rightBoundary) { matches = true; break; }
+        ++at;
+      }
+      if (matches) break;
+    }
+    if (matches) selected << line << '\n';
+  }
+  return parseSymbolIndex(selected);
+}
+
+std::vector<IndexedUnit> loadSymbolIndexCached(const std::filesystem::path& indexFile, bool* cacheHit) {
+  return *loadSymbolIndexShared(indexFile, cacheHit);
+}
+
+std::shared_ptr<const std::vector<IndexedUnit>> loadSymbolIndexShared(
+    const std::filesystem::path& indexFile, bool* cacheHit) {
+  struct Entry {
+    std::uintmax_t size{};
+    std::filesystem::file_time_type timestamp{};
+    std::shared_ptr<const std::vector<IndexedUnit>> units;
+  };
+  static std::mutex mutex;
+  static std::unordered_map<std::string, Entry> cache;
+  std::error_code error;
+  const auto absolute = std::filesystem::weakly_canonical(indexFile, error);
+  const auto normalized = error ? std::filesystem::absolute(indexFile).lexically_normal() : absolute;
+  const auto key = lower(pathToUtf8(normalized));
+  const auto size = std::filesystem::file_size(indexFile);
+  const auto timestamp = std::filesystem::last_write_time(indexFile);
+  {
+    std::lock_guard lock(mutex);
+    const auto found = cache.find(key);
+    if (found != cache.end() && found->second.size == size && found->second.timestamp == timestamp) {
+      if (cacheHit) *cacheHit = true;
+      return found->second.units;
+    }
+  }
+  auto units = std::make_shared<const std::vector<IndexedUnit>>(loadSymbolIndex(indexFile));
+  {
+    std::lock_guard lock(mutex);
+    cache[key] = {size, timestamp, units};
+  }
+  if (cacheHit) *cacheHit = false;
+  return units;
 }
 
 IndexLoadResult loadSymbolIndexValidated(const std::filesystem::path& indexFile) {
@@ -969,6 +1146,23 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
       if (!recoverablePartial) continue;
       ++result.statistics.unitsPartiallyIndexed;
     }
+    for (const auto& relation : ast.inheritance) {
+      const auto hasExport = std::any_of(ast.exports.begin(), ast.exports.end(), [&](const SymbolDeclaration& item) {
+        return lower(item.name) == lower(relation.type);
+      });
+      if (!hasExport) ast.exports.push_back({relation.type, relation.kind, relation.range});
+      const auto hasDeclaration = std::any_of(ast.declarations.begin(), ast.declarations.end(), [&](const AstDeclaration& item) {
+        return lower(item.name) == lower(relation.type) && lower(item.kind) == lower(relation.kind);
+      });
+      if (!hasDeclaration) {
+        AstDeclaration declaration;
+        declaration.kind = relation.kind;
+        declaration.name = relation.type;
+        declaration.visibility = "public";
+        declaration.range = relation.range;
+        ast.declarations.push_back(std::move(declaration));
+      }
+    }
     if (!names.insert(lower(ast.name)).second) {
       const auto level = severity("duplicate_unit_source", "warning");
       result.hasBlockingErrors = result.hasBlockingErrors || level == "error";
@@ -1007,7 +1201,7 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
     return result;
   };
   std::ostringstream output;
-  output << "# JDelphiAST symbol index v2: unit|symbols|flags|declarations|metadata|inheritance|dependencies\n";
+  output << "# JDelphiAST symbol index v2: unit|symbols|flags|declarations|metadata|inheritance|dependencies|source_evidence\n";
   output << "# statistics files_scanned=" << result.statistics.filesScanned
          << " units_indexed=" << result.statistics.unitsIndexed
          << " units_partially_indexed=" << result.statistics.unitsPartiallyIndexed
@@ -1076,7 +1270,9 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
       output << encode(declaration.kind) << ',' << encode(declaration.name) << ','
              << encode(declaration.type) << ',' << encode(signature.str()) << ','
              << (declaration.overload ? "overload" : "") << ','
-             << (declaration.isOverride ? "override" : "");
+             << (declaration.isOverride ? "override" : "") << ','
+             << (declaration.reintroduced ? "reintroduce" : "") << ','
+             << (declaration.deprecated ? "deprecated" : "");
     }
     output << "|source=" << encode(genericPathToUtf8(unit.file)) << ";version=" << encode(options.version)
             << ";origin=" << encode(options.origin);
@@ -1096,6 +1292,15 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
     for (std::size_t dependency = 0; dependency < unit.uses.size(); ++dependency) {
       if (dependency) output << ',';
       output << encode(unit.uses[dependency].name);
+    }
+    output << '|';
+    for (std::size_t reference = 0; reference < unit.references.size(); ++reference) {
+      if (reference) output << ';';
+      const auto& item = unit.references[reference];
+      const auto usage = std::any_of(unit.calls.begin(), unit.calls.end(), [&](const AstCall& call) {
+        return item.range.begin.offset >= call.range.begin.offset && item.range.begin.offset < call.range.end.offset;
+      }) ? "invocation" : "type_reference";
+      output << encode(item.name) << ',' << item.range.begin.line << ',' << item.range.begin.column << ',' << usage;
     }
     output << '\n';
   }

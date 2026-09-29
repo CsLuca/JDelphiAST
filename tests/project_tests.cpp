@@ -185,6 +185,22 @@ end.)");
               dprojUnits.front().packageDcp.empty() && dprojUnits.front().packageBpl.empty() &&
               dprojUnits.front().sourceProject.filename() == "OnlyProject.dproj",
           "DPROJ references provide package identity without inventing DCP or BPL names");
+  std::vector<jdelphiast::IndexedUnit> enriched(1);
+  enriched.front().name = "DprojUnit";
+  enriched.front().sourceFile = dprojOnly / "Source" / "DprojUnit.pas";
+  jdelphiast::enrichPackageMetadata(enriched, {dprojOnly});
+  require(enriched.front().packageName == "OnlyProject" && enriched.front().packageDcp.empty() &&
+              enriched.front().packageBpl.empty() && enriched.front().sourceProject.filename() == "OnlyProject.dproj",
+          "query package enrichment uses real DPROJ references without inventing artifacts");
+  bool firstCacheHit = true, secondCacheHit = false, invalidatedCacheHit = true;
+  const auto cachedIndex = dprojOnly / "cached.jdi";
+  write(cachedIndex, "Cached.Unit|TOne|||version=v600\n");
+  (void)jdelphiast::loadSymbolIndexCached(cachedIndex, &firstCacheHit);
+  (void)jdelphiast::loadSymbolIndexCached(cachedIndex, &secondCacheHit);
+  write(cachedIndex, "Cached.Unit|TOne,TTwo|||version=v600\n");
+  (void)jdelphiast::loadSymbolIndexCached(cachedIndex, &invalidatedCacheHit);
+  require(!firstCacheHit && secondCacheHit && !invalidatedCacheHit,
+          "JDI cache uses path, size, and timestamp and invalidates changed files");
 
   const auto unicodeDir = root / jdelphiast::pathFromSourceBytes("sorgenti-citt\xC3\xA0");
   const auto unicodeFile = unicodeDir / jdelphiast::pathFromSourceBytes("UnitAccentuata-\xC3\xA8.pas");

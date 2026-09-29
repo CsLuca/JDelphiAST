@@ -9,9 +9,12 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <iterator>
+#include <regex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 namespace {
@@ -47,22 +50,173 @@ void writeAtomic(const std::filesystem::path& path, std::string_view content) {
   std::filesystem::rename(temporary, path);
 }
 
-std::vector<jdelphiast::IndexedUnit> loadIndexes(const std::vector<std::filesystem::path>& files) {
-  auto result = jdelphiast::bundledSymbolIndex();
+std::vector<jdelphiast::IndexedUnit> loadIndexes(const std::vector<std::filesystem::path>& files,
+                                                 jdelphiast::QueryPerformance* performance = nullptr) {
+  const auto started = std::chrono::steady_clock::now();
+  std::vector<jdelphiast::IndexedUnit> result;
+  std::unordered_map<std::string, std::size_t> positions;
+  const auto normalized = [](std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+  };
+  bool allCacheHits = !files.empty();
   for (const auto& file : files) {
-    const auto loaded = jdelphiast::loadSymbolIndex(file);
-    for (const auto& unit : loaded) {
-      const auto found = std::find_if(result.begin(), result.end(), [&](const auto& current) {
-        auto left = current.name;
-        auto right = unit.name;
-        std::transform(left.begin(), left.end(), left.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        std::transform(right.begin(), right.end(), right.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        return left == right;
-      });
-      if (found == result.end()) result.push_back(unit); else *found = unit;
+    bool cacheHit = false;
+    const auto loaded = jdelphiast::loadSymbolIndexShared(file, &cacheHit);
+    allCacheHits = allCacheHits && cacheHit;
+    if (result.empty() && files.size() == 1) {
+      result = *loaded;
+      for (std::size_t i = 0; i < result.size(); ++i) positions[normalized(result[i].name)] = i;
+      continue;
+    }
+    for (const auto& unit : *loaded) {
+      const auto key = normalized(unit.name);
+      const auto found = positions.find(key);
+      if (found == positions.end()) {
+        positions.emplace(key, result.size());
+        result.push_back(unit);
+      } else result[found->second] = unit;
     }
   }
+  for (const auto& unit : jdelphiast::bundledSymbolIndex()) {
+    const auto key = normalized(unit.name);
+    if (!positions.contains(key)) {
+      positions.emplace(key, result.size());
+      result.push_back(unit);
+    }
+  }
+  if (performance) {
+    performance->indexLoadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    performance->cacheHit = allCacheHits;
+  }
   return result;
+}
+
+std::vector<jdelphiast::IndexedUnit> loadFilteredIndexes(
+    const std::vector<std::filesystem::path>& files, const std::vector<std::string>& terms,
+    jdelphiast::QueryPerformance* performance = nullptr) {
+  const auto started = std::chrono::steady_clock::now();
+  std::vector<jdelphiast::IndexedUnit> result;
+  const auto normalized = [](std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+  };
+  for (const auto& file : files) {
+    auto loaded = jdelphiast::loadSymbolIndexFiltered(file, terms);
+    result.insert(result.end(), loaded.begin(), loaded.end());
+  }
+  for (const auto& unit : jdelphiast::bundledSymbolIndex()) {
+    const auto matches = std::any_of(terms.begin(), terms.end(), [&](const std::string& term) {
+      return normalized(unit.name).find(normalized(term)) != std::string::npos ||
+          std::any_of(unit.symbols.begin(), unit.symbols.end(), [&](const std::string& symbol) {
+            return normalized(symbol) == normalized(term);
+          });
+    });
+    if (matches) result.push_back(unit);
+  }
+  if (performance) {
+    performance->indexLoadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    performance->cacheHit = false;
+  }
+  return result;
+}
+
+std::vector<std::string> diagnosticTerms(const std::filesystem::path& file,
+                                         std::string_view explicitSymbol = {}, std::size_t line = 0) {
+  std::vector<std::string> result;
+  const auto normalized = [](std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+  };
+  if (!explicitSymbol.empty()) result.emplace_back(explicitSymbol);
+  std::ifstream input(file, std::ios::binary);
+  if (!input) return result;
+  const std::string source{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+  const auto ast = jdelphiast::parseUnit(file, source);
+  std::size_t maximumDepth = 0;
+  if (line) for (const auto& call : ast.calls) {
+    if (call.range.begin.line > line || call.range.end.line < line) continue;
+    std::size_t depth = 0;
+    for (const auto& parent : ast.calls)
+      if (&parent != &call && parent.range.begin.offset <= call.range.begin.offset &&
+          parent.range.end.offset >= call.range.end.offset) ++depth;
+    maximumDepth = std::max(maximumDepth, depth);
+  }
+  for (const auto& call : ast.calls) {
+    if (line && (call.range.begin.line > line || call.range.end.line < line)) continue;
+    if (line) {
+      std::size_t depth = 0;
+      for (const auto& parent : ast.calls)
+        if (&parent != &call && parent.range.begin.offset <= call.range.begin.offset &&
+            parent.range.end.offset >= call.range.end.offset) ++depth;
+      if (depth != maximumDepth) continue;
+    }
+    const auto dot = call.name.find_last_of('.');
+    const auto member = call.name.substr(dot == std::string::npos ? 0 : dot + 1);
+    static const std::unordered_map<std::string, bool> generic = {
+        {"add", true}, {"create", true}, {"open", true}, {"close", true}, {"execute", true}};
+    if (!generic.contains(normalized(member))) result.push_back(member);
+    const auto firstDot = call.name.find('.');
+    if (firstDot != std::string::npos) {
+      const auto receiver = call.name.substr(0, firstDot);
+      std::string receiverType;
+      for (const auto& declaration : ast.declarations) {
+        if (normalized(declaration.name) == normalized(receiver) && !declaration.type.empty()) receiverType = declaration.type;
+        for (const auto& parameter : declaration.parameters)
+          if (normalized(parameter.name) == normalized(receiver) && !parameter.type.empty()) receiverType = parameter.type;
+      }
+      result.push_back(receiverType.empty() ? receiver : receiverType);
+    }
+  }
+  std::sort(result.begin(), result.end());
+  result.erase(std::unique(result.begin(), result.end()), result.end());
+  return result;
+}
+
+std::vector<std::string> batchDiagnosticTerms(const std::filesystem::path& input) {
+  std::ifstream stream(input, std::ios::binary);
+  if (!stream) return {};
+  const std::string source{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+  std::vector<std::string> result;
+  const std::regex field(R"json("(file|symbol)"\s*:\s*"([^"]+)")json");
+  for (std::sregex_iterator item(source.begin(), source.end(), field), end; item != end; ++item) {
+    if ((*item)[1].str() == "symbol") result.push_back((*item)[2].str());
+    else {
+      const auto objectStart = source.rfind('{', static_cast<std::size_t>((*item).position()));
+      const auto objectEnd = source.find('}', static_cast<std::size_t>((*item).position()));
+      std::size_t line = 0;
+      if (objectStart != std::string::npos && objectEnd != std::string::npos) {
+        const auto object = source.substr(objectStart, objectEnd - objectStart + 1);
+        const std::regex linePattern(R"("line"\s*:\s*(\d+))");
+        std::smatch lineMatch;
+        if (std::regex_search(object, lineMatch, linePattern)) line = std::stoull(lineMatch[1].str());
+      }
+      auto requestFile = std::filesystem::path((*item)[2].str());
+      if (requestFile.is_relative() && !std::filesystem::exists(requestFile))
+        requestFile = input.parent_path() / requestFile;
+      const auto terms = diagnosticTerms(requestFile, {}, line);
+      result.insert(result.end(), terms.begin(), terms.end());
+    }
+  }
+  std::sort(result.begin(), result.end());
+  result.erase(std::unique(result.begin(), result.end()), result.end());
+  return result;
+}
+
+std::string queryTimeoutJson(std::string_view schema, const jdelphiast::QueryPerformance& performance) {
+  return "{\"schema_version\":\"" + std::string(schema) +
+      "\",\"classification\":\"unresolved\",\"recommended_action\":\"review_required\","
+      "\"diagnostics\":[{\"code\":\"query_timeout\",\"severity\":\"warning\","
+      "\"message\":\"Semantic query exceeded its time budget.\"}],\"query_performance\":{"
+      "\"index_load_ms\":" + std::to_string(performance.indexLoadMs) +
+      ",\"index_lookup_ms\":" + std::to_string(performance.indexLookupMs) +
+      ",\"source_parse_ms\":" + std::to_string(performance.sourceParseMs) +
+      ",\"source_scan_ms\":" + std::to_string(performance.sourceScanMs) +
+      ",\"package_enrichment_ms\":" + std::to_string(performance.packageEnrichmentMs) +
+      ",\"total_ms\":" + std::to_string(performance.indexLoadMs + performance.packageEnrichmentMs) +
+      ",\"cache_hit\":" + (performance.cacheHit ? "true" : "false") + "}}";
 }
 
 std::filesystem::path packageFromDproj(const std::filesystem::path& dproj) {
@@ -91,6 +245,9 @@ USAGE
   DelphiAstTool.exe legacy-refs --file <unit.pas> --legacy-unit <name> --left-index <v500.jdi> --right-index <v600.jdi> [options]
   DelphiAstTool.exe model-migration --file <unit.pas> --symbol <name> --left-index <v500.jdi> --right-index <v600.jdi> [options]
   DelphiAstTool.exe compiler-log --input <dcc32-build-log.txt> --format json
+  DelphiAstTool.exe type-info --type <name> --index <index.jdi> [--include-inherited] [--include-overloads] --format json
+  DelphiAstTool.exe symbol-origin --name <symbol> --index <index.jdi> --format json
+  DelphiAstTool.exe batch-diagnose --input <requests.json> --index <v600.jdi> [options] --output <results.json>
 
 PROJECT ANALYSIS OPTIONS
   --project <file.dpk>       Delphi package to analyze.
@@ -138,7 +295,13 @@ DIAGNOSTIC OPTIONS
   --symbol <name>           Optional compiler symbol or model name.
   --legacy-unit <name>      Legacy owner inspected by legacy-refs.
   --input <build.log>       DCC32 log parsed by compiler-log.
+  --type <name>             Type inspected by type-info.
+  --include-inherited       Include members declared by indexed ancestors.
+  --include-overloads       Preserve every indexed overload.
+  --package-root <dir>      Enrich query metadata from real DPK/DPROJ declarations.
+  --query-timeout-ms <n>    Per-request semantic budget. Default: 10000.
   diagnose, legacy-refs, model-migration, and compiler-log emit additive schema 2.2 JSON.
+  type-info and symbol-origin emit additive schema 2.3 JSON.
   These commands are read-only and never modify Delphi sources.
 
 ANALYSIS OUTPUT
@@ -200,18 +363,23 @@ bool isQueryCommand(std::string_view command) {
   return command == "exports" || command == "symbol" || command == "expression" ||
          command == "hierarchy" || command == "unit-info" || command == "compare-symbol" ||
          command == "diagnose" || command == "legacy-refs" || command == "model-migration" ||
-         command == "compiler-log";
+         command == "compiler-log" || command == "type-info" || command == "symbol-origin" ||
+         command == "batch-diagnose";
 }
 
 int runQuery(std::string_view command, int argc, char** argv) {
-  std::vector<std::filesystem::path> indexes, leftIndexes, rightIndexes;
-  std::filesystem::path file, input, unitMap;
+  std::vector<std::filesystem::path> indexes, leftIndexes, rightIndexes, packageRoots;
+  std::filesystem::path file, input, output, unitMap;
   std::filesystem::path dproj;
-  std::string unit, legacyUnit, name, kind, qualifiedName, className, errorCode;
+  std::string unit, legacyUnit, name, typeName, kind, qualifiedName, className, errorCode;
   std::string configuration{"Release"}, platform{"Win32"};
   std::size_t line{};
+  std::size_t queryTimeoutMs{10000};
+  bool includeInherited = false, includeOverloads = false;
   for (int i = 2; i < argc; ++i) {
     const std::string argument = argv[i];
+    if (argument == "--include-inherited") { includeInherited = true; continue; }
+    if (argument == "--include-overloads") { includeOverloads = true; continue; }
     if (argument == "--format") {
       if (++i >= argc || std::string(argv[i]) != "json") { std::cerr << "Only --format json is supported\n"; return 2; }
       continue;
@@ -219,14 +387,17 @@ int runQuery(std::string_view command, int argc, char** argv) {
     if (i + 1 >= argc) { std::cerr << "Missing value for " << argument << '\n'; return 2; }
     const std::string value = argv[++i];
     if (argument == "--index") indexes.emplace_back(value);
+    else if (argument == "--package-root") packageRoots.emplace_back(value);
     else if (argument == "--left-index") leftIndexes.emplace_back(value);
     else if (argument == "--right-index") rightIndexes.emplace_back(value);
     else if (argument == "--file") file = value;
     else if (argument == "--input") input = value;
+    else if (argument == "--output") output = value;
     else if (argument == "--unit-map") unitMap = value;
     else if (argument == "--unit") unit = value;
     else if (argument == "--legacy-unit") legacyUnit = value;
     else if (argument == "--name" || argument == "--symbol") name = value;
+    else if (argument == "--type") typeName = value;
     else if (argument == "--kind") kind = value;
     else if (argument == "--qualified-name") qualifiedName = value;
     else if (argument == "--class") className = value;
@@ -234,14 +405,60 @@ int runQuery(std::string_view command, int argc, char** argv) {
     else if (argument == "--line") {
       try { line = std::stoull(value); } catch (...) { std::cerr << "Invalid line number\n"; return 2; }
     } else if (argument == "--dproj") dproj = value;
+    else if (argument == "--query-timeout-ms") {
+      try { queryTimeoutMs = std::stoull(value); } catch (...) { std::cerr << "Invalid query timeout\n"; return 2; }
+    }
     else if (argument == "--config") configuration = value;
     else if (argument == "--platform") platform = value;
     else { std::cerr << "Unknown " << command << " option: " << argument << '\n'; return 2; }
   }
   try {
+    if (command == "batch-diagnose") {
+      if (input.empty() || output.empty() || indexes.empty()) {
+        std::cerr << "batch-diagnose requires --input, --index and --output\n";
+        return 2;
+      }
+      jdelphiast::QueryPerformance performance;
+      const auto loadStarted = std::chrono::steady_clock::now();
+      const auto terms = batchDiagnosticTerms(input);
+      auto rightFuture = std::async(std::launch::async, [&] { return loadFilteredIndexes(indexes, terms); });
+      auto leftFuture = std::async(std::launch::async, [&] { return loadFilteredIndexes(leftIndexes, terms); });
+      auto right = rightFuture.get();
+      auto left = leftFuture.get();
+      performance.indexLoadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - loadStarted).count();
+      performance.cacheHit = false;
+      const auto result = jdelphiast::batchDiagnoseJson(input, right, left, unitMap, queryTimeoutMs, performance);
+      writeAtomic(output, result + "\n");
+      std::cout << result << '\n';
+      return 0;
+    }
     if (command == "compiler-log") {
       if (input.empty()) { std::cerr << "compiler-log requires --input\n"; return 2; }
-      std::cout << jdelphiast::compilerLogJson(input) << '\n';
+      jdelphiast::QueryPerformance performance;
+      performance.timeoutMs = queryTimeoutMs;
+      std::cout << jdelphiast::compilerLogJson(input, performance) << '\n';
+      return 0;
+    }
+    if (command == "type-info" || command == "symbol-origin") {
+      if ((command == "type-info" ? typeName.empty() : name.empty()) || indexes.empty()) {
+        std::cerr << command << " requires " << (command == "type-info" ? "--type" : "--name") << " and --index\n";
+        return 2;
+      }
+      jdelphiast::QueryPerformance performance;
+      performance.timeoutMs = queryTimeoutMs;
+      auto loaded = loadFilteredIndexes(indexes, {command == "type-info" ? typeName : name}, &performance);
+      const auto packageStarted = std::chrono::steady_clock::now();
+      jdelphiast::enrichPackageMetadata(loaded, packageRoots);
+      performance.packageEnrichmentMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - packageStarted).count();
+      if (performance.indexLoadMs + performance.packageEnrichmentMs >= static_cast<long long>(queryTimeoutMs)) {
+        std::cout << queryTimeoutJson("2.3", performance) << '\n';
+        return 0;
+      }
+      if (command == "type-info")
+        std::cout << jdelphiast::typeInfoJson(typeName, loaded, includeInherited, includeOverloads, performance) << '\n';
+      else std::cout << jdelphiast::symbolOriginJson(name, loaded, performance) << '\n';
       return 0;
     }
     if (command == "compare-symbol") {
@@ -259,12 +476,27 @@ int runQuery(std::string_view command, int argc, char** argv) {
                   << (command == "legacy-refs" ? "--legacy-unit\n" : "--symbol\n");
         return 2;
       }
-      std::vector<jdelphiast::IndexedUnit> left, right;
-      for (const auto& path : leftIndexes) { auto loaded = jdelphiast::loadSymbolIndex(path); left.insert(left.end(), loaded.begin(), loaded.end()); }
-      for (const auto& path : rightIndexes) { auto loaded = jdelphiast::loadSymbolIndex(path); right.insert(right.end(), loaded.begin(), loaded.end()); }
+      jdelphiast::QueryPerformance performance;
+      performance.timeoutMs = queryTimeoutMs;
+      const auto loadStarted = std::chrono::steady_clock::now();
+      auto terms = diagnosticTerms(file, command == "legacy-refs" ? legacyUnit : name);
+      if (command == "model-migration") {
+        const std::vector<std::string> modelTerms = {"EnableOnChange", "FieldValues", "GetCsField", "CSSeek", "CSModify", "CSResetCampi"};
+        terms.insert(terms.end(), modelTerms.begin(), modelTerms.end());
+      }
+      auto leftFuture = std::async(std::launch::async, [&] { return loadFilteredIndexes(leftIndexes, terms); });
+      auto rightFuture = std::async(std::launch::async, [&] { return loadFilteredIndexes(rightIndexes, terms); });
+      auto left = leftFuture.get();
+      auto right = rightFuture.get();
+      performance.indexLoadMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - loadStarted).count();
+      performance.cacheHit = false;
+      if (performance.indexLoadMs >= static_cast<long long>(queryTimeoutMs)) {
+        std::cout << queryTimeoutJson("2.2", performance) << '\n';
+        return 0;
+      }
       if (command == "legacy-refs")
-        std::cout << jdelphiast::legacyReferencesJson(file, legacyUnit, left, right, unitMap) << '\n';
-      else std::cout << jdelphiast::modelMigrationJson(file, name, left, right, unitMap) << '\n';
+        std::cout << jdelphiast::legacyReferencesJson(file, legacyUnit, left, right, unitMap, performance) << '\n';
+      else std::cout << jdelphiast::modelMigrationJson(file, name, left, right, unitMap, performance) << '\n';
       return 0;
     }
     if (command == "diagnose") {
@@ -272,16 +504,51 @@ int runQuery(std::string_view command, int argc, char** argv) {
         std::cerr << "diagnose requires --file, --line, --error-code and --index\n";
         return 2;
       }
-      std::vector<jdelphiast::IndexedUnit> left;
-      for (const auto& path : leftIndexes) { auto loaded = jdelphiast::loadSymbolIndex(path); left.insert(left.end(), loaded.begin(), loaded.end()); }
+      const auto terms = diagnosticTerms(file, name, line);
+      jdelphiast::QueryPerformance performance;
+      performance.timeoutMs = queryTimeoutMs;
+      const auto loadStarted = std::chrono::steady_clock::now();
+      auto leftFuture = std::async(std::launch::async, [&] { return loadFilteredIndexes(leftIndexes, terms); });
+      auto rightFuture = std::async(std::launch::async, [&] { return loadFilteredIndexes(indexes, terms); });
+      auto left = leftFuture.get();
+      auto right = rightFuture.get();
+      performance.indexLoadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - loadStarted).count();
+      const auto packageStarted = std::chrono::steady_clock::now();
+      jdelphiast::enrichPackageMetadata(right, packageRoots);
+      performance.packageEnrichmentMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - packageStarted).count();
+      if (performance.indexLoadMs + performance.packageEnrichmentMs >= static_cast<long long>(queryTimeoutMs)) {
+        std::cout << queryTimeoutJson("2.2", performance) << '\n';
+        return 0;
+      }
+      if (!dproj.empty()) {
+        jdelphiast::ProjectOptions projectOptions;
+        projectOptions.dprojFile = dproj;
+        projectOptions.configuration = configuration;
+        projectOptions.platform = platform;
+        const auto project = jdelphiast::loadPackage(packageFromDproj(dproj), projectOptions);
+        jdelphiast::mergeProjectSymbols(right, project.analyzer.analyze());
+      }
       jdelphiast::DiagnoseOptions options;
       options.file = file; options.dproj = dproj; options.unitMap = unitMap;
       options.configuration = configuration; options.platform = platform;
-      options.errorCode = errorCode; options.symbol = name; options.line = line;
-      std::cout << jdelphiast::diagnoseJson(options, loadIndexes(indexes), left) << '\n';
+      options.errorCode = errorCode; options.symbol = name; options.line = line; options.performance = performance;
+      options.timeoutMs = queryTimeoutMs;
+      std::cout << jdelphiast::diagnoseJson(options, right, left) << '\n';
       return 0;
     }
-    auto loaded = loadIndexes(indexes);
+    jdelphiast::QueryPerformance performance;
+    performance.timeoutMs = queryTimeoutMs;
+    auto loaded = (command == "unit-info" ? loadFilteredIndexes(indexes, {unit}, &performance) :
+                   command == "symbol" ? loadFilteredIndexes(indexes, {name}, &performance) :
+                   loadIndexes(indexes, &performance));
+    jdelphiast::enrichPackageMetadata(loaded, packageRoots);
+    if ((command == "unit-info" || command == "symbol") &&
+        performance.indexLoadMs + performance.packageEnrichmentMs >= static_cast<long long>(queryTimeoutMs)) {
+      std::cout << queryTimeoutJson(command == "unit-info" ? "2.1" : "2.1", performance) << '\n';
+      return 0;
+    }
     if (!dproj.empty() && (command == "expression" || command == "hierarchy")) {
       jdelphiast::ProjectOptions options;
       options.dprojFile = dproj;
@@ -310,10 +577,10 @@ int runQuery(std::string_view command, int argc, char** argv) {
       std::cout << jdelphiast::exportsJson(file.empty() ? std::filesystem::path(unit) : file, loaded) << '\n';
     } else if (command == "symbol") {
       if (name.empty()) { std::cerr << "symbol requires --name\n"; return 2; }
-      std::cout << jdelphiast::symbolJson({name, unit, kind, qualifiedName}, loaded) << '\n';
+      std::cout << jdelphiast::symbolJson({name, unit, kind, qualifiedName}, loaded, performance) << '\n';
     } else if (command == "unit-info") {
       if (unit.empty()) { std::cerr << "unit-info requires --unit\n"; return 2; }
-      std::cout << jdelphiast::unitInfoJson(unit, loaded) << '\n';
+      std::cout << jdelphiast::unitInfoJson(unit, loaded, performance) << '\n';
     } else if (command == "expression") {
       if (file.empty() || line == 0) { std::cerr << "expression requires --file and --line\n"; return 2; }
       std::cout << jdelphiast::expressionJson(file, line, loaded) << '\n';

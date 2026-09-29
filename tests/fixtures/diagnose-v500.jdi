@@ -1,3 +1,4 @@
 # JDelphiAST symbol index v2
-UVariStd|SQLStr|partial|function,SQLStr,string,function%20SQLStr%28Value%3A%20string%29%3A%20string|source=K:/V0500/UVariStd.pas;version=v500
-CSStdExt|TCSFields,EnableOnChange,FieldValues,GetCsField,CSSeek,CSModify,CSResetCampi||class,TCSFields,,class%20TCSFields|source=K:/V0500/CSStdExt.pas;version=v500
+UVariStd|SQLStr,CS_VariantTo_SqlStr|partial|function,SQLStr,string,function%20SQLStr%28Value%3A%20string%29%3A%20string;function,CS_VariantTo_SqlStr,string,function%20CS_VariantTo_SqlStr%28Value%3A%20Variant%29%3A%20string|source=K:/V0500/UVariStd.pas;version=v500
+CSStdExt|TCSFields,EnableOnChange,FieldValues,GetCsField,CSSeek,CSModify,CSResetCampi,RegObjStdD2||class,TCSFields,,class%20TCSFields;procedure,RegObjStdD2,,procedure%20RegObjStdD2%28Value%3A%20Variant%29|source=K:/V0500/CSStdExt.pas;version=v500
+Legacy.Table.Utils|TUtils_Table||class,TUtils_Table,,class%20TUtils_Table|source=K:/V0500/Legacy/Table/Utils.pas;version=v500;package=M_Legacy;dcp=M_Legacy.dcp;bpl=M_Legacy.bpl

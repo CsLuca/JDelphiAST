@@ -49,8 +49,9 @@ int main() {
   const auto diagnosticRight = jdelphiast::loadSymbolIndex(fixtures / "diagnose-v600.jdi");
   jdelphiast::DiagnoseOptions diagnoseOptions;
   diagnoseOptions.file = fixtures / "DiagnosticCalls.pas";
-  diagnoseOptions.line = 16;
+  diagnoseOptions.line = 15;
   diagnoseOptions.errorCode = "E2010";
+  diagnoseOptions.unitMap = fixtures / "diagnostic-unit-map.json";
   const auto diagnosis = jdelphiast::diagnoseJson(diagnoseOptions, diagnosticRight, diagnosticLeft);
   require(diagnosis.find("PrdRT.Utils.GetColumnMaxLength") != std::string::npos &&
               diagnosis.find("\"member\":\"GetColumnMaxLength\"") != std::string::npos &&
@@ -58,14 +59,40 @@ int main() {
               diagnosis.find("\"match_score\":100") != std::string::npos &&
               diagnosis.find(".Add\"") == std::string::npos &&
               diagnosis.find("\"inferred_type\":\"TAziendaStd\"") != std::string::npos &&
+              diagnosis.find("\"type_confidence\":\"high\"") != std::string::npos &&
+              diagnosis.find("\"type_source\":\"parameter\"") != std::string::npos &&
+              diagnosis.find("\"v500_unit\":\"Legacy.Table.Utils\"") != std::string::npos &&
+              diagnosis.find("\"mapping_source\":\"unit_map\"") != std::string::npos &&
+              diagnosis.find("\"qualifier_match\":\"exact\"") != std::string::npos &&
               diagnosis.find("\"name\":\"M_PrdRT\"") != std::string::npos,
           "diagnose returns call signature, argument type, and package metadata");
+  require(diagnosis.find("Azienda.Connection") == std::string::npos &&
+              diagnosis.find("\"recommended_action\":\"review_required\"") != std::string::npos,
+          "TAziendaStd and connection overloads prevent an automatic argument replacement");
+  auto uniqueConnectionTarget = diagnosticRight;
+  for (auto& unit : uniqueConnectionTarget) if (unit.name == "PrdRT.Utils") {
+    unit.declarations.erase(std::remove_if(unit.declarations.begin(), unit.declarations.end(), [](const auto& declaration) {
+      return declaration.name == "TUtils_Table.GetColumnMaxLength" && !declaration.parameters.empty() &&
+             declaration.parameters.front().type == "TAziendaStd";
+    }), unit.declarations.end());
+  }
+  const auto connectionFix = jdelphiast::diagnoseJson(diagnoseOptions, uniqueConnectionTarget, diagnosticLeft);
+  require(connectionFix.find("\"recommended_action\":\"replace_argument\"") != std::string::npos &&
+              connectionFix.find("\"suggested_fixes\":[{\"kind\":\"replace_argument\"") != std::string::npos &&
+              connectionFix.find("\"replacement\":\"Azienda.Connection\"") != std::string::npos &&
+              connectionFix.find("\"suggestion_confidence\":\"high\"") != std::string::npos,
+          "a unique connection overload emits an exact high-confidence argument fix");
   diagnoseOptions.line = 21;
   const auto nestedDiagnosis = jdelphiast::diagnoseJson(diagnoseOptions, diagnosticRight, diagnosticLeft);
   require(nestedDiagnosis.find("\"member\":\"GetColumnMaxLength\"") != std::string::npos &&
               nestedDiagnosis.find("\"nesting_depth\":1") != std::string::npos &&
               nestedDiagnosis.find("Data.DB.Add") == std::string::npos,
           "diagnose selects the inner incompatible call and excludes outer Add candidates");
+  diagnoseOptions.line = 16;
+  const auto dbExecDiagnosis = jdelphiast::diagnoseJson(diagnoseOptions, diagnosticRight, diagnosticLeft);
+  require(dbExecDiagnosis.find("\"expression\":\"DBExec\",\"type\":\"TCSEDatabase\"") != std::string::npos &&
+              dbExecDiagnosis.find("\"type_source\":\"parameter\"") != std::string::npos,
+          "diagnose infers DBExec from the enclosing method parameter");
   jdelphiast::DiagnoseOptions buildOptions;
   buildOptions.file = fixtures / "DiagnosticCalls.pas";
   buildOptions.line = 1;
@@ -74,7 +101,9 @@ int main() {
   buildOptions.unitMap = fixtures / "diagnostic-unit-map.json";
   const auto buildDiagnosis = jdelphiast::diagnoseJson(buildOptions, diagnosticRight, diagnosticLeft);
   require(buildDiagnosis.find("\"classification\":\"namespace_mapping\"") != std::string::npos &&
-              buildDiagnosis.find("\"recommended_action\":\"replace_in_uses\"") != std::string::npos,
+              buildDiagnosis.find("\"recommended_action\":\"replace_in_uses\"") != std::string::npos &&
+              buildDiagnosis.find("\"suggested_fixes\":[{\"kind\":\"replace_in_uses\"") != std::string::npos &&
+              buildDiagnosis.find("\"replacement\":\"Vcl.Mask\"") != std::string::npos,
           "F2613 uses only a verified namespace mapping");
   buildOptions.errorCode = "E2003";
   buildOptions.symbol = "CercaPrezzoStd";
@@ -100,14 +129,19 @@ int main() {
 
   jdelphiast::DiagnoseOptions execOptions;
   execOptions.file = fixtures / "ApiCalls.pas";
-  execOptions.line = 19;
+  execOptions.line = 22;
   execOptions.errorCode = "E2010";
   const auto execSql = jdelphiast::diagnoseJson(execOptions, diagnosticRight, diagnosticLeft);
   require(execSql.find("\"classification\":\"return_type_mismatch\"") != std::string::npos &&
               execSql.find("\"automatic_migration_safe\":false") != std::string::npos &&
               execSql.find("Return type changes error-handling semantics") != std::string::npos,
           "ExecSql return changes remain review-required");
-  execOptions.line = 20;
+  execOptions.line = 23;
+  const auto globalDbExec = jdelphiast::diagnoseJson(execOptions, diagnosticRight, diagnosticLeft);
+  require(globalDbExec.find("\"expression\":\"DBCfg\",\"type\":\"TCSEDatabase\"") != std::string::npos &&
+              globalDbExec.find("\"type_source\":\"global\"") != std::string::npos,
+          "diagnose infers DBCfg from a global Delphi declaration");
+  execOptions.line = 24;
   const auto bareExecSql = jdelphiast::diagnoseJson(execOptions, diagnosticRight, diagnosticLeft);
   require(bareExecSql.find("\"api_name\":\"ExecSQL\"") != std::string::npos &&
               bareExecSql.find("\"classification\":\"return_type_mismatch\"") != std::string::npos,
@@ -125,13 +159,20 @@ int main() {
       fixtures / "LegacyRefs.pas", "UVariStd", diagnosticLeft, diagnosticRight,
       fixtures / "diagnostic-unit-map.json");
   require(legacyRefs.find("\"symbol\":\"ArrayCopia\"") != std::string::npos &&
-              legacyRefs.find("\"references\":[],\"unresolved_active_references\":[{") != std::string::npos &&
+              legacyRefs.find("\"unresolved_active_references\":[{") != std::string::npos &&
               legacyRefs.find("\"mapping_status\":\"ambiguous\"") != std::string::npos &&
               legacyRefs.find("\"symbol\":\"Add\"") == std::string::npos &&
               legacyRefs.find("ambiguous:Add") == std::string::npos &&
               legacyRefs.find("\"ignored_generic_references_count\":") != std::string::npos &&
               legacyRefs.find("\"allowed\":false") != std::string::npos,
           "active references from a partial legacy index remain visible and block removal");
+  require(legacyRefs.find("\"symbol\":\"CS_VariantTo_SqlStr\"") != std::string::npos &&
+              legacyRefs.find("\"v500_owner_unit\":\"UVariStd\"") != std::string::npos &&
+              legacyRefs.find("\"v600_owner_unit\":\"CSResources.Utils\"") != std::string::npos &&
+              legacyRefs.find("\"mapping_status\":\"verified\"") != std::string::npos &&
+              legacyRefs.find("\"symbol\":\"RegObjStdD2\"") != std::string::npos &&
+              legacyRefs.find("\"v500_owner_unit\":\"CSStdExt\"") != std::string::npos,
+          "legacy references preserve unique V500 and V600 symbol owners");
   auto completeLegacy = diagnosticLeft;
   for (auto& unit : completeLegacy) if (unit.name == "UVariStd") {
     unit.complete = true;
@@ -144,9 +185,9 @@ int main() {
   const auto provenLegacyRefs = jdelphiast::legacyReferencesJson(
       fixtures / "LegacyRefs.pas", "UVariStd", completeLegacy, diagnosticRight,
       fixtures / "diagnostic-unit-map.json");
-  require(provenLegacyRefs.find("\"references\":[{\"symbol\":\"ArrayCopia\"") != std::string::npos &&
+  require(provenLegacyRefs.find("\"symbol\":\"ArrayCopia\"") != std::string::npos &&
               provenLegacyRefs.find("\"mapping_status\":\"legacy_symbol_unmapped\"") != std::string::npos &&
-              provenLegacyRefs.find("\"reason\":\"legacy_symbol_unmapped:ArrayCopia\"") != std::string::npos,
+              provenLegacyRefs.find("\"reason\":\"legacy_symbol_unmapped:") != std::string::npos,
           "a proven legacy export is reported without treating an unrelated V600 homonym as a relocation");
 
   const auto model = jdelphiast::modelMigrationJson(
@@ -154,10 +195,45 @@ int main() {
       fixtures / "diagnostic-unit-map.json");
   require(model.find("EnableOnChange") != std::string::npos && model.find("FieldValues") != std::string::npos &&
               model.find("\"type_exists\":true") != std::string::npos &&
+              model.find("\"unit\":\"CSStdExt\"") != std::string::npos &&
+              model.find("\"exported_members\":[") != std::string::npos &&
               model.find("K:/V0600/Core/CSCore/Source/CSFields.pas") != std::string::npos &&
               model.find("GetCsField") != std::string::npos && model.find("CSSeek") != std::string::npos &&
               model.find("\"classification\":\"legacy_model_migration_required\"") != std::string::npos,
           "TCSFields model migration separates compatible and unresolved members");
+
+  const auto databaseType = jdelphiast::typeInfoJson("TCSEDatabase", diagnosticRight, true, true);
+  require(databaseType.find("\"schema_version\":\"2.3\"") != std::string::npos &&
+              databaseType.find("\"unit\":\"CSData.CSETables\"") != std::string::npos &&
+              databaseType.find("\"name\":\"ExecSql\"") != std::string::npos &&
+              databaseType.find("\"return_type\":\"Integer\"") != std::string::npos,
+          "type-info returns TCSEDatabase methods and package metadata");
+  const auto tableUtilsType = jdelphiast::typeInfoJson("TUtils_Table", diagnosticRight, true, true);
+  require(tableUtilsType.find("\"name\":\"GetColumnMaxLength\"") != std::string::npos &&
+              tableUtilsType.find("\"overload\":true") != std::string::npos &&
+              tableUtilsType.find("\"reintroduced\":true") != std::string::npos,
+          "type-info preserves overload and reintroduce metadata");
+  const auto companyType = jdelphiast::typeInfoJson("TAziendaStd", diagnosticRight, true, true);
+  const auto connectionType = jdelphiast::typeInfoJson("IERPConnection", diagnosticRight, true, true);
+  const auto queryType = jdelphiast::typeInfoJson("TCSEQuery", diagnosticRight, true, true);
+  require(companyType.find("\"name\":\"Connection\"") != std::string::npos &&
+              companyType.find("\"inherited\":true") != std::string::npos &&
+              connectionType.find("\"unit\":\"CSCore.Interfaces\"") != std::string::npos &&
+              queryType.find("\"unit\":\"CSData.CSETables\"") != std::string::npos,
+          "type-info resolves TAziendaStd, IERPConnection, and TCSEQuery");
+  const auto inheritedModel = jdelphiast::typeInfoJson("TDerivedModel", diagnosticRight, true, true);
+  const auto directModel = jdelphiast::typeInfoJson("TDerivedModel", diagnosticRight, false, true);
+  require(inheritedModel.find("\"name\":\"GetList\"") != std::string::npos &&
+              inheritedModel.find("\"name\":\"GetKey\"") != std::string::npos &&
+              inheritedModel.find("\"inherited\":true") != std::string::npos &&
+              directModel.find("\"name\":\"GetList\"") == std::string::npos,
+          "type-info includes inherited GetList and GetKey only when requested");
+
+  const auto symbolOrigin = jdelphiast::symbolOriginJson("TCSEOLEDBRowset", oleRight);
+  require(symbolOrigin.find("\"active_source_evidence\":[{") != std::string::npos &&
+              symbolOrigin.find("\"classification\":\"ambiguous\"") != std::string::npos &&
+              symbolOrigin.find("FireDAC") == std::string::npos,
+          "symbol-origin returns V600 evidence without inventing a FireDAC provider");
 
   const auto compilerLog = jdelphiast::compilerLogJson(fixtures / "dcc32-errors.log");
   require(compilerLog.find("\"ordinal\":1,\"file\":\"PI_PulsarEngineering_GenPIeLV_Models.pas\",\"line\":391") != std::string::npos &&
@@ -165,6 +241,8 @@ int main() {
               compilerLog.find("\"first_actionable_error\":{\"ordinal\":1") != std::string::npos &&
               compilerLog.find("\"error_groups\":[{\"file\":\"PI_PulsarEngineering_GenPIeLV_Models.pas\",\"code\":\"E2010\",\"count\":2,\"lines\":[391,429]") != std::string::npos,
           "compiler log preserves output order and selects the first E2010 error");
+  require(compilerLog.find("\"query_performance\":{") != std::string::npos,
+          "diagnostic queries expose additive performance metrics");
 
   const auto exports = jdelphiast::exportsJson("CSControls.Theme", right);
   require(exports.find("CSGlobalTheme") != std::string::npos && exports.find("TCSTheme") != std::string::npos,
@@ -203,6 +281,16 @@ int main() {
   require(unitMap.json.find("\"v500_unit\":\"ComCtrls\"") != std::string::npos &&
               unitMap.json.find("\"mapping_type\":\"namespace_migration\"") != std::string::npos,
           "standard namespace migrations are classified explicitly");
+  require(unitMap.json.find("\"v500_unit\":\"Mask\"") != std::string::npos &&
+              unitMap.json.find("\"v600_unit\":\"Vcl.Mask\"") != std::string::npos &&
+              unitMap.json.find("\"v500_unit\":\"Generics.Defaults\"") != std::string::npos &&
+              unitMap.json.find("\"v600_unit\":\"System.Generics.Defaults\"") != std::string::npos,
+          "Mask and Generics.Defaults are available as high-confidence namespace mappings");
+  require(unitMap.json.find("\"v500_unit\":\"Mask\"") != std::string::npos &&
+              unitMap.json.find("\"v600_unit\":\"Vcl.Mask\"") != std::string::npos &&
+              unitMap.json.find("\"v500_unit\":\"Generics.Defaults\"") != std::string::npos &&
+              unitMap.json.find("\"v600_unit\":\"System.Generics.Defaults\"") != std::string::npos,
+          "Mask and Generics.Defaults namespace mappings are available with the standard seed");
   require(unitMap.json.find("\"matched_exports\":[\"CSGlobalTheme\"") != std::string::npos,
           "CSGlobalTheme is compared as a public unit export");
   require(unitMap.csv.find("v500_unit,v600_unit") != std::string::npos &&

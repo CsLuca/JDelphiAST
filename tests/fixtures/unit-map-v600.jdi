@@ -8,3 +8,5 @@ Vcl.ActnList|TActionList,TAction|||source=K:/V0600/Vcl.ActnList.pas;version=v600
 System.Generics.Collections|TList,TDictionary|||source=K:/V0600/System.Generics.Collections.pas;version=v600
 System.Win.ComObj|CreateOleObject|||source=K:/V0600/System.Win.ComObj.pas;version=v600
 Vcl.Clipbrd|Clipboard,TClipboard|||source=K:/V0600/Vcl.Clipbrd.pas;version=v600
+Vcl.Mask|TMaskEdit|||source=K:/V0600/Vcl.Mask.pas;version=v600
+System.Generics.Defaults|IComparer|||source=K:/V0600/System.Generics.Defaults.pas;version=v600

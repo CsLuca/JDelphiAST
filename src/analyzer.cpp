@@ -380,6 +380,7 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
                !word(tokens[directive], "begin") && !word(tokens[directive], "implementation")) {
           if (word(tokens[directive], "overload")) declaration.overload = true;
           if (word(tokens[directive], "override")) declaration.isOverride = true;
+          if (word(tokens[directive], "reintroduce")) declaration.reintroduced = true;
           if (word(tokens[directive], "deprecated")) declaration.deprecated = true;
           ++directive;
         }
@@ -422,10 +423,23 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
       while (tokens[n].kind != TokenKind::End && !word(tokens[n], "implementation") &&
              !word(tokens[n], "type") && !word(tokens[n], "const") && !word(tokens[n], "uses") &&
              !word(tokens[n], "procedure") && !word(tokens[n], "function")) {
-        if (tokens[n].kind == TokenKind::Identifier && tokens[n + 1].text == ":") {
+        if (tokens[n].kind == TokenKind::Identifier && tokens[n + 1].text == ":" &&
+            tokens[n + 2].kind == TokenKind::Identifier) {
           ast.exports.push_back({tokens[n].text, "variable", tokens[n].range});
           ownNames.insert(canonical(tokens[n].text));
           excluded.insert(n);
+          std::size_t typeEnd = n + 2;
+          SourceRange typeRange;
+          const auto type = qualifiedName(tokens, typeEnd, &typeRange);
+          AstDeclaration declaration;
+          declaration.kind = "variable";
+          declaration.name = tokens[n].text;
+          declaration.visibility = "public";
+          declaration.type = type;
+          declaration.scope = ast.name;
+          declaration.range = {tokens[n].range.begin, typeRange.end};
+          ast.declarations.push_back(std::move(declaration));
+          variableTypes[canonical(tokens[n].text)] = type;
         }
         ++n;
       }
@@ -643,6 +657,7 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
         for (std::size_t d = cursor; tokens[d].kind != TokenKind::End && d < cursor + 16 && tokens[d].text != ";"; ++d) {
           if (word(tokens[d], "overload")) declaration.overload = true;
           if (word(tokens[d], "override")) declaration.isOverride = true;
+          if (word(tokens[d], "reintroduce")) declaration.reintroduced = true;
           if (word(tokens[d], "deprecated")) declaration.deprecated = true;
         }
         ast.declarations.push_back(std::move(declaration));

@@ -4,6 +4,9 @@ interface
 
 uses CSData, FireDAC.Comp.Client;
 
+var
+  DBCfg: TCSEDatabase;
+
 procedure Run;
 
 implementation
@@ -17,6 +20,7 @@ var
   numRec: Integer;
 begin
   LMsgErr := AObjDB.ExecSql(LStrSQL);
+  LMsgErr := DBCfg.ExecSql(LStrSQL);
   numRec := Qry.ExecSQL;
 end;
 

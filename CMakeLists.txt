@@ -196,7 +196,39 @@ if(JDELPHIAST_BUILD_TESTS)
   set_tests_properties(jdelphiast_cli_model_migration PROPERTIES PASS_REGULAR_EXPRESSION "legacy_model_migration_required")
   add_test(NAME jdelphiast_cli_diagnose
     COMMAND DelphiAstTool diagnose --file ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/DiagnosticCalls.pas
-      --line 16 --error-code E2010 --index ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnose-v600.jdi
+      --line 15 --error-code E2010 --index ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnose-v600.jdi
       --left-index ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnose-v500.jdi --format json)
   set_tests_properties(jdelphiast_cli_diagnose PROPERTIES PASS_REGULAR_EXPRESSION "PrdRT.Utils.GetColumnMaxLength")
+  add_test(NAME jdelphiast_cli_diagnose_timeout
+    COMMAND DelphiAstTool diagnose --file ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/DiagnosticCalls.pas
+      --line 15 --error-code E2010 --index ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnose-v600.jdi
+      --query-timeout-ms 0 --format json)
+  set_tests_properties(jdelphiast_cli_diagnose_timeout PROPERTIES PASS_REGULAR_EXPRESSION "query_timeout")
+  add_test(NAME jdelphiast_cli_diagnose_project_environment
+    COMMAND DelphiAstTool diagnose --dproj ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/DemoPackage.dproj
+      --file ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/package/Demo.Main.pas --line 19 --error-code E2010
+      --index ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/v600.jdi --format json)
+  set_tests_properties(jdelphiast_cli_diagnose_project_environment PROPERTIES PASS_REGULAR_EXPRESSION "Demo.Shared.MakeValue")
+  add_test(NAME jdelphiast_cli_type_info
+    COMMAND DelphiAstTool type-info --type TCSEDatabase --index ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnose-v600.jdi
+      --include-inherited --include-overloads --format json)
+  set_tests_properties(jdelphiast_cli_type_info PROPERTIES PASS_REGULAR_EXPRESSION "schema_version.*2.3.*TCSEDatabase.*ExecSql")
+  add_test(NAME jdelphiast_cli_symbol_origin
+    COMMAND DelphiAstTool symbol-origin --name TCSEOLEDBRowset --index ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnose-v600.jdi --format json)
+  set_tests_properties(jdelphiast_cli_symbol_origin PROPERTIES PASS_REGULAR_EXPRESSION "TCSEOLEDBRowset.*ambiguous")
+  add_test(NAME jdelphiast_cli_batch_diagnose
+    COMMAND DelphiAstTool batch-diagnose --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/batch-diagnose.json
+      --index ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnose-v600.jdi
+      --left-index ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnose-v500.jdi
+      --unit-map ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnostic-unit-map.json
+      --output ${CMAKE_CURRENT_BINARY_DIR}/batch-diagnose-result.json --query-timeout-ms 10000 --format json)
+  set_tests_properties(jdelphiast_cli_batch_diagnose PROPERTIES
+    PASS_REGULAR_EXPRESSION "request_count.*10.*index_load_count.*1")
+  add_test(NAME jdelphiast_cli_batch_diagnose_error_isolation
+    COMMAND ${CMAKE_COMMAND}
+      -DTOOL=$<TARGET_FILE:DelphiAstTool> -DEXPECT_EXIT=0 -DEXPECT_TEXT=query_execution_failed
+      -DEXPECT_PRESENT_FILE=${CMAKE_CURRENT_BINARY_DIR}/batch-diagnose-isolation.json
+      -DEXPECT_FILE_TEXT=GetColumnMaxLength.*request_count.*10
+      "-DARGS=batch-diagnose;--input;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/batch-diagnose.json;--index;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnose-v600.jdi;--left-index;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnose-v500.jdi;--unit-map;${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnostic-unit-map.json;--output;${CMAKE_CURRENT_BINARY_DIR}/batch-diagnose-isolation.json;--format;json"
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_command.cmake)
 endif()

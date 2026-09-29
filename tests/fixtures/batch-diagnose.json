@@ -1,0 +1,14 @@
+{
+  "requests": [
+    {"file":"DiagnosticCalls.pas","line":15,"error_code":"E2010"},
+    {"file":"DiagnosticCalls.pas","line":21,"error_code":"E2010"},
+    {"file":"ApiCalls.pas","line":22,"error_code":"E2010"},
+    {"file":"ApiCalls.pas","line":23,"error_code":"E2010"},
+    {"file":"ApiCalls.pas","line":24,"error_code":"E2010"},
+    {"file":"DiagnosticCalls.pas","line":17,"error_code":"E2250"},
+    {"file":"DiagnosticCalls.pas","line":1,"error_code":"E2003","symbol":"TCSEOLEDBRowset"},
+    {"file":"DiagnosticCalls.pas","line":1,"error_code":"E2003","symbol":"CercaPrezzoStd"},
+    {"file":"does-not-exist.pas","line":1,"error_code":"E2003","symbol":"Missing"},
+    {"file":"DiagnosticCalls.pas","line":1,"error_code":"F2613","symbol":"Mask"}
+  ]
+}

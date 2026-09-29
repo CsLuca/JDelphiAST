@@ -15,6 +15,8 @@ begin
   Format('%s', [Value]);
   IndexOf(Value);
   FieldByName('Code');
+  CS_VariantTo_SqlStr(Value);
+  RegObjStdD2(Value);
   ArrayCopia(Value);
 end;
 

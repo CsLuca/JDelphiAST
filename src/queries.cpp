@@ -2,10 +2,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <fstream>
 #include <iterator>
 #include <optional>
-#include <regex>
 #include <set>
 #include <sstream>
 #include <unordered_set>
@@ -99,6 +99,7 @@ void writeDeclaration(std::ostringstream& output, const IndexedUnit& unit,
            << escape(parameter.modifier) << "\"}";
   }
   output << "],\"overload\":" << (declaration.overload ? "true" : "false")
+         << ",\"reintroduced\":" << (declaration.reintroduced ? "true" : "false")
          << ",\"package\":{\"name\":";
   if (unit.packageName.empty()) output << "null"; else output << '"' << escape(unit.packageName) << '"';
   output << ",\"dcp\":";
@@ -368,10 +369,13 @@ std::string exportsJson(const std::filesystem::path& requested, const std::vecto
   return output.str();
 }
 
-std::string symbolJson(const SymbolQuery& query, const std::vector<IndexedUnit>& index) {
+std::string symbolJson(const SymbolQuery& query, const std::vector<IndexedUnit>& index,
+                       QueryPerformance performance) {
+  const auto started = std::chrono::steady_clock::now();
   std::ostringstream output;
   output << "{\"schema_version\":\"2.1\",\"query\":{\"name\":\"" << escape(query.name) << "\"},\"matches\":[";
   bool first = true;
+  std::size_t matchCount = 0;
   for (const auto& unit : index) {
     if (!query.unit.empty() && lower(unit.name) != lower(query.unit)) continue;
     for (const auto* declaration : matchingDeclarations(unit, query.name, query.kind)) {
@@ -379,6 +383,7 @@ std::string symbolJson(const SymbolQuery& query, const std::vector<IndexedUnit>&
       if (!query.qualifiedName.empty() && lower(qualified) != lower(query.qualifiedName)) continue;
       if (!first) output << ',';
       first = false;
+      ++matchCount;
       writeDeclaration(output, unit, *declaration);
     }
     if (matchingDeclarations(unit, query.name, query.kind).empty() &&
@@ -391,16 +396,19 @@ std::string symbolJson(const SymbolQuery& query, const std::vector<IndexedUnit>&
       declaration.kind = "unknown";
       if (!first) output << ',';
       first = false;
+      ++matchCount;
       writeDeclaration(output, unit, declaration);
     }
   }
   std::vector<std::string> sourceEvidence;
   if (first && !query.name.empty()) {
-    const std::regex token("\\b" + query.name + "\\b", std::regex::icase);
     for (const auto& unit : index) {
-      if (unit.sourceFile.empty() || !std::filesystem::is_regular_file(unit.sourceFile)) continue;
-      const auto source = readFile(unit.sourceFile);
-      if (std::regex_search(source, token)) sourceEvidence.push_back(unit.sourceFile.generic_string());
+      const auto found = std::any_of(unit.sourceEvidence.begin(), unit.sourceEvidence.end(), [&](const auto& evidence) {
+        const auto dot = evidence.symbol.find_last_of('.');
+        const auto simple = evidence.symbol.substr(dot == std::string::npos ? 0 : dot + 1);
+        return lower(simple) == lower(query.name);
+      });
+      if (found && !unit.sourceFile.empty()) sourceEvidence.push_back(unit.sourceFile.generic_string());
       if (sourceEvidence.size() >= 8) break;
     }
   }
@@ -410,17 +418,28 @@ std::string symbolJson(const SymbolQuery& query, const std::vector<IndexedUnit>&
     output << '"' << escape(sourceEvidence[i]) << '"';
   }
   output << "],\"classification\":";
-  if (!sourceEvidence.empty()) output << "\"ambiguous\",\"recommended_action\":\"review_required\",\"reason\":\"symbol_exists_in_v600_but_owner_unit_is_ambiguous\"";
+  if (matchCount > 1 || !sourceEvidence.empty()) output << "\"ambiguous\",\"recommended_action\":\"review_required\",\"reason\":\"symbol_exists_in_v600_but_owner_unit_is_ambiguous\"";
+  else if (matchCount == 1) output << "\"provider_resolved\",\"recommended_action\":\"none\",\"reason\":null";
   else output << "null,\"recommended_action\":\"none\",\"reason\":null";
   output << ",\"diagnostics\":[";
   if (first) writeDiagnostic(output, sourceEvidence.empty() ? "unresolved_symbol" : "ambiguous_symbol_owner",
                              sourceEvidence.empty() ? "Symbol not found in the persistent index."
                                                     : "Symbol exists in indexed V600 sources but its owner unit is ambiguous.");
-  output << "]}";
+  performance.totalMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started).count() + performance.indexLoadMs + performance.packageEnrichmentMs;
+  output << "],\"query_performance\":{\"index_load_ms\":" << performance.indexLoadMs
+         << ",\"index_lookup_ms\":" << performance.indexLookupMs
+         << ",\"source_parse_ms\":" << performance.sourceParseMs
+         << ",\"source_scan_ms\":" << performance.sourceScanMs
+         << ",\"package_enrichment_ms\":" << performance.packageEnrichmentMs
+         << ",\"total_ms\":" << performance.totalMs
+         << ",\"cache_hit\":" << (performance.cacheHit ? "true" : "false") << "}}";
   return output.str();
 }
 
-std::string unitInfoJson(std::string_view requested, const std::vector<IndexedUnit>& index) {
+std::string unitInfoJson(std::string_view requested, const std::vector<IndexedUnit>& index,
+                         QueryPerformance performance) {
+  const auto started = std::chrono::steady_clock::now();
   const auto* unit = findUnit(index, requested);
   std::ostringstream output;
   output << "{\"schema_version\":\"2.1\",\"unit\":\"" << escape(requested)
@@ -446,7 +465,15 @@ std::string unitInfoJson(std::string_view requested, const std::vector<IndexedUn
   output << "],\"diagnostics\":[";
   if (!unit) writeDiagnostic(output, "source_unit_not_indexed", "Unit not found in the persistent index.");
   else if (unit->packageName.empty()) writeDiagnostic(output, "package_metadata_not_available", "Package metadata is not available in the index.");
-  output << "]}";
+  performance.totalMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started).count() + performance.indexLoadMs + performance.packageEnrichmentMs;
+  output << "],\"query_performance\":{\"index_load_ms\":" << performance.indexLoadMs
+         << ",\"index_lookup_ms\":" << performance.indexLookupMs
+         << ",\"source_parse_ms\":" << performance.sourceParseMs
+         << ",\"source_scan_ms\":" << performance.sourceScanMs
+         << ",\"package_enrichment_ms\":" << performance.packageEnrichmentMs
+         << ",\"total_ms\":" << performance.totalMs
+         << ",\"cache_hit\":" << (performance.cacheHit ? "true" : "false") << "}}";
   return output.str();
 }
 
@@ -716,9 +743,9 @@ UnitMapOutput compareUnits(const UnitMapOptions& options, const std::vector<Inde
     }
   }
   const std::unordered_map<std::string, std::string> namespaces = {
-      {"sysutils", "System.SysUtils"}, {"classes", "System.Classes"}, {"forms", "Vcl.Forms"},
+      {"sysutils", "System.SysUtils"}, {"classes", "System.Classes"}, {"forms", "Vcl.Forms"}, {"mask", "Vcl.Mask"},
       {"comctrls", "Vcl.ComCtrls"}, {"actnlist", "Vcl.ActnList"}, {"db", "Data.DB"},
-      {"generics.collections", "System.Generics.Collections"}, {"comobj", "System.Win.ComObj"},
+      {"generics.defaults", "System.Generics.Defaults"}, {"generics.collections", "System.Generics.Collections"}, {"comobj", "System.Win.ComObj"},
       {"clipbrd", "Vcl.Clipbrd"}};
   const std::set<std::string> semanticOnly = {"csmail", "rnote", "uvaristd", "iacquisti", "iquoart",
       "icontatti", "ustamain", "cbfrig", "fsecstdns", "fgridstdns", "cercaprezzostd"};
@@ -743,7 +770,7 @@ UnitMapOutput compareUnits(const UnitMapOptions& options, const std::vector<Inde
       return lower(item.left) == lower(leftUnit.name);
     });
     if (seed != seeds.end()) {
-      mapping.type = "seeded_mapping";
+      mapping.type = seed->type == "namespace_migration" ? "namespace_migration" : "seeded_mapping";
       mapping.compatibility = seed->type == "partial_compatibility" ? "partial_compatible"
                             : seed->type == "relocated_symbols" ? "relocated_symbols"
                             : seed->type == "semantic_migration_required" ? "semantic_migration_required"

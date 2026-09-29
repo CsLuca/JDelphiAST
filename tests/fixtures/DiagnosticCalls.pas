@@ -2,18 +2,18 @@ unit DiagnosticCalls;
 
 interface
 
-uses PrdRT.Utils, CSData;
+uses PrdRT.Utils, CSData, Mask;
 
-procedure Run;
+procedure Run(Azienda: TAziendaStd; DBExec: TCSEDatabase);
 
 implementation
 
-procedure Run;
+procedure Run(Azienda: TAziendaStd; DBExec: TCSEDatabase);
 var
-  Azienda: TAziendaStd;
   L: Integer;
 begin
   L := TUtils_Table.GetColumnMaxLength(Azienda, 'AnaLav', 'Codice');
+  L := DBExec.ExecSql('select 1');
   ResolveThing(UnknownValue);
   Add(
     'CodLav',

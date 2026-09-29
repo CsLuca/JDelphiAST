@@ -62,6 +62,7 @@ struct AstDeclaration {
   std::string ownerType;
   bool overload{};
   bool isOverride{};
+  bool reintroduced{};
   bool deprecated{};
 };
 
@@ -183,6 +184,12 @@ struct AnalysisResult {
 };
 
 struct IndexedUnit {
+  struct SourceEvidence {
+    std::string symbol;
+    std::size_t line{};
+    std::size_t column{};
+    std::string usage;
+  };
   std::string name;
   std::vector<std::string> symbols;
   std::vector<AstDeclaration> declarations;
@@ -197,6 +204,7 @@ struct IndexedUnit {
   std::string packageBpl;
   std::filesystem::path sourceProject;
   std::vector<std::string> dependencies;
+  std::vector<SourceEvidence> sourceEvidence;
   std::string origin;
 };
 
