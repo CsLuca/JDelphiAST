@@ -268,6 +268,13 @@ int main() {
                 oledbMultirow.find("\"allowed_action\":null") != std::string::npos,
         "semantic-rule-match classifies OLEDB loops and multi-bindings as report-only");
   }
+  const auto oledbBlob = jdelphiast::semanticRuleMatchJson(
+      "oledb-blob-flow", fixtures / "OleScalarRejected.pas", 69);
+  require(oledbBlob.find("\"matched\":true") != std::string::npos &&
+              oledbBlob.find("\"classification\":\"report_only\"") != std::string::npos &&
+              oledbBlob.find("\"binding_type\":\"binary\"") != std::string::npos &&
+              oledbBlob.find("\"sql_table\":\"Articoli\"") != std::string::npos,
+          "semantic-rule-match classifies binary OLEDB flows as report-only with SQL table evidence");
   for (const auto line : {18U, 30U, 43U, 56U, 70U}) {
     const auto rejected = jdelphiast::semanticRuleMatchJson(
         "oledb-scalar-string", fixtures / "OleScalarRejected.pas", line);
