@@ -314,9 +314,16 @@ std::string compilerLogJson(const std::filesystem::path& input, QueryPerformance
     output << '}';
   }
   output << "],\"first_actionable_error\":";
-  if (errors.empty()) output << "null";
-  else output << "{\"ordinal\":1,\"file\":\"" << escape(errors.front().file)
-              << "\",\"line\":" << errors.front().line << ",\"code\":\"" << escape(errors.front().code) << "\"}";
+  const auto actionable = std::find_if(errors.begin(), errors.end(), [](const Error& error) {
+    const auto severity = lower(error.severity);
+    const auto code = lower(error.code);
+    return (severity == "error" || severity == "fatal") &&
+           !code.empty() && (code.front() == 'e' || code.front() == 'f');
+  });
+  if (actionable == errors.end()) output << "null";
+  else output << "{\"ordinal\":" << std::distance(errors.begin(), actionable) + 1
+              << ",\"file\":\"" << escape(actionable->file)
+              << "\",\"line\":" << actionable->line << ",\"code\":\"" << escape(actionable->code) << "\"}";
   struct Group { std::string file, code; std::vector<std::size_t> lines; };
   std::vector<Group> groups;
   std::unordered_map<std::string, std::size_t> groupByKey;

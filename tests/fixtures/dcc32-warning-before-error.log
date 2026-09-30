@@ -1,0 +1,2 @@
+[dcc32 Warning] UWarning.pas(10): W1000 Symbol 'DeprecatedApi' is deprecated
+[dcc32 Error] UFailure.pas(42): E2003 Undeclared identifier: 'RequiredSymbol'

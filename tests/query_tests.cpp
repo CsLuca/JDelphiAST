@@ -243,6 +243,10 @@ int main() {
           "compiler log preserves output order and selects the first E2010 error");
   require(compilerLog.find("\"query_performance\":{") != std::string::npos,
           "diagnostic queries expose additive performance metrics");
+  const auto warningBeforeError = jdelphiast::compilerLogJson(fixtures / "dcc32-warning-before-error.log");
+  require(warningBeforeError.find("\"ordinal\":1,\"file\":\"UWarning.pas\"") != std::string::npos &&
+              warningBeforeError.find("\"first_actionable_error\":{\"ordinal\":2,\"file\":\"UFailure.pas\",\"line\":42,\"code\":\"E2003\"}") != std::string::npos,
+          "compiler-log retains warnings but selects the first Error or Fatal as actionable");
   require(diagnosis.find("\"suggested_fixes\":[]") != std::string::npos &&
               diagnosis.find("\"query_performance\":{") != std::string::npos,
           "ambiguous diagnostic decisions do not emit automatic edits and expose timings");
