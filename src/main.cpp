@@ -274,6 +274,7 @@ USAGE
   DelphiAstTool.exe type-info --type <name> --index <index.jdi> [--include-inherited] [--include-overloads] --format json
    DelphiAstTool.exe symbol-origin --name <symbol> --index <index.jdi> --format json
    DelphiAstTool.exe semantic-rule-match --rule <id> --file <unit.pas> --line <number> --format json
+   DelphiAstTool.exe legacy-model-candidate --file <unit.pas> --symbol TCSFields --format json
    DelphiAstTool.exe batch-diagnose --input <requests.json> --index <v600.jdi> [options] --output <results.json>
   DelphiAstTool.exe build-query-index --index <file.jdi> [--index <file.jdi> ...] --format json
 
@@ -397,7 +398,7 @@ bool isQueryCommand(std::string_view command) {
          command == "hierarchy" || command == "unit-info" || command == "compare-symbol" ||
          command == "diagnose" || command == "legacy-refs" || command == "model-migration" ||
           command == "compiler-log" || command == "type-info" || command == "symbol-origin" ||
-          command == "semantic-rule-match" || command == "batch-diagnose" || command == "build-query-index";
+          command == "semantic-rule-match" || command == "legacy-model-candidate" || command == "batch-diagnose" || command == "build-query-index";
 }
 
 int runQuery(std::string_view command, int argc, char** argv) {
@@ -522,6 +523,17 @@ int runQuery(std::string_view command, int argc, char** argv) {
           std::chrono::steady_clock::now() - processStarted).count();
       performance.timeoutMs = queryTimeoutMs;
       std::cout << jdelphiast::semanticRuleMatchJson(rule, file, line, performance) << '\n';
+      return 0;
+    }
+    if (command == "legacy-model-candidate") {
+      if (file.empty() || name.empty()) {
+        std::cerr << "legacy-model-candidate requires --file and --symbol\n";
+        return 2;
+      }
+      jdelphiast::QueryPerformance performance;
+      performance.startupMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - processStarted).count();
+      std::cout << jdelphiast::legacyModelCandidateJson(file, name, performance) << '\n';
       return 0;
     }
     if (command == "type-info" || command == "symbol-origin") {

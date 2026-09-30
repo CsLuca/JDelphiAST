@@ -201,6 +201,11 @@ int main() {
               model.find("GetCsField") != std::string::npos && model.find("CSSeek") != std::string::npos &&
               model.find("\"classification\":\"legacy_model_migration_required\"") != std::string::npos,
           "TCSFields model migration separates compatible and unresolved members");
+  const auto modelCandidate = jdelphiast::legacyModelCandidateJson(fixtures / "ModelMigration.pas", "TCSFields");
+  require(modelCandidate.find("\"matched\":true") != std::string::npos &&
+              modelCandidate.find("\"recommended_action\":\"manual_required\"") != std::string::npos &&
+              modelCandidate.find("EnableOnChange") != std::string::npos,
+          "legacy-model-candidate reports TCSFields as manual-required without a patch");
 
   const auto databaseType = jdelphiast::typeInfoJson("TCSEDatabase", diagnosticRight, true, true);
   require(databaseType.find("\"schema_version\":\"2.3\"") != std::string::npos &&

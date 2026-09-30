@@ -84,6 +84,9 @@ struct DiagnoseOptions {
                                                  const std::filesystem::path& file,
                                                  std::size_t line,
                                                  QueryPerformance performance = {});
+[[nodiscard]] std::string legacyModelCandidateJson(const std::filesystem::path& file,
+                                                    std::string_view symbol,
+                                                    QueryPerformance performance = {});
 [[nodiscard]] std::string typeInfoJson(std::string_view type,
                                        const std::vector<IndexedUnit>& index,
                                        bool includeInherited,
