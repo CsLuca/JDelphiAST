@@ -272,8 +272,9 @@ USAGE
   DelphiAstTool.exe model-migration --file <unit.pas> --symbol <name> --left-index <v500.jdi> --right-index <v600.jdi> [options]
   DelphiAstTool.exe compiler-log --input <dcc32-build-log.txt> --format json
   DelphiAstTool.exe type-info --type <name> --index <index.jdi> [--include-inherited] [--include-overloads] --format json
-  DelphiAstTool.exe symbol-origin --name <symbol> --index <index.jdi> --format json
-  DelphiAstTool.exe batch-diagnose --input <requests.json> --index <v600.jdi> [options] --output <results.json>
+   DelphiAstTool.exe symbol-origin --name <symbol> --index <index.jdi> --format json
+   DelphiAstTool.exe semantic-rule-match --rule <id> --file <unit.pas> --line <number> --format json
+   DelphiAstTool.exe batch-diagnose --input <requests.json> --index <v600.jdi> [options] --output <results.json>
   DelphiAstTool.exe build-query-index --index <file.jdi> [--index <file.jdi> ...] --format json
 
 PROJECT ANALYSIS OPTIONS
@@ -318,7 +319,8 @@ COMPARE-UNITS OPTIONS
   --html <file.html>        Optional searchable HTML report.
 
 DIAGNOSTIC OPTIONS
-  --error-code <code>       Delphi compiler error associated with diagnose.
+   --error-code <code>       Delphi compiler error associated with diagnose.
+   --rule <id>               Semantic migration rule inspected read-only.
   --symbol <name>           Optional compiler symbol or model name.
   --legacy-unit <name>      Legacy owner inspected by legacy-refs.
   --input <build.log>       DCC32 log parsed by compiler-log.
@@ -394,15 +396,15 @@ bool isQueryCommand(std::string_view command) {
   return command == "exports" || command == "symbol" || command == "expression" ||
          command == "hierarchy" || command == "unit-info" || command == "compare-symbol" ||
          command == "diagnose" || command == "legacy-refs" || command == "model-migration" ||
-         command == "compiler-log" || command == "type-info" || command == "symbol-origin" ||
-         command == "batch-diagnose" || command == "build-query-index";
+          command == "compiler-log" || command == "type-info" || command == "symbol-origin" ||
+          command == "semantic-rule-match" || command == "batch-diagnose" || command == "build-query-index";
 }
 
 int runQuery(std::string_view command, int argc, char** argv) {
   std::vector<std::filesystem::path> indexes, leftIndexes, rightIndexes, packageRoots;
   std::filesystem::path file, input, output, unitMap;
   std::filesystem::path dproj;
-  std::string unit, legacyUnit, name, typeName, kind, qualifiedName, className, errorCode;
+  std::string unit, legacyUnit, name, typeName, kind, qualifiedName, className, errorCode, rule;
   std::string configuration{"Release"}, platform{"Win32"};
   std::size_t line{};
   std::size_t queryTimeoutMs{10000};
@@ -442,6 +444,7 @@ int runQuery(std::string_view command, int argc, char** argv) {
     else if (argument == "--qualified-name") qualifiedName = value;
     else if (argument == "--class") className = value;
     else if (argument == "--error-code") errorCode = value;
+    else if (argument == "--rule") rule = value;
     else if (argument == "--line") {
       try { line = std::stoull(value); } catch (...) { std::cerr << "Invalid line number\n"; return 2; }
     } else if (argument == "--dproj") dproj = value;
@@ -507,6 +510,18 @@ int runQuery(std::string_view command, int argc, char** argv) {
           std::chrono::steady_clock::now() - processStarted).count();
       performance.timeoutMs = queryTimeoutMs;
       std::cout << jdelphiast::compilerLogJson(input, performance) << '\n';
+      return 0;
+    }
+    if (command == "semantic-rule-match") {
+      if (rule.empty() || file.empty() || line == 0) {
+        std::cerr << "semantic-rule-match requires --rule, --file and --line\n";
+        return 2;
+      }
+      jdelphiast::QueryPerformance performance;
+      performance.startupMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - processStarted).count();
+      performance.timeoutMs = queryTimeoutMs;
+      std::cout << jdelphiast::semanticRuleMatchJson(rule, file, line, performance) << '\n';
       return 0;
     }
     if (command == "type-info" || command == "symbol-origin") {

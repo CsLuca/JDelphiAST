@@ -243,6 +243,22 @@ int main() {
           "compiler log preserves output order and selects the first E2010 error");
   require(compilerLog.find("\"query_performance\":{") != std::string::npos,
           "diagnostic queries expose additive performance metrics");
+  const auto oledbMatch = jdelphiast::semanticRuleMatchJson(
+      "oledb-scalar-string", fixtures / "OleScalarString.pas", 16);
+  require(oledbMatch.find("\"matched\":true") != std::string::npos &&
+              oledbMatch.find("\"allowed_action\":\"oledb_scalar_string_to_tcsequery\"") != std::string::npos &&
+              oledbMatch.find("\"binding_count\":1") != std::string::npos,
+          "semantic-rule-match proves the safe OLEDB scalar string pattern");
+  const auto oledbIntegerMatch = jdelphiast::semanticRuleMatchJson(
+      "oledb-scalar-integer-equality", fixtures / "OleScalarInteger.pas", 16);
+  require(oledbIntegerMatch.find("\"matched\":true") != std::string::npos &&
+              oledbIntegerMatch.find("\"allowed_action\":\"oledb_scalar_integer_equality_to_tcsequery\"") != std::string::npos,
+          "semantic-rule-match proves the safe OLEDB scalar integer equality pattern");
+  const auto unsupportedRule = jdelphiast::semanticRuleMatchJson(
+      "mail-flow", fixtures / "OleScalarString.pas", 16);
+  require(unsupportedRule.find("\"matched\":false") != std::string::npos &&
+              unsupportedRule.find("semantic_rule_not_supported") != std::string::npos,
+          "unsupported semantic rules remain read-only and unmatched");
   const auto warningBeforeError = jdelphiast::compilerLogJson(fixtures / "dcc32-warning-before-error.log");
   require(warningBeforeError.find("\"ordinal\":1,\"file\":\"UWarning.pas\"") != std::string::npos &&
               warningBeforeError.find("\"first_actionable_error\":{\"ordinal\":2,\"file\":\"UFailure.pas\",\"line\":42,\"code\":\"E2003\"}") != std::string::npos,

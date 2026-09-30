@@ -348,6 +348,68 @@ std::string compilerLogJson(const std::filesystem::path& input, QueryPerformance
   return output.str();
 }
 
+std::string semanticRuleMatchJson(std::string_view rule, const std::filesystem::path& file,
+                                  std::size_t line, QueryPerformance performance) {
+  const auto started = std::chrono::steady_clock::now();
+  const auto source = readFile(file);
+  const auto ast = parseUnit(file, source);
+  const auto normalizedRule = lower(std::string(rule));
+  const bool knownRule = normalizedRule == "oledb-scalar-string" ||
+                         normalizedRule == "oledb-scalar-integer-equality";
+  const AstDeclaration* routine = nullptr;
+  for (const auto& declaration : ast.declarations) {
+    const auto kind = lower(declaration.kind);
+    if ((kind == "function" || kind == "procedure") && declaration.range.begin.line <= line &&
+        declaration.range.end.line >= line && (!routine || declaration.range.begin.offset >= routine->range.begin.offset))
+      routine = &declaration;
+  }
+  const auto block = routine ? sourceSlice(source, routine->range) : source;
+  const auto contains = [&](std::string_view token) {
+    return std::regex_search(block, std::regex("\\b" + std::string(token) + "\\b", std::regex::icase));
+  };
+  const std::regex accessorPattern(R"(CreateDynamicAccessor\b)", std::regex::icase);
+  const std::regex bindingPattern(R"(\.Bindings\s*\[\s*\d+\s*\])", std::regex::icase);
+  const auto accessorCount = std::distance(
+      std::sregex_iterator(block.begin(), block.end(), accessorPattern), std::sregex_iterator());
+  const auto bindingCount = std::distance(
+      std::sregex_iterator(block.begin(), block.end(), bindingPattern), std::sregex_iterator());
+  const bool legacyRowset = contains("TCSEOLEDBRowset") && contains("TOLEDBAccessor");
+  const bool selectOnly = std::regex_search(block, std::regex(R"(QueryText\s*:=\s*['"]?\s*SELECT\b)", std::regex::icase)) &&
+                          !contains("INSERT") && !contains("UPDATE") && !contains("DELETE");
+  const bool hasLoop = std::regex_search(block, std::regex(R"(\bfor\b|\bwhile\b|\brepeat\b)", std::regex::icase));
+  const bool hasRecordCount = contains("RecordCount");
+  const bool hasBlob = std::regex_search(block, std::regex(R"(\bblob\b|\bstream\b|\basolebdbinary\b)", std::regex::icase));
+  const bool stringBinding = std::regex_search(block, std::regex(R"(Bindings\s*\[\s*0\s*\]\s*\.\s*As(?:OleDb)?String\b)", std::regex::icase));
+  const bool integerBinding = std::regex_search(block, std::regex(R"(Bindings\s*\[\s*0\s*\]\s*\.\s*AsInteger\b)", std::regex::icase));
+  const bool equalitySql = std::regex_search(block, std::regex(R"(WHERE\s+\(?\s*[A-Za-z_]\w*\s*=\s*''')", std::regex::icase)) &&
+                           !std::regex_search(block, std::regex(R"(\bLIKE\b)", std::regex::icase));
+  const bool matches = knownRule && legacyRowset && accessorCount == 1 && bindingCount == 1 && selectOnly &&
+      !hasLoop && !hasRecordCount && !hasBlob &&
+      (normalizedRule == "oledb-scalar-string" ? stringBinding : integerBinding && equalitySql);
+  std::ostringstream output;
+  output << "{\"schema_version\":\"2.4\",\"command\":\"semantic-rule-match\",\"rule_id\":\""
+         << escape(rule) << "\",\"file\":\"" << escape(file.generic_string()) << "\",\"line\":" << line
+         << ",\"matched\":" << (matches ? "true" : "false") << ",\"confidence\":\""
+         << (matches ? "high" : "low") << "\",\"allowed_action\":";
+  if (matches) output << '"' << (normalizedRule == "oledb-scalar-string" ? "oledb_scalar_string_to_tcsequery" : "oledb_scalar_integer_equality_to_tcsequery") << '"';
+  else output << "null";
+  output << ",\"evidence\":{\"legacy_rowset\":" << (legacyRowset ? "true" : "false")
+         << ",\"accessor_count\":" << accessorCount << ",\"binding_count\":" << bindingCount
+         << ",\"binding_type\":\"" << (stringBinding ? "string" : integerBinding ? "integer" : "unknown")
+         << "\",\"sql_is_select\":" << (selectOnly ? "true" : "false")
+         << ",\"sql_is_equality\":" << (equalitySql ? "true" : "false")
+         << ",\"has_recordcount\":" << (hasRecordCount ? "true" : "false")
+         << ",\"has_loop\":" << (hasLoop ? "true" : "false")
+         << ",\"has_blob\":" << (hasBlob ? "true" : "false") << "},\"diagnostics\":[";
+  if (!knownRule) output << "{\"code\":\"semantic_rule_not_supported\",\"severity\":\"warning\",\"message\":\"The requested semantic rule is not supported.\"}";
+  else if (!matches) output << "{\"code\":\"semantic_rule_not_matched\",\"severity\":\"warning\",\"message\":\"The source does not prove every required OLEDB scalar precondition.\",\"file\":\""
+                            << escape(file.generic_string()) << "\",\"line\":" << line << '}';
+  output << "],";
+  writePerformance(output, performance, started);
+  output << '}';
+  return output.str();
+}
+
 std::string legacyReferencesJson(const std::filesystem::path& file, std::string_view legacyUnit,
                                  const std::vector<IndexedUnit>& left, const std::vector<IndexedUnit>& right,
                                  const std::filesystem::path& unitMap, QueryPerformance performance) {

@@ -79,7 +79,11 @@ struct DiagnoseOptions {
                                               const std::filesystem::path& unitMap = {},
                                               QueryPerformance performance = {});
 [[nodiscard]] std::string compilerLogJson(const std::filesystem::path& input,
-                                          QueryPerformance performance = {});
+                                           QueryPerformance performance = {});
+[[nodiscard]] std::string semanticRuleMatchJson(std::string_view rule,
+                                                 const std::filesystem::path& file,
+                                                 std::size_t line,
+                                                 QueryPerformance performance = {});
 [[nodiscard]] std::string typeInfoJson(std::string_view type,
                                        const std::vector<IndexedUnit>& index,
                                        bool includeInherited,
