@@ -275,6 +275,13 @@ int main() {
               oledbBlob.find("\"binding_type\":\"binary\"") != std::string::npos &&
               oledbBlob.find("\"sql_table\":\"Articoli\"") != std::string::npos,
           "semantic-rule-match classifies binary OLEDB flows as report-only with SQL table evidence");
+  const auto oledbLike = jdelphiast::semanticRuleMatchJson(
+      "oledb-like-search", fixtures / "OleScalarRejected.pas", 18);
+  require(oledbLike.find("\"matched\":true") != std::string::npos &&
+              oledbLike.find("\"classification\":\"report_only\"") != std::string::npos &&
+              oledbLike.find("\"sql_has_like\":true") != std::string::npos &&
+              oledbLike.find("\"sql_table\":\"Causali\"") != std::string::npos,
+          "semantic-rule-match classifies OLEDB LIKE searches as report-only with SQL evidence");
   for (const auto line : {18U, 30U, 43U, 56U, 70U}) {
     const auto rejected = jdelphiast::semanticRuleMatchJson(
         "oledb-scalar-string", fixtures / "OleScalarRejected.pas", line);

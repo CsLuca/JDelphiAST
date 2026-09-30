@@ -359,7 +359,8 @@ std::string semanticRuleMatchJson(std::string_view rule, const std::filesystem::
   const bool existenceRule = normalizedRule == "oledb-existence-recordcount";
   const bool multirowRule = normalizedRule == "oledb-multirow-flow";
   const bool blobRule = normalizedRule == "oledb-blob-flow";
-  const bool knownRule = stringRule || integerRule || existenceRule || multirowRule || blobRule;
+  const bool likeRule = normalizedRule == "oledb-like-search";
+  const bool knownRule = stringRule || integerRule || existenceRule || multirowRule || blobRule || likeRule;
   std::size_t lineOffset = 0;
   for (std::size_t current = 1; current < line && lineOffset < source.size(); ++current) {
     const auto next = source.find('\n', lineOffset);
@@ -400,19 +401,21 @@ std::string semanticRuleMatchJson(std::string_view rule, const std::filesystem::
     sqlTable = tableMatch[1].str();
   const bool equalitySql = std::regex_search(block, std::regex(R"(WHERE\s+\(?\s*[A-Za-z_]\w*\s*=\s*''')", std::regex::icase)) &&
                            !std::regex_search(block, std::regex(R"(\bLIKE\b)", std::regex::icase));
+  const bool likeSql = std::regex_search(block, std::regex(R"(\bLIKE\b)", std::regex::icase));
   const bool matches = knownRule && legacyRowset && accessorCount == 1 && selectOnly &&
       (stringRule ? bindingCount == 1 && stringBinding && !hasRecordCount && !hasLoop && !hasBlob
                   : integerRule ? bindingCount == 1 && integerBinding && equalitySql && !hasRecordCount && !hasLoop
                   : existenceRule ? recordCountExistence
                   : multirowRule ? !hasBlob && (hasLoop || bindingCount > 1)
-                                 : hasBlob || binaryBinding);
+                  : blobRule ? hasBlob || binaryBinding
+                             : likeSql);
   std::ostringstream output;
   output << "{\"schema_version\":\"2.4\",\"command\":\"semantic-rule-match\",\"rule_id\":\""
          << escape(rule) << "\",\"file\":\"" << escape(file.generic_string()) << "\",\"line\":" << line
          << ",\"matched\":" << (matches ? "true" : "false") << ",\"confidence\":\""
          << (matches ? "high" : "low") << "\",\"classification\":\""
-         << ((existenceRule || multirowRule || blobRule) ? "report_only" : "auto_patterned") << "\",\"allowed_action\":";
-  if (matches && !existenceRule && !multirowRule && !blobRule) output << '"' << (stringRule ? "oledb_scalar_string_to_tcsequery" : "oledb_scalar_integer_equality_to_tcsequery") << '"';
+         << ((existenceRule || multirowRule || blobRule || likeRule) ? "report_only" : "auto_patterned") << "\",\"allowed_action\":";
+  if (matches && !existenceRule && !multirowRule && !blobRule && !likeRule) output << '"' << (stringRule ? "oledb_scalar_string_to_tcsequery" : "oledb_scalar_integer_equality_to_tcsequery") << '"';
   else output << "null";
   output << ",\"evidence\":{\"legacy_rowset\":" << (legacyRowset ? "true" : "false")
          << ",\"accessor_count\":" << accessorCount << ",\"binding_count\":" << bindingCount
@@ -422,6 +425,7 @@ std::string semanticRuleMatchJson(std::string_view rule, const std::filesystem::
   output
          << ",\"sql_is_select\":" << (selectOnly ? "true" : "false")
          << ",\"sql_is_equality\":" << (equalitySql ? "true" : "false")
+         << ",\"sql_has_like\":" << (likeSql ? "true" : "false")
          << ",\"has_recordcount\":" << (hasRecordCount ? "true" : "false")
          << ",\"recordcount_is_existence_check\":" << (recordCountExistence ? "true" : "false")
          << ",\"has_loop\":" << (hasLoop ? "true" : "false")
