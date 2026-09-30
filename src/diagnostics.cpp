@@ -360,7 +360,8 @@ std::string semanticRuleMatchJson(std::string_view rule, const std::filesystem::
   const bool multirowRule = normalizedRule == "oledb-multirow-flow";
   const bool blobRule = normalizedRule == "oledb-blob-flow";
   const bool likeRule = normalizedRule == "oledb-like-search";
-  const bool knownRule = stringRule || integerRule || existenceRule || multirowRule || blobRule || likeRule;
+  const bool cardinalityRule = normalizedRule == "oledb-recordcount-nonexistence";
+  const bool knownRule = stringRule || integerRule || existenceRule || multirowRule || blobRule || likeRule || cardinalityRule;
   std::size_t lineOffset = 0;
   for (std::size_t current = 1; current < line && lineOffset < source.size(); ++current) {
     const auto next = source.find('\n', lineOffset);
@@ -391,6 +392,15 @@ std::string semanticRuleMatchJson(std::string_view rule, const std::filesystem::
   const bool hasRecordCount = contains("RecordCount");
   const bool recordCountExistence = std::regex_search(block,
       std::regex(R"(RecordCount\s*>\s*0\b)", std::regex::icase));
+  std::string recordCountOperator;
+  std::string recordCountValue;
+  std::smatch recordCountMatch;
+  if (std::regex_search(block, recordCountMatch,
+      std::regex(R"(RecordCount\s*(=|<>|<=|>=|<|>)\s*(\d+))", std::regex::icase))) {
+    recordCountOperator = recordCountMatch[1].str();
+    recordCountValue = recordCountMatch[2].str();
+  }
+  const bool recordCountNonExistence = hasRecordCount && !recordCountExistence && !recordCountOperator.empty();
   const bool stringBinding = std::regex_search(block, std::regex(R"(Bindings\s*\[\s*0\s*\]\s*\.\s*As(?:OleDb)?String\b)", std::regex::icase));
   const bool integerBinding = std::regex_search(block, std::regex(R"(Bindings\s*\[\s*0\s*\]\s*\.\s*AsInteger\b)", std::regex::icase));
   const bool binaryBinding = std::regex_search(block, std::regex(R"(Bindings\s*\[\s*0\s*\]\s*\.\s*As(?:OleDb)?Binary\b)", std::regex::icase));
@@ -408,14 +418,15 @@ std::string semanticRuleMatchJson(std::string_view rule, const std::filesystem::
                   : existenceRule ? recordCountExistence
                   : multirowRule ? !hasBlob && (hasLoop || bindingCount > 1)
                   : blobRule ? hasBlob || binaryBinding
-                             : likeSql);
+                  : likeRule ? likeSql
+                             : recordCountNonExistence);
   std::ostringstream output;
   output << "{\"schema_version\":\"2.4\",\"command\":\"semantic-rule-match\",\"rule_id\":\""
          << escape(rule) << "\",\"file\":\"" << escape(file.generic_string()) << "\",\"line\":" << line
          << ",\"matched\":" << (matches ? "true" : "false") << ",\"confidence\":\""
          << (matches ? "high" : "low") << "\",\"classification\":\""
-         << ((existenceRule || multirowRule || blobRule || likeRule) ? "report_only" : "auto_patterned") << "\",\"allowed_action\":";
-  if (matches && !existenceRule && !multirowRule && !blobRule && !likeRule) output << '"' << (stringRule ? "oledb_scalar_string_to_tcsequery" : "oledb_scalar_integer_equality_to_tcsequery") << '"';
+         << ((existenceRule || multirowRule || blobRule || likeRule || cardinalityRule) ? "report_only" : "auto_patterned") << "\",\"allowed_action\":";
+  if (matches && !existenceRule && !multirowRule && !blobRule && !likeRule && !cardinalityRule) output << '"' << (stringRule ? "oledb_scalar_string_to_tcsequery" : "oledb_scalar_integer_equality_to_tcsequery") << '"';
   else output << "null";
   output << ",\"evidence\":{\"legacy_rowset\":" << (legacyRowset ? "true" : "false")
          << ",\"accessor_count\":" << accessorCount << ",\"binding_count\":" << bindingCount
@@ -428,6 +439,11 @@ std::string semanticRuleMatchJson(std::string_view rule, const std::filesystem::
          << ",\"sql_has_like\":" << (likeSql ? "true" : "false")
          << ",\"has_recordcount\":" << (hasRecordCount ? "true" : "false")
          << ",\"recordcount_is_existence_check\":" << (recordCountExistence ? "true" : "false")
+         << ",\"recordcount_operator\":";
+  if (recordCountOperator.empty()) output << "null"; else output << '"' << escape(recordCountOperator) << '"';
+  output << ",\"recordcount_value\":";
+  if (recordCountValue.empty()) output << "null"; else output << recordCountValue;
+  output
          << ",\"has_loop\":" << (hasLoop ? "true" : "false")
          << ",\"has_blob\":" << (hasBlob ? "true" : "false") << "},\"diagnostics\":[";
   if (!knownRule) output << "{\"code\":\"semantic_rule_not_supported\",\"severity\":\"warning\",\"message\":\"The requested semantic rule is not supported.\"}";

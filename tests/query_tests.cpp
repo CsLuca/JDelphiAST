@@ -282,6 +282,13 @@ int main() {
               oledbLike.find("\"sql_has_like\":true") != std::string::npos &&
               oledbLike.find("\"sql_table\":\"Causali\"") != std::string::npos,
           "semantic-rule-match classifies OLEDB LIKE searches as report-only with SQL evidence");
+  const auto oledbCardinality = jdelphiast::semanticRuleMatchJson(
+      "oledb-recordcount-nonexistence", fixtures / "OleScalarRejected.pas", 85);
+  require(oledbCardinality.find("\"matched\":true") != std::string::npos &&
+              oledbCardinality.find("\"classification\":\"report_only\"") != std::string::npos &&
+              oledbCardinality.find("\"recordcount_operator\":\"<>\"") != std::string::npos &&
+              oledbCardinality.find("\"recordcount_value\":1") != std::string::npos,
+          "semantic-rule-match classifies non-existence RecordCount cardinality checks as report-only");
   for (const auto line : {18U, 30U, 43U, 56U, 70U}) {
     const auto rejected = jdelphiast::semanticRuleMatchJson(
         "oledb-scalar-string", fixtures / "OleScalarRejected.pas", line);

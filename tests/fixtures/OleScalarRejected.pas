@@ -7,6 +7,7 @@ procedure FindCount(const Codice: string);
 procedure FindLoop(const Codice: string);
 procedure FindMultiBinding(const Codice: string);
 procedure FindBlob(const Codice: string);
+procedure FindCardinality(const Codice: string);
 
 implementation
 
@@ -71,6 +72,19 @@ begin
   Rowset.QueryText := 'SELECT Immagine FROM Articoli WHERE Codice = ''' + Codice + '''';
   Rowset.Open;
   Accessor.Bindings[0].AsOleDbBinary;
+end;
+
+procedure FindCardinality(const Codice: string);
+var
+  Rowset: TCSEOLEDBRowset;
+  Accessor: TOLEDBAccessor;
+begin
+  Rowset := TCSEOLEDBRowset.Create(nil);
+  Accessor := Rowset.CreateDynamicAccessor;
+  Rowset.QueryText := 'SELECT ID FROM Causali WHERE Codice = ''' + Codice + '''';
+  Rowset.Open;
+  if Rowset.RecordCount <> 1 then
+    Accessor.Bindings[0].AsInteger;
 end;
 
 end.
