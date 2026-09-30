@@ -289,6 +289,13 @@ int main() {
               oledbCardinality.find("\"recordcount_operator\":\"<>\"") != std::string::npos &&
               oledbCardinality.find("\"recordcount_value\":1") != std::string::npos,
           "semantic-rule-match classifies non-existence RecordCount cardinality checks as report-only");
+  const auto oledbWrite = jdelphiast::semanticRuleMatchJson(
+      "oledb-write-flow", fixtures / "OleScalarRejected.pas", 98);
+  require(oledbWrite.find("\"matched\":true") != std::string::npos &&
+              oledbWrite.find("\"classification\":\"report_only\"") != std::string::npos &&
+              oledbWrite.find("\"sql_write_verb\":\"update\"") != std::string::npos &&
+              oledbWrite.find("\"sql_table\":\"Causali\"") != std::string::npos,
+          "semantic-rule-match classifies OLEDB writes as report-only with verb and table evidence");
   for (const auto line : {18U, 30U, 43U, 56U, 70U}) {
     const auto rejected = jdelphiast::semanticRuleMatchJson(
         "oledb-scalar-string", fixtures / "OleScalarRejected.pas", line);

@@ -361,7 +361,8 @@ std::string semanticRuleMatchJson(std::string_view rule, const std::filesystem::
   const bool blobRule = normalizedRule == "oledb-blob-flow";
   const bool likeRule = normalizedRule == "oledb-like-search";
   const bool cardinalityRule = normalizedRule == "oledb-recordcount-nonexistence";
-  const bool knownRule = stringRule || integerRule || existenceRule || multirowRule || blobRule || likeRule || cardinalityRule;
+  const bool writeRule = normalizedRule == "oledb-write-flow";
+  const bool knownRule = stringRule || integerRule || existenceRule || multirowRule || blobRule || likeRule || cardinalityRule || writeRule;
   std::size_t lineOffset = 0;
   for (std::size_t current = 1; current < line && lineOffset < source.size(); ++current) {
     const auto next = source.find('\n', lineOffset);
@@ -385,7 +386,8 @@ std::string semanticRuleMatchJson(std::string_view rule, const std::filesystem::
       std::sregex_iterator(block.begin(), block.end(), accessorPattern), std::sregex_iterator());
   const auto bindingCount = std::distance(
       std::sregex_iterator(block.begin(), block.end(), bindingPattern), std::sregex_iterator());
-  const bool legacyRowset = contains("TCSEOLEDBRowset") && contains("TOLEDBAccessor");
+  const bool hasLegacyRowset = contains("TCSEOLEDBRowset");
+  const bool legacyRowset = hasLegacyRowset && contains("TOLEDBAccessor");
   const bool selectOnly = std::regex_search(block, std::regex(R"(QueryText\s*:=\s*['"]?\s*SELECT\b)", std::regex::icase)) &&
                           !contains("INSERT") && !contains("UPDATE") && !contains("DELETE");
   const bool hasLoop = std::regex_search(block, std::regex(R"(\bfor\b|\bwhile\b|\brepeat\b)", std::regex::icase));
@@ -409,30 +411,41 @@ std::string semanticRuleMatchJson(std::string_view rule, const std::filesystem::
   std::smatch tableMatch;
   if (std::regex_search(block, tableMatch, std::regex(R"(\bFROM\s+([A-Za-z_]\w*))", std::regex::icase)))
     sqlTable = tableMatch[1].str();
+  std::string sqlVerb;
+  std::smatch writeMatch;
+  if (std::regex_search(block, writeMatch,
+      std::regex(R"(\b(INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+([A-Za-z_]\w*))", std::regex::icase))) {
+    sqlVerb = lower(writeMatch[1].str());
+    if (sqlTable.empty()) sqlTable = writeMatch[2].str();
+  }
   const bool equalitySql = std::regex_search(block, std::regex(R"(WHERE\s+\(?\s*[A-Za-z_]\w*\s*=\s*''')", std::regex::icase)) &&
                            !std::regex_search(block, std::regex(R"(\bLIKE\b)", std::regex::icase));
   const bool likeSql = std::regex_search(block, std::regex(R"(\bLIKE\b)", std::regex::icase));
-  const bool matches = knownRule && legacyRowset && accessorCount == 1 && selectOnly &&
+  const bool matches = knownRule &&
+      (writeRule ? hasLegacyRowset && !sqlVerb.empty()
+                 : legacyRowset && accessorCount == 1 && selectOnly &&
       (stringRule ? bindingCount == 1 && stringBinding && !hasRecordCount && !hasLoop && !hasBlob
                   : integerRule ? bindingCount == 1 && integerBinding && equalitySql && !hasRecordCount && !hasLoop
                   : existenceRule ? recordCountExistence
                   : multirowRule ? !hasBlob && (hasLoop || bindingCount > 1)
                   : blobRule ? hasBlob || binaryBinding
                   : likeRule ? likeSql
-                             : recordCountNonExistence);
+                             : recordCountNonExistence));
   std::ostringstream output;
   output << "{\"schema_version\":\"2.4\",\"command\":\"semantic-rule-match\",\"rule_id\":\""
          << escape(rule) << "\",\"file\":\"" << escape(file.generic_string()) << "\",\"line\":" << line
          << ",\"matched\":" << (matches ? "true" : "false") << ",\"confidence\":\""
          << (matches ? "high" : "low") << "\",\"classification\":\""
-         << ((existenceRule || multirowRule || blobRule || likeRule || cardinalityRule) ? "report_only" : "auto_patterned") << "\",\"allowed_action\":";
-  if (matches && !existenceRule && !multirowRule && !blobRule && !likeRule && !cardinalityRule) output << '"' << (stringRule ? "oledb_scalar_string_to_tcsequery" : "oledb_scalar_integer_equality_to_tcsequery") << '"';
+         << ((existenceRule || multirowRule || blobRule || likeRule || cardinalityRule || writeRule) ? "report_only" : "auto_patterned") << "\",\"allowed_action\":";
+  if (matches && !existenceRule && !multirowRule && !blobRule && !likeRule && !cardinalityRule && !writeRule) output << '"' << (stringRule ? "oledb_scalar_string_to_tcsequery" : "oledb_scalar_integer_equality_to_tcsequery") << '"';
   else output << "null";
-  output << ",\"evidence\":{\"legacy_rowset\":" << (legacyRowset ? "true" : "false")
+  output << ",\"evidence\":{\"legacy_rowset\":" << (hasLegacyRowset ? "true" : "false")
          << ",\"accessor_count\":" << accessorCount << ",\"binding_count\":" << bindingCount
          << ",\"binding_type\":\"" << (binaryBinding ? "binary" : stringBinding ? "string" : integerBinding ? "integer" : "unknown")
          << "\",\"sql_table\":";
   if (sqlTable.empty()) output << "null"; else output << '"' << escape(sqlTable) << '"';
+  output << ",\"sql_write_verb\":";
+  if (sqlVerb.empty()) output << "null"; else output << '"' << escape(sqlVerb) << '"';
   output
          << ",\"sql_is_select\":" << (selectOnly ? "true" : "false")
          << ",\"sql_is_equality\":" << (equalitySql ? "true" : "false")

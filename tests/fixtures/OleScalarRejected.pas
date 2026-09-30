@@ -8,6 +8,7 @@ procedure FindLoop(const Codice: string);
 procedure FindMultiBinding(const Codice: string);
 procedure FindBlob(const Codice: string);
 procedure FindCardinality(const Codice: string);
+procedure WriteStatus(const Codice: string);
 
 implementation
 
@@ -85,6 +86,15 @@ begin
   Rowset.Open;
   if Rowset.RecordCount <> 1 then
     Accessor.Bindings[0].AsInteger;
+end;
+
+procedure WriteStatus(const Codice: string);
+var
+  Rowset: TCSEOLEDBRowset;
+begin
+  Rowset := TCSEOLEDBRowset.Create(nil);
+  Rowset.QueryText := 'UPDATE Causali SET Attivo = 1 WHERE Codice = ''' + Codice + '''';
+  Rowset.Open;
 end;
 
 end.
