@@ -206,6 +206,12 @@ int main() {
               modelCandidate.find("\"recommended_action\":\"manual_required\"") != std::string::npos &&
               modelCandidate.find("EnableOnChange") != std::string::npos,
           "legacy-model-candidate reports TCSFields as manual-required without a patch");
+  const auto databaseCandidate = jdelphiast::legacyModelCandidateJson(fixtures / "ApiCalls.pas", "DBCfg");
+  require(databaseCandidate.find("\"matched\":true") != std::string::npos &&
+              databaseCandidate.find("\"model_kind\":\"database\"") != std::string::npos &&
+              databaseCandidate.find("ExecSql") != std::string::npos &&
+              databaseCandidate.find("\"recommended_action\":\"manual_required\"") != std::string::npos,
+          "legacy-model-candidate reports DBCfg database flows as manual-required");
 
   const auto databaseType = jdelphiast::typeInfoJson("TCSEDatabase", diagnosticRight, true, true);
   require(databaseType.find("\"schema_version\":\"2.3\"") != std::string::npos &&

@@ -474,21 +474,28 @@ std::string legacyModelCandidateJson(const std::filesystem::path& file, std::str
   const auto source = readFile(file);
   const auto key = lower(std::string(symbol));
   const bool typePresent = std::regex_search(source, std::regex("\\b" + std::string(symbol) + "\\b", std::regex::icase));
-  const std::vector<std::string> members = {"EnableOnChange", "FieldValues", "GetCsField", "CSSeek", "CSModify", "CSResetCampi"};
+  const bool fieldsModel = key == "tcsfields";
+  const bool databaseModel = key == "tcsdatabase" || key == "dbcfg";
+  const std::vector<std::string> members = fieldsModel
+      ? std::vector<std::string>{"EnableOnChange", "FieldValues", "GetCsField", "CSSeek", "CSModify", "CSResetCampi"}
+      : std::vector<std::string>{"ExecSql", "ExecSQL", "ExecuteScalar", "BeginTransaction", "Commit", "Rollback", "DataBaseName"};
   std::vector<std::string> used;
   for (const auto& member : members)
     if (std::regex_search(source, std::regex("\\b" + member + "\\b", std::regex::icase))) used.push_back(member);
-  const bool candidate = key == "tcsfields" && typePresent;
+  const bool candidate = (fieldsModel || databaseModel) && typePresent;
   std::ostringstream output;
   output << "{\"schema_version\":\"2.4\",\"command\":\"legacy-model-candidate\",\"file\":\""
          << escape(file.generic_string()) << "\",\"symbol\":\"" << escape(symbol)
          << "\",\"matched\":" << (candidate ? "true" : "false")
          << ",\"classification\":\"" << (candidate ? "legacy_model_migration_required" : "unresolved")
          << "\",\"recommended_action\":\"" << (candidate ? "manual_required" : "review_required")
-         << "\",\"evidence\":{\"type_present\":" << (typePresent ? "true" : "false") << ",\"legacy_members\":[";
+         << "\",\"evidence\":{\"type_present\":" << (typePresent ? "true" : "false")
+         << ",\"model_kind\":\"" << (fieldsModel ? "fields" : databaseModel ? "database" : "unknown")
+         << "\",\"legacy_members\":[";
   for (std::size_t i = 0; i < used.size(); ++i) { if (i) output << ','; output << '"' << used[i] << '"'; }
   output << "]},\"diagnostics\":[";
-  if (candidate) output << "{\"code\":\"legacy_model_migration_required\",\"severity\":\"warning\",\"message\":\"TCSFields requires a file-specific model migration.\"}";
+  if (candidate) output << "{\"code\":\"legacy_model_migration_required\",\"severity\":\"warning\",\"message\":\""
+                        << (fieldsModel ? "TCSFields requires a file-specific model migration." : "Legacy database usage requires a file-specific migration.") << "\"}";
   else output << "{\"code\":\"legacy_model_not_matched\",\"severity\":\"warning\",\"message\":\"The requested legacy model was not proven in this source.\"}";
   output << "],";
   writePerformance(output, performance, started);
