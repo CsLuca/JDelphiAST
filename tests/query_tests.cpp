@@ -254,6 +254,13 @@ int main() {
   require(oledbIntegerMatch.find("\"matched\":true") != std::string::npos &&
               oledbIntegerMatch.find("\"allowed_action\":\"oledb_scalar_integer_equality_to_tcsequery\"") != std::string::npos,
           "semantic-rule-match proves the safe OLEDB scalar integer equality pattern");
+  for (const auto line : {18U, 30U, 43U, 56U, 70U}) {
+    const auto rejected = jdelphiast::semanticRuleMatchJson(
+        "oledb-scalar-string", fixtures / "OleScalarRejected.pas", line);
+    require(rejected.find("\"matched\":false") != std::string::npos &&
+                rejected.find("semantic_rule_not_matched") != std::string::npos,
+        "semantic-rule-match rejects LIKE, RecordCount, loops, multi-bindings, and BLOB flows");
+  }
   const auto unsupportedRule = jdelphiast::semanticRuleMatchJson(
       "mail-flow", fixtures / "OleScalarString.pas", 16);
   require(unsupportedRule.find("\"matched\":false") != std::string::npos &&
