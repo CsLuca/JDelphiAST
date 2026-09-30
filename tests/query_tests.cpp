@@ -254,6 +254,12 @@ int main() {
   require(oledbIntegerMatch.find("\"matched\":true") != std::string::npos &&
               oledbIntegerMatch.find("\"allowed_action\":\"oledb_scalar_integer_equality_to_tcsequery\"") != std::string::npos,
           "semantic-rule-match proves the safe OLEDB scalar integer equality pattern");
+  const auto oledbExistence = jdelphiast::semanticRuleMatchJson(
+      "oledb-existence-recordcount", fixtures / "OleScalarRejected.pas", 30);
+  require(oledbExistence.find("\"matched\":true") != std::string::npos &&
+              oledbExistence.find("\"classification\":\"report_only\"") != std::string::npos &&
+              oledbExistence.find("\"allowed_action\":null") != std::string::npos,
+          "semantic-rule-match classifies RecordCount existence checks as report-only");
   for (const auto line : {18U, 30U, 43U, 56U, 70U}) {
     const auto rejected = jdelphiast::semanticRuleMatchJson(
         "oledb-scalar-string", fixtures / "OleScalarRejected.pas", line);

@@ -354,16 +354,24 @@ std::string semanticRuleMatchJson(std::string_view rule, const std::filesystem::
   const auto source = readFile(file);
   const auto ast = parseUnit(file, source);
   const auto normalizedRule = lower(std::string(rule));
-  const bool knownRule = normalizedRule == "oledb-scalar-string" ||
-                         normalizedRule == "oledb-scalar-integer-equality";
-  const AstDeclaration* routine = nullptr;
-  for (const auto& declaration : ast.declarations) {
-    const auto kind = lower(declaration.kind);
-    if ((kind == "function" || kind == "procedure") && declaration.range.begin.line <= line &&
-        declaration.range.end.line >= line && (!routine || declaration.range.begin.offset >= routine->range.begin.offset))
-      routine = &declaration;
+  const bool stringRule = normalizedRule == "oledb-scalar-string";
+  const bool integerRule = normalizedRule == "oledb-scalar-integer-equality";
+  const bool existenceRule = normalizedRule == "oledb-existence-recordcount";
+  const bool knownRule = stringRule || integerRule || existenceRule;
+  std::size_t lineOffset = 0;
+  for (std::size_t current = 1; current < line && lineOffset < source.size(); ++current) {
+    const auto next = source.find('\n', lineOffset);
+    lineOffset = next == std::string::npos ? source.size() : next + 1;
   }
-  const auto block = routine ? sourceSlice(source, routine->range) : source;
+  const std::regex routinePattern(R"((?:^|\n)\s*(?:function|procedure)\s+[A-Za-z_]\w*)", std::regex::icase);
+  std::size_t routineStart = std::string::npos;
+  for (std::sregex_iterator item(source.begin(), source.end(), routinePattern), end; item != end; ++item)
+    if (static_cast<std::size_t>((*item).position()) <= lineOffset) routineStart = static_cast<std::size_t>((*item).position());
+  std::string block = source;
+  if (routineStart != std::string::npos) {
+    const auto routineEnd = source.find("\nend;", routineStart);
+    block = source.substr(routineStart, routineEnd == std::string::npos ? std::string::npos : routineEnd - routineStart + 5);
+  }
   const auto contains = [&](std::string_view token) {
     return std::regex_search(block, std::regex("\\b" + std::string(token) + "\\b", std::regex::icase));
   };
@@ -378,20 +386,24 @@ std::string semanticRuleMatchJson(std::string_view rule, const std::filesystem::
                           !contains("INSERT") && !contains("UPDATE") && !contains("DELETE");
   const bool hasLoop = std::regex_search(block, std::regex(R"(\bfor\b|\bwhile\b|\brepeat\b)", std::regex::icase));
   const bool hasRecordCount = contains("RecordCount");
+  const bool recordCountExistence = std::regex_search(block,
+      std::regex(R"(RecordCount\s*>\s*0\b)", std::regex::icase));
   const bool hasBlob = std::regex_search(block, std::regex(R"(\bblob\b|\bstream\b|\basolebdbinary\b)", std::regex::icase));
   const bool stringBinding = std::regex_search(block, std::regex(R"(Bindings\s*\[\s*0\s*\]\s*\.\s*As(?:OleDb)?String\b)", std::regex::icase));
   const bool integerBinding = std::regex_search(block, std::regex(R"(Bindings\s*\[\s*0\s*\]\s*\.\s*AsInteger\b)", std::regex::icase));
   const bool equalitySql = std::regex_search(block, std::regex(R"(WHERE\s+\(?\s*[A-Za-z_]\w*\s*=\s*''')", std::regex::icase)) &&
                            !std::regex_search(block, std::regex(R"(\bLIKE\b)", std::regex::icase));
-  const bool matches = knownRule && legacyRowset && accessorCount == 1 && bindingCount == 1 && selectOnly &&
-      !hasLoop && !hasRecordCount && !hasBlob &&
-      (normalizedRule == "oledb-scalar-string" ? stringBinding : integerBinding && equalitySql);
+  const bool matches = knownRule && legacyRowset && accessorCount == 1 && selectOnly && !hasLoop && !hasBlob &&
+      (stringRule ? bindingCount == 1 && stringBinding && !hasRecordCount
+                  : integerRule ? bindingCount == 1 && integerBinding && equalitySql && !hasRecordCount
+                                : recordCountExistence);
   std::ostringstream output;
   output << "{\"schema_version\":\"2.4\",\"command\":\"semantic-rule-match\",\"rule_id\":\""
          << escape(rule) << "\",\"file\":\"" << escape(file.generic_string()) << "\",\"line\":" << line
          << ",\"matched\":" << (matches ? "true" : "false") << ",\"confidence\":\""
-         << (matches ? "high" : "low") << "\",\"allowed_action\":";
-  if (matches) output << '"' << (normalizedRule == "oledb-scalar-string" ? "oledb_scalar_string_to_tcsequery" : "oledb_scalar_integer_equality_to_tcsequery") << '"';
+         << (matches ? "high" : "low") << "\",\"classification\":\""
+         << (existenceRule ? "report_only" : "auto_patterned") << "\",\"allowed_action\":";
+  if (matches && !existenceRule) output << '"' << (stringRule ? "oledb_scalar_string_to_tcsequery" : "oledb_scalar_integer_equality_to_tcsequery") << '"';
   else output << "null";
   output << ",\"evidence\":{\"legacy_rowset\":" << (legacyRowset ? "true" : "false")
          << ",\"accessor_count\":" << accessorCount << ",\"binding_count\":" << bindingCount
@@ -399,6 +411,7 @@ std::string semanticRuleMatchJson(std::string_view rule, const std::filesystem::
          << "\",\"sql_is_select\":" << (selectOnly ? "true" : "false")
          << ",\"sql_is_equality\":" << (equalitySql ? "true" : "false")
          << ",\"has_recordcount\":" << (hasRecordCount ? "true" : "false")
+         << ",\"recordcount_is_existence_check\":" << (recordCountExistence ? "true" : "false")
          << ",\"has_loop\":" << (hasLoop ? "true" : "false")
          << ",\"has_blob\":" << (hasBlob ? "true" : "false") << "},\"diagnostics\":[";
   if (!knownRule) output << "{\"code\":\"semantic_rule_not_supported\",\"severity\":\"warning\",\"message\":\"The requested semantic rule is not supported.\"}";
