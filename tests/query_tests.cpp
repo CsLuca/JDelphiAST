@@ -260,6 +260,14 @@ int main() {
               oledbExistence.find("\"classification\":\"report_only\"") != std::string::npos &&
               oledbExistence.find("\"allowed_action\":null") != std::string::npos,
           "semantic-rule-match classifies RecordCount existence checks as report-only");
+  for (const auto line : {43U, 56U}) {
+    const auto oledbMultirow = jdelphiast::semanticRuleMatchJson(
+        "oledb-multirow-flow", fixtures / "OleScalarRejected.pas", line);
+    require(oledbMultirow.find("\"matched\":true") != std::string::npos &&
+                oledbMultirow.find("\"classification\":\"report_only\"") != std::string::npos &&
+                oledbMultirow.find("\"allowed_action\":null") != std::string::npos,
+        "semantic-rule-match classifies OLEDB loops and multi-bindings as report-only");
+  }
   for (const auto line : {18U, 30U, 43U, 56U, 70U}) {
     const auto rejected = jdelphiast::semanticRuleMatchJson(
         "oledb-scalar-string", fixtures / "OleScalarRejected.pas", line);

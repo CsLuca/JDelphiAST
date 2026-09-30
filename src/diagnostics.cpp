@@ -357,7 +357,8 @@ std::string semanticRuleMatchJson(std::string_view rule, const std::filesystem::
   const bool stringRule = normalizedRule == "oledb-scalar-string";
   const bool integerRule = normalizedRule == "oledb-scalar-integer-equality";
   const bool existenceRule = normalizedRule == "oledb-existence-recordcount";
-  const bool knownRule = stringRule || integerRule || existenceRule;
+  const bool multirowRule = normalizedRule == "oledb-multirow-flow";
+  const bool knownRule = stringRule || integerRule || existenceRule || multirowRule;
   std::size_t lineOffset = 0;
   for (std::size_t current = 1; current < line && lineOffset < source.size(); ++current) {
     const auto next = source.find('\n', lineOffset);
@@ -393,17 +394,18 @@ std::string semanticRuleMatchJson(std::string_view rule, const std::filesystem::
   const bool integerBinding = std::regex_search(block, std::regex(R"(Bindings\s*\[\s*0\s*\]\s*\.\s*AsInteger\b)", std::regex::icase));
   const bool equalitySql = std::regex_search(block, std::regex(R"(WHERE\s+\(?\s*[A-Za-z_]\w*\s*=\s*''')", std::regex::icase)) &&
                            !std::regex_search(block, std::regex(R"(\bLIKE\b)", std::regex::icase));
-  const bool matches = knownRule && legacyRowset && accessorCount == 1 && selectOnly && !hasLoop && !hasBlob &&
-      (stringRule ? bindingCount == 1 && stringBinding && !hasRecordCount
-                  : integerRule ? bindingCount == 1 && integerBinding && equalitySql && !hasRecordCount
-                                : recordCountExistence);
+  const bool matches = knownRule && legacyRowset && accessorCount == 1 && selectOnly && !hasBlob &&
+      (stringRule ? bindingCount == 1 && stringBinding && !hasRecordCount && !hasLoop
+                  : integerRule ? bindingCount == 1 && integerBinding && equalitySql && !hasRecordCount && !hasLoop
+                                : existenceRule ? recordCountExistence
+                                                : hasLoop || bindingCount > 1);
   std::ostringstream output;
   output << "{\"schema_version\":\"2.4\",\"command\":\"semantic-rule-match\",\"rule_id\":\""
          << escape(rule) << "\",\"file\":\"" << escape(file.generic_string()) << "\",\"line\":" << line
          << ",\"matched\":" << (matches ? "true" : "false") << ",\"confidence\":\""
          << (matches ? "high" : "low") << "\",\"classification\":\""
-         << (existenceRule ? "report_only" : "auto_patterned") << "\",\"allowed_action\":";
-  if (matches && !existenceRule) output << '"' << (stringRule ? "oledb_scalar_string_to_tcsequery" : "oledb_scalar_integer_equality_to_tcsequery") << '"';
+         << ((existenceRule || multirowRule) ? "report_only" : "auto_patterned") << "\",\"allowed_action\":";
+  if (matches && !existenceRule && !multirowRule) output << '"' << (stringRule ? "oledb_scalar_string_to_tcsequery" : "oledb_scalar_integer_equality_to_tcsequery") << '"';
   else output << "null";
   output << ",\"evidence\":{\"legacy_rowset\":" << (legacyRowset ? "true" : "false")
          << ",\"accessor_count\":" << accessorCount << ",\"binding_count\":" << bindingCount
