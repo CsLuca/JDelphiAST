@@ -21,6 +21,8 @@ std::string lower(std::string value) {
 }
 
 std::string escape(std::string_view value) {
+  return jsonSourceBytes(value);
+#if 0
   std::string result;
   for (const unsigned char c : value) {
     if (c == '\\') result += "\\\\";
@@ -36,6 +38,7 @@ std::string escape(std::string_view value) {
     } else result += static_cast<char>(c);
   }
   return result;
+#endif
 }
 
 std::string readFile(const std::filesystem::path& path) {
@@ -314,11 +317,17 @@ std::string exportsJson(const std::filesystem::path& requested, const std::vecto
     parsed = parseUnit(requested, source);
     sourceUnit.name = parsed->name;
     sourceUnit.sourceFile = requested;
-    sourceUnit.declarations = parsed->declarations;
+    sourceUnit.complete = parsed->complete;
+    // Preserve source declaration identity/range, including distinct overloads.
+    for (const auto& declaration : parsed->declarations)
+      if (declaration.visibility == "public" || declaration.visibility == "published")
+        sourceUnit.declarations.push_back(declaration);
     for (const auto& symbol : parsed->exports) {
-      sourceUnit.symbols.push_back(symbol.name);
       const auto existing = std::find_if(sourceUnit.declarations.begin(), sourceUnit.declarations.end(), [&](const AstDeclaration& declaration) {
-        return lower(declaration.name) == lower(symbol.name);
+        const auto simple = declaration.name.substr(declaration.name.find_last_of('.') + 1);
+        return declaration.kind == symbol.kind &&
+               (lower(declaration.name) == lower(symbol.name) || lower(simple) == lower(symbol.name)) &&
+               declaration.range.begin.line == symbol.range.begin.line;
       });
       if (existing == sourceUnit.declarations.end()) {
         AstDeclaration declaration;
@@ -329,6 +338,7 @@ std::string exportsJson(const std::filesystem::path& requested, const std::vecto
         sourceUnit.declarations.push_back(std::move(declaration));
       }
     }
+    for (const auto& declaration : sourceUnit.declarations) sourceUnit.symbols.push_back(declaration.name);
     unit = &sourceUnit;
   } else unit = findUnit(index, requested.string());
   std::ostringstream output;
@@ -339,10 +349,14 @@ std::string exportsJson(const std::filesystem::path& requested, const std::vecto
   output << ",\"index_status\":\"" << (unit ? "indexed" : "not_found") << "\",\"exports\":[";
   if (unit) {
     bool first = true;
-    for (const auto& name : unit->symbols) {
+    std::unordered_set<std::string> emitted;
+    for (const auto& declaration : unit->declarations) {
+      const auto name = declaration.name;
+      const auto key = name + ":" + signature(declaration) + ":" + std::to_string(declaration.range.begin.offset);
+      if (!emitted.insert(key).second) continue;
       if (!first) output << ',';
       first = false;
-      const auto declarations = matchingDeclarations(*unit, name);
+      const std::vector<const AstDeclaration*> declarations{&declaration};
       output << "{\"name\":\"" << escape(name) << "\",\"qualified_name\":\""
              << escape(unit->name + "." + name) << "\",\"kind\":\""
              << escape(declarations.empty() ? "unknown" : declarations.front()->kind)
@@ -357,6 +371,16 @@ std::string exportsJson(const std::filesystem::path& requested, const std::vecto
   }
   output << "],\"diagnostics\":[";
   if (!unit) writeDiagnostic(output, "source_unit_not_indexed", "Unit not found in source or index.");
+  else if (parsed && !parsed->complete) {
+    if (parsed->parseDiagnostics.empty())
+      writeDiagnostic(output, "incomplete_unit", "Source syntax or preprocessing is incomplete; exports are provisional.",
+                      requested.generic_string(), parsed->range.end.line);
+    else for (std::size_t n = 0; n < parsed->parseDiagnostics.size(); ++n) {
+      if (n) output << ',';
+      const auto& diagnostic = parsed->parseDiagnostics[n];
+      writeDiagnostic(output, diagnostic.code, diagnostic.message, requested.generic_string(), diagnostic.position.line);
+    }
+  }
   output << "],\"exports_summary\":{\"count\":" << (unit ? unit->symbols.size() : 0)
          << ",\"public_functions\":";
   std::size_t functions = 0, classes = 0, interfaces = 0;
@@ -517,21 +541,126 @@ std::string expressionJson(const std::filesystem::path& file, std::size_t line,
   std::vector<std::pair<const IndexedUnit*, const AstDeclaration*>> matches;
   std::string receiverType;
   const auto ast = parseUnit(file, source);
+  const AstDeclaration* routine = nullptr;
+  std::size_t lineOffset = 0;
+  for (std::size_t n = 1; n < line; ++n) {
+    const auto next = source.find('\n', lineOffset);
+    if (next == std::string::npos) break;
+    lineOffset = next + 1;
+  }
+  for (const auto& declaration : ast.declarations)
+    if ((declaration.kind == "procedure" || declaration.kind == "function" || declaration.kind == "constructor") &&
+        declaration.ownerType.empty() && declaration.bodyRange.end.offset > lineOffset && declaration.range.begin.offset <= lineOffset &&
+        (!routine || declaration.range.begin.offset > routine->range.begin.offset)) routine = &declaration;
+  auto visibleType = [&](const std::string& name) {
+    std::vector<std::string> types;
+    // Local declarations shadow parameters and unit globals; never use another routine's local.
+    if (routine) for (const auto& declaration : ast.declarations)
+      if (lower(declaration.name) == lower(name) && declaration.kind == "localVariable" &&
+          declaration.scope == routine->name && declaration.range.begin.offset <= lineOffset)
+        types.push_back(declaration.type);
+    if (types.empty() && routine) for (const auto& parameter : routine->parameters)
+      if (lower(parameter.name) == lower(name)) types.push_back(parameter.type);
+    if (types.empty()) {
+      std::vector<const AstDeclaration*> parents;
+      for (const auto& candidate : ast.declarations)
+        if (candidate.ownerType.empty() && candidate.bodyRange.begin.offset <= lineOffset &&
+            candidate.bodyRange.end.offset > lineOffset && &candidate != routine &&
+            (candidate.kind == "procedure" || candidate.kind == "function")) parents.push_back(&candidate);
+      std::sort(parents.begin(), parents.end(), [](const auto* a, const auto* b) { return a->range.begin.offset > b->range.begin.offset; });
+      for (const auto* parent : parents) {
+        for (const auto& declaration : ast.declarations)
+          if (lower(declaration.name) == lower(name) && declaration.kind == "localVariable" && declaration.scope == parent->name)
+            types.push_back(declaration.type);
+        if (types.empty()) for (const auto& parameter : parent->parameters)
+          if (lower(parameter.name) == lower(name)) types.push_back(parameter.type);
+        if (!types.empty()) break;
+      }
+    }
+    if (types.empty()) for (const auto& declaration : ast.declarations)
+      if (lower(declaration.name) == lower(name) && declaration.kind == "variable") types.push_back(declaration.type);
+    if (types.empty() && routine && routine->name.find('.') != std::string::npos) {
+      const auto owner = routine->name.substr(0, routine->name.find_last_of('.'));
+      if (lower(name) == "self") types.push_back(owner);
+      else for (const auto& declaration : ast.declarations)
+        if (lower(declaration.ownerType) == lower(owner) &&
+            lower(declaration.name.substr(declaration.name.find_last_of('.') + 1)) == lower(name) &&
+            (declaration.kind == "field" || declaration.kind == "property")) types.push_back(declaration.type);
+    }
+    if (types.empty() || std::any_of(types.begin(), types.end(), [&](const std::string& type) { return lower(type) != lower(types.front()); })) return std::string{};
+    return types.front();
+  };
   const auto firstDot = called.find('.');
   if (firstDot != std::string::npos) {
     const auto receiver = called.substr(0, firstDot);
-    const auto declared = std::find_if(ast.declarations.begin(), ast.declarations.end(), [&](const AstDeclaration& declaration) {
-      return lower(declaration.name) == lower(receiver) && !declaration.type.empty();
-    });
-    if (declared != ast.declarations.end()) receiverType = declared->type;
+    receiverType = visibleType(receiver);
+    // Resolve explicit property chains from declared receiver types only.
+    const auto lastDot = called.find_last_of('.');
+    std::size_t member = firstDot + 1;
+    while (!receiverType.empty() && member < lastDot) {
+      const auto end = called.find('.', member);
+      const auto property = called.substr(member, end - member);
+      std::vector<std::string> propertyTypes;
+      for (const auto& unit : index) for (const auto& declaration : unit.declarations)
+        if (lower(declaration.ownerType) == lower(receiverType) &&
+            lower(declaration.name.substr(declaration.name.find_last_of('.') + 1)) == lower(property) &&
+            (declaration.kind == "property" || declaration.kind == "field")) propertyTypes.push_back(declaration.type);
+      if (propertyTypes.size() != 1) { receiverType.clear(); break; }
+      receiverType = propertyTypes.front(); member = end + 1;
+    }
   }
   if (!called.empty()) {
+    std::unordered_set<std::string> receiverOwners;
+    if (!receiverType.empty()) receiverOwners.insert(lower(receiverType));
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (const auto& unit : index) for (const auto& relation : unit.inheritance)
+        if (receiverOwners.contains(lower(relation.type)) && !relation.baseType.empty() &&
+            receiverOwners.insert(lower(relation.baseType)).second) changed = true;
+    }
     const auto simple = called.substr(called.find_last_of('.') == std::string::npos ? 0 : called.find_last_of('.') + 1);
     for (const auto& unit : index) for (const auto* candidate : matchingDeclarations(unit, simple)) {
       if (candidate->type.empty()) continue;
-      if (!receiverType.empty() && !candidate->ownerType.empty() && lower(candidate->ownerType) != lower(receiverType)) continue;
+      const bool imported = std::any_of(ast.uses.begin(), ast.uses.end(), [&](const UsesItem& use) {
+        return lower(use.name) == lower(unit.name);
+      });
+      const auto qualifier = firstDot == std::string::npos ? std::string{} : called.substr(0, called.find_last_of('.'));
+      const bool qualifiedUnit = !qualifier.empty() && visibleType(qualifier).empty() && lower(qualifier) == lower(unit.name);
+      if (!imported && !qualifiedUnit) continue;
+      if (firstDot == std::string::npos && !candidate->ownerType.empty()) continue;
+      if (firstDot != std::string::npos && receiverType.empty() && !qualifiedUnit) continue;
+      if (!receiverType.empty() && (candidate->ownerType.empty() || !receiverOwners.contains(lower(candidate->ownerType)))) continue;
       matches.push_back({&unit, candidate});
     }
+  }
+  // Exact argument compatibility only. Conversions, defaults without metadata,
+  // var/out lvalue semantics and ambiguous nested expressions remain unresolved.
+  const AstCall* selectedCall = nullptr;
+  for (const auto& call : ast.calls)
+    if (call.range.begin.line == line && lower(call.name) == lower(called)) {
+      if (selectedCall) { selectedCall = nullptr; break; }
+      selectedCall = &call;
+    }
+  if (selectedCall) {
+    matches.erase(std::remove_if(matches.begin(), matches.end(), [&](const auto& match) {
+      const auto& declaration = *match.second;
+      if (declaration.parameters.size() != selectedCall->arguments.size()) return true;
+      for (std::size_t n = 0; n < declaration.parameters.size(); ++n) {
+        const auto& argument = selectedCall->arguments[n];
+        // Scoped declarations take precedence over the legacy flat type map.
+        std::string actual = visibleType(argument.text);
+        if (actual.empty() && (argument.kind == "string" || argument.kind == "boolean")) actual = argument.resolvedType;
+        if (actual.empty() && argument.kind == "string") actual = "string";
+        if (actual.empty() && !argument.text.empty() &&
+            std::all_of(argument.text.begin(), argument.text.end(), [](unsigned char c) { return std::isdigit(c); })) actual = "Integer";
+        if (actual.empty() || lower(actual) == "variant" || lower(actual) != lower(declaration.parameters[n].type)) return true;
+        if (declaration.parameters[n].modifier == "var" || declaration.parameters[n].modifier == "out") {
+          if (visibleType(argument.text).empty()) return true;
+        }
+      }
+      return false;
+    }), matches.end());
   }
   bool visible = false;
   if (matches.size() == 1) {
@@ -541,8 +670,13 @@ std::string expressionJson(const std::filesystem::path& file, std::size_t line,
       return ownerName == used || (ownerName.size() > used.size() && ownerName.ends_with("." + used));
     });
   }
-  const auto receiverProven = firstDot == std::string::npos || !receiverType.empty();
-  const auto resolved = matches.size() == 1 && visible && receiverProven;
+  const auto receiverProven = firstDot == std::string::npos || !receiverType.empty() ||
+    (matches.size() == 1 && lower(called.substr(0, called.find_last_of('.'))) == lower(matches.front().first->name));
+  const bool localCallable = firstDot == std::string::npos && std::any_of(ast.declarations.begin(), ast.declarations.end(), [&](const AstDeclaration& d) {
+    return lower(d.name) == lower(called) && (d.kind == "procedure" || d.kind == "function");
+  });
+  const bool withContext = source.substr(0, lineOffset).find("with ") != std::string::npos;
+  const auto resolved = ast.complete && selectedCall && matches.size() == 1 && visible && receiverProven && !localCallable && !withContext;
   const auto* owner = resolved ? matches.front().first : nullptr;
   const auto* match = resolved ? matches.front().second : nullptr;
   std::ostringstream output;

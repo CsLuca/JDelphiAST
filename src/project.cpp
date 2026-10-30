@@ -83,19 +83,15 @@ std::uint64_t quickFingerprint(const std::filesystem::path& path, std::uintmax_t
   constexpr std::size_t blockSize = 65536;
   std::array<char, blockSize> buffer{};
   std::uint64_t hash = 1469598103934665603ULL;
-  auto consume = [&](std::streamoff offset, std::size_t count) {
-    input.clear();
-    input.seekg(offset);
-    input.read(buffer.data(), static_cast<std::streamsize>(count));
+  // Cache identity covers every byte, not just first/middle/last samples.
+  // Same-size, same-timestamp SDK changes must invalidate the sidecar too.
+  while (input) {
+    input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
     for (std::streamsize i = 0; i < input.gcount(); ++i) {
       hash ^= static_cast<unsigned char>(buffer[static_cast<std::size_t>(i)]);
       hash *= 1099511628211ULL;
     }
-  };
-  const auto firstCount = static_cast<std::size_t>(std::min<std::uintmax_t>(size, blockSize));
-  consume(0, firstCount);
-  if (size > blockSize * 2) consume(static_cast<std::streamoff>(size / 2 - blockSize / 2), blockSize);
-  if (size > blockSize) consume(static_cast<std::streamoff>(size - blockSize), blockSize);
+  }
   hash ^= size;
   return hash;
 }

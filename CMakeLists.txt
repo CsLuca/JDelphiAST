@@ -3,7 +3,7 @@ project(JDelphiAST VERSION 0.1.0 LANGUAGES CXX)
 
 option(JDELPHIAST_BUILD_TESTS "Build JDelphiAST tests" ON)
 
-add_library(jdelphiast src/analyzer.cpp src/project.cpp src/preprocessor.cpp src/queries.cpp src/diagnostics.cpp)
+add_library(jdelphiast src/analyzer.cpp src/concrete.cpp src/project.cpp src/preprocessor.cpp src/queries.cpp src/diagnostics.cpp)
 target_include_directories(jdelphiast PUBLIC include)
 target_compile_features(jdelphiast PUBLIC cxx_std_20)
 
@@ -19,13 +19,21 @@ if(MINGW)
   # Keep the distributed CLI independent from the MSYS2 GCC runtime DLLs.
   target_link_options(DelphiAstTool PRIVATE -static -static-libgcc -static-libstdc++)
 endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/indexes")
 add_custom_command(TARGET DelphiAstTool POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory
           ${CMAKE_CURRENT_SOURCE_DIR}/indexes
-          $<TARGET_FILE_DIR:DelphiAstTool>/indexes)
+           $<TARGET_FILE_DIR:DelphiAstTool>/indexes)
+endif()
 
 if(JDELPHIAST_BUILD_TESTS)
   enable_testing()
+  add_executable(jdelphiast_resolution_tests tests/resolution_tests.cpp)
+  target_link_libraries(jdelphiast_resolution_tests PRIVATE jdelphiast)
+  add_test(NAME jdelphiast_resolution_tests COMMAND jdelphiast_resolution_tests)
+  add_executable(jdelphiast_qualification_tests tests/qualification_tests.cpp)
+  target_link_libraries(jdelphiast_qualification_tests PRIVATE jdelphiast)
+  add_test(NAME jdelphiast_qualification_tests COMMAND jdelphiast_qualification_tests)
   add_executable(jdelphiast_tests tests/analyzer_tests.cpp)
   target_link_libraries(jdelphiast_tests PRIVATE jdelphiast)
   add_test(NAME jdelphiast_tests COMMAND jdelphiast_tests)

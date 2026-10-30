@@ -16,7 +16,19 @@ struct PreprocessorOptions {
 };
 
 struct PreprocessResult {
+  struct SourceOrigin {
+    std::filesystem::path file;
+    SourcePosition position;
+  };
+  struct IncludedSource {
+    std::filesystem::path file;
+    std::string source;
+  };
   std::string source;
+  std::string expandedSource;
+  // One entry per expanded byte plus EOF; original source remains untouched.
+  std::vector<SourceOrigin> origins;
+  std::vector<IncludedSource> includedSources;
   std::vector<std::filesystem::path> includesResolved;
   std::vector<InactiveRange> inactiveRanges;
   std::vector<std::string> reasons;

@@ -95,18 +95,18 @@ struct Processor {
     target.complete = false;
   }
 
-  void processInclude(PreprocessResult& target, const std::filesystem::path& includingFile,
+  PreprocessResult processInclude(PreprocessResult& target, const std::filesystem::path& includingFile,
                       const std::string& requested, std::size_t depth) {
     const auto found = findInclude(includingFile, requested, options);
-    if (!found) { reason(target, "include_not_found: " + requested); return; }
+    if (!found) { reason(target, "include_not_found: " + requested); return {}; }
     if (std::find(chain.begin(), chain.end(), *found) != chain.end()) {
       reason(target, "include_cycle: " + found->string());
-      return;
+      return {};
     }
-    if (depth >= options.maxIncludeDepth) { reason(target, "include_depth_exceeded: " + requested); return; }
+    if (depth >= options.maxIncludeDepth) { reason(target, "include_depth_exceeded: " + requested); return {}; }
     target.includesResolved.push_back(*found);
     std::ifstream input(*found, std::ios::binary);
-    if (!input) { reason(target, "include_read_error: " + found->string()); return; }
+    if (!input) { reason(target, "include_read_error: " + found->string()); return {}; }
     const std::string source{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
     chain.push_back(*found);
     auto nested = run(*found, source, depth + 1);
@@ -114,16 +114,18 @@ struct Processor {
     target.includesResolved.insert(target.includesResolved.end(), nested.includesResolved.begin(), nested.includesResolved.end());
     target.inactiveRanges.insert(target.inactiveRanges.end(), nested.inactiveRanges.begin(), nested.inactiveRanges.end());
     target.reasons.insert(target.reasons.end(), nested.reasons.begin(), nested.reasons.end());
+    target.includedSources.push_back({*found, nested.source});
+    target.includedSources.insert(target.includedSources.end(), nested.includedSources.begin(), nested.includedSources.end());
     target.complete = target.complete && nested.complete;
     defines.clear();
     for (const auto& define : nested.finalDefines) defines.insert(canonical(define));
-    if (std::any_of(nested.source.begin(), nested.source.end(), [](unsigned char c) { return !std::isspace(c); }))
-      reason(target, "include_contains_code: " + found->string());
+    return nested;
   }
 
   PreprocessResult run(const std::filesystem::path& file, std::string_view source, std::size_t depth) {
     PreprocessResult local;
     local.source = std::string(source);
+    std::vector<std::pair<std::size_t, PreprocessResult>> expansions;
     std::vector<Frame> stack;
     bool active = true;
     bool inString = false;
@@ -206,8 +208,8 @@ struct Processor {
         else if (command == "UNDEF" && active) defines.erase(canonical(argument));
         else if ((command == "I" || command == "INCLUDE") && active && !argument.empty() && argument != "+" && argument != "-") {
           if (argument.size() >= 2 && argument.front() == '\'' && argument.back() == '\'') argument = argument.substr(1, argument.size() - 2);
-          processInclude(local, file, argument, depth);
-        } else if (command == "R" || command == "RESOURCE" || command == "WARN" || command == "HINTS" ||
+          expansions.emplace_back(end, processInclude(local, file, argument, depth));
+        } else if (command == "REGION" || command == "ENDREGION" || command == "R" || command == "RESOURCE" || command == "WARN" || command == "HINTS" ||
                    command == "WARNINGS" || command == "APPTYPE" || command == "ALIGN" ||
                    command == "MINENUMSIZE" || command == "R+" || command == "R-" ||
                    command == "Q+" || command == "Q-" || command == "O+" || command == "O-" ||
@@ -232,6 +234,25 @@ struct Processor {
     if (!stack.empty()) { local.complete = false; local.reasons.push_back("unterminated_conditional"); }
     local.finalDefines.assign(defines.begin(), defines.end());
     std::sort(local.finalDefines.begin(), local.finalDefines.end());
+    SourcePosition original;
+    std::size_t expansion = 0;
+    auto appendExpansion = [&]() {
+      while (expansion < expansions.size() && expansions[expansion].first == original.offset) {
+        const auto& included = expansions[expansion++].second;
+        local.expandedSource += included.expandedSource;
+        if (!included.origins.empty())
+          local.origins.insert(local.origins.end(), included.origins.begin(), included.origins.end() - 1);
+      }
+    };
+    for (; original.offset < source.size();) {
+      appendExpansion();
+      local.origins.push_back({file, original});
+      local.expandedSource += local.source[original.offset];
+      if (source[original.offset++] == '\n') { ++original.line; original.column = 1; }
+      else ++original.column;
+    }
+    appendExpansion();
+    local.origins.push_back({file, original});
     return local;
   }
 };

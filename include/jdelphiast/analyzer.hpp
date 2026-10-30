@@ -18,7 +18,26 @@ struct SourcePosition {
 struct SourceRange {
   SourcePosition begin;
   SourcePosition end;
+  std::filesystem::path sourceFile;
 };
+
+// Lossless source-oriented token envelope. Ranges and columns count bytes,
+// not Unicode code points. Trivia and BOM are retained verbatim.
+struct ConcreteToken {
+  std::string kind;
+  std::string bytes;
+  SourceRange range;
+};
+struct ConcreteSyntax {
+  std::vector<ConcreteToken> tokens;
+  bool complete{true};
+  std::vector<std::string> diagnostics;
+};
+[[nodiscard]] ConcreteSyntax tokenizeConcrete(std::string_view source);
+[[nodiscard]] std::string writeConcrete(const ConcreteSyntax& syntax);
+// Valid UTF8 stays intact; invalid UTF8 bytes are represented losslessly as
+// U+00xx in JSON. This is a byte envelope, not an inferred ANSI code page.
+[[nodiscard]] std::string jsonSourceBytes(std::string_view source);
 
 struct InactiveRange {
   std::filesystem::path file;
@@ -64,6 +83,10 @@ struct AstDeclaration {
   bool isOverride{};
   bool reintroduced{};
   bool deprecated{};
+  std::filesystem::path sourceFile;
+  bool anonymous{};
+  std::string enclosingRoutine;
+  SourceRange bodyRange;
 };
 
 struct InheritanceRelation {
@@ -114,6 +137,11 @@ struct SymbolReference {
 };
 
 struct UnitAst {
+  struct ParseDiagnostic {
+    std::string code;
+    std::string message;
+    SourcePosition position;
+  };
   std::string name;
   std::filesystem::path file;
   SourceRange range;
@@ -123,6 +151,7 @@ struct UnitAst {
   std::vector<AstDeclaration> declarations;
   std::vector<AstCall> calls;
   std::vector<AstAssignment> assignments;
+  std::vector<ParseDiagnostic> parseDiagnostics;
   std::string sourceHash;
   std::vector<std::filesystem::path> includesResolved;
   std::vector<InactiveRange> inactiveRanges;

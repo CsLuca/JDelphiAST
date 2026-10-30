@@ -55,7 +55,10 @@ bool isBuiltin(std::string_view text) {
 
 class Lexer {
  public:
-  explicit Lexer(std::string_view source) : source_(source) {}
+  explicit Lexer(std::string_view source) : source_(source) {
+    // Offsets are original-file byte offsets; BOM is not a Pascal token.
+    if (source_.starts_with("\xEF\xBB\xBF")) offset_ = 3;
+  }
 
   std::vector<Token> run(bool* hasDirective = nullptr) {
     std::vector<Token> result;
@@ -233,7 +236,83 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
   ast.sourceHash = sha256(source);
   ast.range = {{0, 1, 1}, tokens.back().range.end};
   ast.complete = !hasDirective;
+  const auto concrete = tokenizeConcrete(source);
+  if (!concrete.complete) {
+    ast.complete = false;
+    ast.preprocessorReasons.insert(ast.preprocessorReasons.end(), concrete.diagnostics.begin(), concrete.diagnostics.end());
+  }
+  std::size_t headerCursor = !tokens.empty() && word(tokens[0], "unit") ? 1 : 0;
+  if (headerCursor) ast.name = qualifiedName(tokens, headerCursor);
+  std::vector<std::string> checkedDelimiters;
+  for (const auto& token : tokens) {
+    if (token.text == "(" || token.text == "[") checkedDelimiters.push_back(token.text);
+    else if (token.text == ")" || token.text == "]") {
+      if (checkedDelimiters.empty() || (token.text == ")" ? checkedDelimiters.back() != "(" : checkedDelimiters.back() != "[")) {
+        ast.complete = false;
+        ast.parseDiagnostics.push_back({"syntax_error", "Unexpected closing delimiter", token.range.begin});
+        return ast;
+      }
+      checkedDelimiters.pop_back();
+    }
+  }
+  if (!checkedDelimiters.empty()) {
+    ast.complete = false;
+    const auto opening = std::find_if(tokens.begin(), tokens.end(), [](const Token& token) { return token.text == "(" || token.text == "["; });
+    ast.parseDiagnostics.push_back({"incomplete_unit", "Unclosed delimiter; partial interface only", opening->range.begin});
+    // Recover only named interface headers preceding the malformed delimiter.
+    for (std::size_t n = headerCursor; n + 1 < tokens.size(); ++n) {
+      if (word(tokens[n], "implementation")) break;
+      if ((word(tokens[n], "procedure") || word(tokens[n], "function")) &&
+          tokens[n + 1].kind == TokenKind::Identifier && !isKeyword(tokens[n + 1].text))
+        ast.exports.push_back({tokens[n + 1].text, canonical(tokens[n].text), tokens[n + 1].range});
+    }
+    return ast;
+  }
   std::size_t i = 0;
+  std::unordered_set<std::size_t> typeBodyTokens;
+  std::unordered_map<std::size_t, std::string> typeOwners;
+  // Parse type headers independently of parameter modifiers (const/var).
+  for (std::size_t t = 1; t + 3 < tokens.size(); ++t) {
+    if (tokens[t].kind != TokenKind::Identifier || isKeyword(tokens[t].text)) continue;
+    std::size_t equal = t + 1;
+    if (tokens[equal].text == "<") {
+      int genericDepth = 1;
+      while (genericDepth && ++equal < tokens.size()) {
+        if (tokens[equal].text == "<") ++genericDepth;
+        if (tokens[equal].text == ">") --genericDepth;
+      }
+      ++equal;
+    }
+    if (equal + 2 >= tokens.size() || tokens[equal].text != "=" ||
+        !(word(tokens[equal + 1], "class") || word(tokens[equal + 1], "record") ||
+          word(tokens[equal + 1], "interface"))) continue;
+    AstDeclaration header;
+    header.name = tokens[t].text;
+    header.kind = canonical(tokens[equal + 1].text);
+    header.visibility = "public";
+    header.range = {tokens[t].range.begin, tokens[equal + 1].range.end};
+    std::size_t body = equal + 2;
+    if (word(tokens[body], "helper")) {
+      header.kind += "Helper";
+      while (body < tokens.size() && !word(tokens[body], "for") && tokens[body].text != ";") ++body;
+      if (body + 1 < tokens.size() && word(tokens[body], "for")) {
+        header.type = tokens[body + 1].text;
+        body += 2;
+      }
+    }
+    header.signature = sourceSlice(source, {tokens[t].range.begin, tokens[body].range.begin});
+    ast.declarations.push_back(header);
+    if (tokens[body].text == ";") continue; // forward declaration
+    int depth = 1;
+    for (std::size_t n = body; n < tokens.size() && tokens[n].kind != TokenKind::End; ++n) {
+      typeBodyTokens.insert(n);
+      typeOwners[n] = header.name;
+      if (word(tokens[n], "end")) {
+        if (--depth == 0) break;
+      } else if ((word(tokens[n], "class") || word(tokens[n], "record")) &&
+                 n > 0 && tokens[n - 1].text == "=") ++depth;
+    }
+  }
   if (!word(tokens[i], "unit")) {
     ast.complete = false;
     return ast;
@@ -255,7 +334,7 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
   std::string currentRoutine;
 
   for (i = 0; tokens[i].kind != TokenKind::End; ++i) {
-    if (word(tokens[i], "interface")) {
+    if (word(tokens[i], "interface") && (i == 0 || tokens[i - 1].text != "=")) {
       sawInterface = true;
       inInterface = true;
       inImplementation = false;
@@ -319,19 +398,19 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
       continue;
     }
 
-    if (inInterface && (word(tokens[i], "procedure") || word(tokens[i], "function") ||
+    if (inInterface && !typeBodyTokens.contains(i) && (word(tokens[i], "procedure") || word(tokens[i], "function") ||
                         word(tokens[i], "constructor") || word(tokens[i], "destructor"))) {
-      if (tokens[i + 1].kind == TokenKind::Identifier) {
+      if (tokens[i + 1].kind == TokenKind::Identifier && !isKeyword(tokens[i + 1].text)) {
         ast.exports.push_back({tokens[i + 1].text, canonical(tokens[i].text), tokens[i + 1].range});
         ownNames.insert(canonical(tokens[i + 1].text));
         excluded.insert(i + 1);
       }
     }
-    if (word(tokens[i], "procedure") || word(tokens[i], "function") || word(tokens[i], "constructor") ||
-        word(tokens[i], "destructor")) {
+    if (!typeBodyTokens.contains(i) && (word(tokens[i], "procedure") || word(tokens[i], "function") || word(tokens[i], "constructor") ||
+        word(tokens[i], "destructor"))) {
       std::size_t n = i + 1;
       SourceRange nameRange;
-      const auto name = qualifiedName(tokens, n, &nameRange);
+      const auto name = isKeyword(tokens[n].text) ? std::string{} : qualifiedName(tokens, n, &nameRange);
       if (!name.empty()) {
         AstDeclaration declaration;
         declaration.kind = canonical(tokens[i].text);
@@ -404,7 +483,8 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
         ++n;
       }
     }
-    if (inInterface && (word(tokens[i], "const") || word(tokens[i], "resourcestring"))) {
+    if (inInterface && (word(tokens[i], "const") || word(tokens[i], "resourcestring")) &&
+        (i == 0 || tokens[i - 1].text == ";" || word(tokens[i - 1], "interface"))) {
       std::size_t n = i + 1;
       while (tokens[n].kind != TokenKind::End && !word(tokens[n], "implementation") &&
              !word(tokens[n], "type") && !word(tokens[n], "var") && !word(tokens[n], "uses") &&
@@ -484,6 +564,21 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
     }
   }
   ast.complete = ast.complete && sawInterface && sawImplementation && hasTerminatingEnd;
+  if (!sawInterface || !sawImplementation || !hasTerminatingEnd)
+    ast.parseDiagnostics.push_back({"incomplete_unit", "Missing interface, implementation or final end.", tokens.back().range.end});
+  // Reject malformed delimiter streams before subsequent look-ahead passes.
+  std::vector<std::string> delimiters;
+  for (const auto& token : tokens) {
+    if (token.text == "(" || token.text == "[") delimiters.push_back(token.text);
+    else if (token.text == ")" || token.text == "]") {
+      if (delimiters.empty() || (token.text == ")" ? delimiters.back() != "(" : delimiters.back() != "[")) {
+        ast.complete = false;
+        return ast;
+      }
+      delimiters.pop_back();
+    }
+  }
+  if (!delimiters.empty()) { ast.complete = false; return ast; }
 
   struct LexicalScope {
     std::size_t begin{};
@@ -608,12 +703,12 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
   }
 
   for (i = 0; tokens[i].kind != TokenKind::End; ++i) {
-    if (tokens[i].kind != TokenKind::Identifier || tokens[i + 1].text != "=" ||
-        !(word(tokens[i + 2], "class") || word(tokens[i + 2], "interface") || word(tokens[i + 2], "record"))) continue;
-    const auto owner = tokens[i].text;
-    std::string visibility = "private";
+    if (!typeOwners.contains(i) || (i > 0 && typeOwners.contains(i - 1))) continue;
+    const auto owner = typeOwners.at(i);
+    const auto ownerHeader = std::find_if(ast.declarations.begin(), ast.declarations.end(), [&](const AstDeclaration& d) { return d.name == owner; });
+    std::string visibility = ownerHeader != ast.declarations.end() && ownerHeader->kind == "interface" ? "public" : "private";
     int depth = 1;
-    for (std::size_t n = i + 3; tokens[n].kind != TokenKind::End && depth > 0; ++n) {
+    for (std::size_t n = i; tokens[n].kind != TokenKind::End && depth > 0 && typeOwners.contains(n); ++n) {
       if (word(tokens[n], "class") || word(tokens[n], "record")) ++depth;
       else if (word(tokens[n], "end")) { --depth; continue; }
       if (depth != 1) continue;
@@ -622,7 +717,7 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
         continue;
       }
       if (word(tokens[n], "procedure") || word(tokens[n], "function") || word(tokens[n], "constructor") || word(tokens[n], "destructor")) {
-        if (tokens[n + 1].kind != TokenKind::Identifier) continue;
+        if (tokens[n + 1].kind != TokenKind::Identifier || isKeyword(tokens[n + 1].text)) continue;
         AstDeclaration declaration;
         declaration.kind = canonical(tokens[n].text);
         declaration.name = owner + "." + tokens[n + 1].text;
@@ -654,7 +749,10 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
         }
         if (word(tokens[n], "function") && tokens[cursor + 1].text == ":" && tokens[cursor + 2].kind == TokenKind::Identifier)
           declaration.type = tokens[cursor + 2].text;
-        for (std::size_t d = cursor; tokens[d].kind != TokenKind::End && d < cursor + 16 && tokens[d].text != ";"; ++d) {
+        while (tokens[cursor].kind != TokenKind::End && tokens[cursor].text != ";") ++cursor;
+        for (std::size_t d = cursor + 1; d < tokens.size() && tokens[d].kind != TokenKind::End && d < cursor + 16 &&
+             (tokens[d].text == ";" || word(tokens[d], "overload") || word(tokens[d], "override") ||
+              word(tokens[d], "reintroduce") || word(tokens[d], "deprecated")); ++d) {
           if (word(tokens[d], "overload")) declaration.overload = true;
           if (word(tokens[d], "override")) declaration.isOverride = true;
           if (word(tokens[d], "reintroduce")) declaration.reintroduced = true;
@@ -672,6 +770,8 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
         declaration.range = {tokens[n].range.begin, tokens[n + 1].range.end};
         if (tokens[n + 2].text == ":" && tokens[n + 3].kind == TokenKind::Identifier) declaration.type = tokens[n + 3].text;
         ast.declarations.push_back(std::move(declaration));
+        // Property names/types/accessors are not separate field declarations.
+        while (tokens[n].kind != TokenKind::End && tokens[n].text != ";") ++n;
       } else if (tokens[n].kind == TokenKind::Identifier && tokens[n + 1].text == ":" && tokens[n + 2].kind == TokenKind::Identifier) {
         AstDeclaration declaration;
         declaration.kind = "field";
@@ -784,6 +884,48 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
       }
     }
   }
+  // Bound implementation routine scopes by balanced bodies. Declarations in
+  // interfaces have no body and must not capture later implementation locals.
+  for (auto& declaration : ast.declarations) {
+    if (!declaration.ownerType.empty() || declaration.visibility != "private" ||
+        !(declaration.kind == "procedure" || declaration.kind == "function" ||
+          declaration.kind == "constructor" || declaration.kind == "destructor")) continue;
+    auto start = std::find_if(tokens.begin(), tokens.end(), [&](const Token& token) {
+      return token.range.begin.offset == declaration.range.begin.offset;
+    });
+    if (start == tokens.end()) continue;
+    auto body = start;
+    // Skip nested routine definitions using the already extracted headers.
+    while (body != tokens.end() && !word(*body, "begin") && body->kind != TokenKind::End) ++body;
+    if (body == tokens.end() || body->kind == TokenKind::End) continue;
+    auto end = body;
+    int depth = 1;
+    while (++end != tokens.end() && end->kind != TokenKind::End) {
+      if (word(*end, "begin") || word(*end, "try") || word(*end, "case") || word(*end, "asm")) ++depth;
+      else if (word(*end, "end") && --depth == 0) break;
+    }
+    if (end == tokens.end() || end->kind == TokenKind::End) { ast.complete = false; continue; }
+    declaration.bodyRange = {declaration.range.begin, end->range.end};
+    // If the first begin belongs to a nested named routine, find the outer
+    // body's following begin rather than claiming the nested scope alone.
+    bool nested = std::any_of(ast.declarations.begin(), ast.declarations.end(), [&](const AstDeclaration& other) {
+      return other.ownerType.empty() && other.range.begin.offset > declaration.range.begin.offset &&
+             other.range.begin.offset < body->range.begin.offset &&
+             (other.kind == "procedure" || other.kind == "function");
+    });
+    if (nested) {
+      auto outerBody = end + 1;
+      while (outerBody != tokens.end() && outerBody->kind != TokenKind::End && !word(*outerBody,"begin")) ++outerBody;
+      if (outerBody != tokens.end() && outerBody->kind != TokenKind::End) {
+        auto outerEnd = outerBody; depth = 1;
+        while (++outerEnd != tokens.end() && outerEnd->kind != TokenKind::End) {
+          if (word(*outerEnd,"begin") || word(*outerEnd,"try") || word(*outerEnd,"case")) ++depth;
+          else if (word(*outerEnd,"end") && --depth == 0) break;
+        }
+        if (outerEnd != tokens.end() && outerEnd->kind != TokenKind::End) declaration.bodyRange.end = outerEnd->range.end;
+      }
+    }
+  }
   for (auto& declaration : ast.declarations) {
     if (declaration.isOverride || declaration.name.find('.') == std::string::npos) continue;
     const auto simple = declaration.name.substr(declaration.name.find_last_of('.') + 1);
@@ -791,10 +933,40 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
       return candidate.isOverride && canonical(candidate.name) == canonical(simple);
     });
   }
+  for (std::size_t n = 1; n + 1 < tokens.size(); ++n) {
+    if (!(word(tokens[n], "procedure") || word(tokens[n], "function")) ||
+        !(tokens[n - 1].text == "=" || tokens[n - 1].text == "(" || tokens[n - 1].text == ",") ||
+        word(tokens[n - 1], "to")) continue;
+    if (!(word(tokens[n + 1], "begin") || tokens[n + 1].text == "(" || tokens[n + 1].text == ":")) continue;
+    std::size_t body = n + 1;
+    while (body < tokens.size() && tokens[body].kind != TokenKind::End && !word(tokens[body], "begin")) ++body;
+    if (body >= tokens.size() || tokens[body].kind == TokenKind::End) { ast.complete = false; continue; }
+    int depth = 1;
+    std::size_t end = body;
+    while (++end < tokens.size() && tokens[end].kind != TokenKind::End && depth) {
+      if (word(tokens[end], "begin") || word(tokens[end], "try") || word(tokens[end], "case")) ++depth;
+      else if (word(tokens[end], "end")) --depth;
+    }
+    if (depth) { ast.complete = false; continue; }
+    AstDeclaration declaration;
+    declaration.name = "<anonymous@" + std::to_string(tokens[n].range.begin.offset) + ">";
+    declaration.kind = "anonymousMethod"; declaration.anonymous = true;
+    declaration.visibility = "private"; declaration.scope = ast.name;
+    declaration.range = {tokens[n].range.begin, tokens[end - 1].range.end};
+    // The loop increments once after the terminating end; range is half-open.
+    declaration.signature = sourceSlice(source, {tokens[n].range.begin, tokens[body].range.begin});
+    for (const auto& routine : ast.declarations)
+      if ((routine.kind == "procedure" || routine.kind == "function") && routine.ownerType.empty() &&
+          routine.range.begin.offset < tokens[n].range.begin.offset)
+        declaration.enclosingRoutine = routine.name;
+    ast.declarations.push_back(std::move(declaration));
+  }
   return ast;
 }
 
 std::string jsonEscape(std::string_view value) {
+  return jsonSourceBytes(value);
+#if 0
   std::string result;
   for (const char c : value) {
     switch (c) {
@@ -813,6 +985,7 @@ std::string jsonEscape(std::string_view value) {
     }
   }
   return result;
+#endif
 }
 
 }  // namespace
@@ -864,14 +1037,22 @@ AnalysisResult Analyzer::analyze() const {
   result.unitMappings = unitMappings_;
   result.units.reserve(inputs_.size());
   const PreprocessorOptions preprocessorOptions{defines_, includePaths_, 64};
+  std::vector<PreprocessResult> sourceMaps;
   for (const auto& input : inputs_) {
     const auto preprocessed = preprocess(input.path, input.source, preprocessorOptions);
-    auto ast = parseSource(input.path, preprocessed.source);
+    sourceMaps.push_back(preprocessed);
+    auto ast = parseSource(input.path, preprocessed.expandedSource);
     ast.sourceHash = sha256(input.source);
     ast.complete = ast.complete && preprocessed.complete;
+    // Keep internal expanded ranges until dependency analysis has completed.
+    // Serialization remaps them to the original files using this source map.
     ast.includesResolved = preprocessed.includesResolved;
     ast.inactiveRanges = preprocessed.inactiveRanges;
-    ast.preprocessorReasons = preprocessed.reasons;
+    ast.preprocessorReasons.insert(ast.preprocessorReasons.end(), preprocessed.reasons.begin(), preprocessed.reasons.end());
+    if (!ast.complete) result.diagnostics.push_back("source_parse_incomplete: " + input.path.generic_string());
+    for (const auto& diagnostic : ast.parseDiagnostics)
+      result.diagnostics.push_back(diagnostic.code + ": " + input.path.generic_string() + ":" +
+                                   std::to_string(diagnostic.position.line) + ":" + diagnostic.message);
     result.includesResolved.insert(result.includesResolved.end(), preprocessed.includesResolved.begin(),
                                    preprocessed.includesResolved.end());
     result.inactiveRanges.insert(result.inactiveRanges.end(), preprocessed.inactiveRanges.begin(),
@@ -1086,6 +1267,38 @@ AnalysisResult Analyzer::analyze() const {
   };
   for (std::size_t i = 0; i < result.units.size(); ++i)
     if (marks[i] == Mark::None) visit(visit, i);
+  for (std::size_t u = 0; u < sourceMaps.size(); ++u) {
+    auto& ast = result.units[u].ast;
+    const auto& origins = sourceMaps[u].origins;
+    auto remap = [&](SourceRange& range) {
+      if (origins.empty() || range.begin.offset >= origins.size() || range.end.offset >= origins.size()) {
+        ast.complete = false; return;
+      }
+      const auto begin = origins[range.begin.offset];
+      auto end = origins[range.end.offset];
+      if (end.file != begin.file && range.end.offset > range.begin.offset) {
+        end = origins[range.end.offset - 1];
+        ++end.position.offset; ++end.position.column;
+      }
+      if (end.file != begin.file) {
+        ast.complete = false;
+        ast.preprocessorReasons.push_back("cross_file_span_requires_review");
+        return;
+      }
+      range.begin = begin.position; range.end = end.position; range.sourceFile = begin.file;
+    };
+    for (auto& declaration : ast.declarations) {
+      remap(declaration.range); declaration.sourceFile = declaration.range.sourceFile;
+      for (auto& parameter : declaration.parameters) remap(parameter.range);
+    }
+    for (auto& item : ast.exports) remap(item.range);
+    for (auto& item : ast.uses) remap(item.range);
+    for (auto& item : ast.references) remap(item.range);
+    for (auto& item : ast.inheritance) remap(item.range);
+    for (auto& call : ast.calls) { remap(call.range); for (auto& arg : call.arguments) remap(arg.range); }
+    for (auto& item : ast.assignments) { remap(item.range); for (auto& arg : item.arguments) remap(arg.range); }
+    for (auto& dep : result.units[u].dependencies) for (auto& reference : dep.references) remap(reference.range);
+  }
   return result;
 }
 
@@ -1241,7 +1454,10 @@ std::string toProjectJson(const AnalysisResult& result, std::string_view plugin,
              << jsonEscape(declaration.name) << "\",\"visibility\":\""
              << jsonEscape(declaration.visibility) << "\"";
       if (!declaration.type.empty()) output << ",\"type\":\"" << jsonEscape(declaration.type) << "\"";
-      if (!declaration.scope.empty()) output << ",\"scope\":\"" << jsonEscape(declaration.scope) << "\"";
+       if (!declaration.scope.empty()) output << ",\"scope\":\"" << jsonEscape(declaration.scope) << "\"";
+       if (declaration.anonymous) output << ",\"anonymous\":true,\"enclosing_routine\":\"" << jsonEscape(declaration.enclosingRoutine) << "\"";
+       output << ",\"source_file\":\"" << jsonEscape((declaration.sourceFile.empty() ? unit.ast.file : declaration.sourceFile).generic_string())
+              << "\",\"offset_unit\":\"byte\",\"column_unit\":\"byte\"";
       output << ',';
       writePosition(output, declaration.range);
       output << ",\"parameters\":[";
@@ -1261,15 +1477,21 @@ std::string toProjectJson(const AnalysisResult& result, std::string_view plugin,
       const auto& call = unit.ast.calls[c];
       output << "{\"name\":\"" << jsonEscape(call.name) << "\",";
       writePosition(output, call.range);
+      output << ",\"source_file\":\"" << jsonEscape((call.range.sourceFile.empty() ? unit.ast.file : call.range.sourceFile).generic_string())
+             << "\",\"offset_unit\":\"byte\"";
       output << ",\"arguments\":[";
       for (std::size_t a = 0; a < call.arguments.size(); ++a) {
         if (a) output << ',';
         const auto& argument = call.arguments[a];
         output << "{\"kind\":\"" << jsonEscape(argument.kind) << "\",\"text\":\""
                << jsonEscape(argument.text) << "\"";
-        if (!argument.resolvedType.empty())
-          output << ",\"resolvedType\":\"" << jsonEscape(argument.resolvedType) << "\"";
-        output << '}';
+         if (!argument.resolvedType.empty())
+           output << ",\"resolvedType\":\"" << jsonEscape(argument.resolvedType) << "\"";
+         output << ',';
+         writePosition(output, argument.range);
+         output << ",\"source_file\":\"" << jsonEscape((argument.range.sourceFile.empty() ? unit.ast.file : argument.range.sourceFile).generic_string())
+                << "\",\"offset_unit\":\"byte\"";
+         output << '}';
       }
       output << ']';
       if (!call.assignmentTarget.text.empty()) {

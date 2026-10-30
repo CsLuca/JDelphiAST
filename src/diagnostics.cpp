@@ -125,27 +125,38 @@ InferredType inferType(const UnitAst& ast, std::string expression,
   for (const auto& declaration : ast.declarations) {
     const auto kind = lower(declaration.kind);
     if (kind != "procedure" && kind != "function" && kind != "constructor" && kind != "destructor") continue;
-    if (declaration.range.begin.offset <= sourceOffset &&
+    if (declaration.ownerType.empty() && declaration.bodyRange.end.offset > sourceOffset && declaration.range.begin.offset <= sourceOffset &&
         (!enclosingRoutine || declaration.range.begin.offset >= enclosingRoutine->range.begin.offset))
       enclosingRoutine = &declaration;
   }
-  if (enclosingRoutine) for (const auto& parameter : enclosingRoutine->parameters)
+  if (enclosingRoutine) for (const auto& declaration : ast.declarations)
+    if (lower(declaration.name) == key && lower(declaration.kind) == "localvariable" &&
+        lower(declaration.scope) == lower(enclosingRoutine->name) && declaration.range.begin.offset <= sourceOffset)
+      matches.push_back({declaration.type, "local_variable", "high"});
+  if (matches.empty() && enclosingRoutine) for (const auto& parameter : enclosingRoutine->parameters)
     if (lower(parameter.name) == key && !parameter.type.empty())
       matches.push_back({parameter.type, "parameter", "high"});
+  const bool scopedMatch = !matches.empty();
   for (const auto& declaration : ast.declarations) {
+    if (scopedMatch) break;
+    const auto kind = lower(declaration.kind);
+    if (kind != "variable" && kind != "localvariable" && kind != "field" && kind != "property") continue;
+    if ((kind == "field" || kind == "property") &&
+        (!enclosingRoutine || enclosingRoutine->name.find('.') == std::string::npos ||
+         lower(declaration.ownerType) != lower(enclosingRoutine->name.substr(0, enclosingRoutine->name.find_last_of('.'))))) continue;
     if (lower(simpleName(declaration.name)) == key && !declaration.type.empty() &&
         (lower(declaration.kind) != "localvariable" ||
          (enclosingRoutine && lower(declaration.scope) == lower(enclosingRoutine->name)))) {
-      const auto kind = lower(declaration.kind);
       matches.push_back({declaration.type,
           kind == "property" ? "property" : kind == "field" ? "field" :
           declaration.visibility == "private" ? "local_variable" : "global", "high"});
     }
   }
   if (matches.empty()) for (const auto& unit : index) for (const auto& declaration : unit.declarations) {
+    if (!std::any_of(ast.uses.begin(), ast.uses.end(), [&](const UsesItem& use) { return lower(use.name) == lower(unit.name); })) continue;
     if (lower(simpleName(declaration.name)) != key || declaration.type.empty()) continue;
     const auto kind = lower(declaration.kind);
-    if (kind == "variable" || kind == "field" || kind == "property")
+    if (kind == "variable" && declaration.ownerType.empty())
       matches.push_back({declaration.type, kind == "property" ? "property" : kind == "field" ? "field" : "global", "high"});
   }
   if (matches.empty()) return {};
