@@ -51,6 +51,10 @@ int main(int argc, char** argv) {
   }
   require(overloads == 2, "two distinct interface overloads");
   auto invalid = parseUnit("Bad.pas", "unit Bad; interface procedure Run(; implementation end.");
+  auto indexed = parseUnit("Indexed.pas", "unit Indexed; interface implementation procedure Run; begin CampiObj['IdArtico'] := Query.FieldByName('IdLotSer').AsInteger; end; end.");
+  require(std::any_of(indexed.assignments.begin(), indexed.assignments.end(), [](const AstAssignment& assignment) {
+    return assignment.left == "CampiObj['IdArtico']" && assignment.right == "Query.FieldByName('IdLotSer').AsInteger";
+  }), "indexed ID producer/consumer assignment retained without inferred domain");
   require(!invalid.complete && invalid.name == "Bad", "malformed source returns incomplete without exception");
   auto incomplete = parseUnit("Half.pas", "unit Half; interface type T = class");
   require(!incomplete.complete, "unfinished unit rejected");

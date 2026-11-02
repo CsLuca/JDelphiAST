@@ -137,6 +137,7 @@ struct SymbolReference {
 };
 
 struct UnitAst {
+  std::vector<ConcreteToken> concreteTokens;
   struct ParseDiagnostic {
     std::string code;
     std::string message;

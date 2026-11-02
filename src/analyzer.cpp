@@ -790,7 +790,23 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
     if (tokens[i].kind == TokenKind::Identifier) {
       std::size_t assignmentOperator = i;
       SourceRange leftRange;
-      const auto left = qualifiedName(tokens, assignmentOperator, &leftRange);
+      auto left = qualifiedName(tokens, assignmentOperator, &leftRange);
+      // Preserve indexed property/array targets as expressions. Their schema
+      // or receiver type still requires an explicit semantic contract.
+      if (tokens[assignmentOperator].text == "[") {
+        int indexDepth = 1;
+        std::size_t close = assignmentOperator + 1;
+        while (tokens[close].kind != TokenKind::End && indexDepth) {
+          if (tokens[close].text == "[") ++indexDepth;
+          else if (tokens[close].text == "]") --indexDepth;
+          ++close;
+        }
+        if (indexDepth == 0) {
+          leftRange.end = tokens[close - 1].range.end;
+          left = sourceSlice(source, leftRange);
+          assignmentOperator = close;
+        } else ast.complete = false;
+      }
       if (tokens[assignmentOperator].text == ":" && tokens[assignmentOperator + 1].text == "=") {
         std::size_t end = assignmentOperator + 2;
         int parentheses = 0;
@@ -1043,6 +1059,7 @@ AnalysisResult Analyzer::analyze() const {
     sourceMaps.push_back(preprocessed);
     auto ast = parseSource(input.path, preprocessed.expandedSource);
     ast.sourceHash = sha256(input.source);
+    ast.concreteTokens = tokenizeConcrete(input.source).tokens;
     ast.complete = ast.complete && preprocessed.complete;
     // Keep internal expanded ranges until dependency analysis has completed.
     // Serialization remaps them to the original files using this source map.
@@ -1289,6 +1306,7 @@ AnalysisResult Analyzer::analyze() const {
     };
     for (auto& declaration : ast.declarations) {
       remap(declaration.range); declaration.sourceFile = declaration.range.sourceFile;
+      if (declaration.bodyRange.end.offset > declaration.bodyRange.begin.offset) remap(declaration.bodyRange);
       for (auto& parameter : declaration.parameters) remap(parameter.range);
     }
     for (auto& item : ast.exports) remap(item.range);
@@ -1460,6 +1478,11 @@ std::string toProjectJson(const AnalysisResult& result, std::string_view plugin,
               << "\",\"offset_unit\":\"byte\",\"column_unit\":\"byte\"";
       output << ',';
       writePosition(output, declaration.range);
+      if (declaration.bodyRange.end.offset > declaration.bodyRange.begin.offset) {
+        output << ",\"body_range\":{";
+        writePosition(output, declaration.bodyRange);
+        output << ",\"source_file\":\"" << jsonEscape(declaration.bodyRange.sourceFile.generic_string()) << "\",\"offset_unit\":\"byte\"}";
+      }
       output << ",\"parameters\":[";
       for (std::size_t p = 0; p < declaration.parameters.size(); ++p) {
         if (p) output << ',';
@@ -1470,6 +1493,16 @@ std::string toProjectJson(const AnalysisResult& result, std::string_view plugin,
         output << '}';
       }
       output << "]}";
+    }
+    output << "],\"trivia\":[";
+    bool firstTrivia = true;
+    for (const auto& token : unit.ast.concreteTokens) {
+      if (token.kind != "comment" && token.kind != "directive") continue;
+      if (!firstTrivia) output << ',';
+      firstTrivia = false;
+      output << "{\"kind\":\"" << token.kind << "\",\"text\":\"" << jsonEscape(token.bytes) << "\",";
+      writePosition(output, token.range);
+      output << '}';
     }
     output << "],\"calls\":[";
     for (std::size_t c = 0; c < unit.ast.calls.size(); ++c) {
@@ -1526,6 +1559,8 @@ std::string toProjectJson(const AnalysisResult& result, std::string_view plugin,
       }
       output << "]},";
       writePosition(output, assignment.range);
+      output << ",\"source_file\":\"" << jsonEscape((assignment.range.sourceFile.empty() ? unit.ast.file : assignment.range.sourceFile).generic_string())
+             << "\",\"offset_unit\":\"byte\"";
       output << '}';
     }
     output << "],\"unit_mapping\":{\"available\":" << (result.unitMappingCatalogValid ? "true" : "false")
