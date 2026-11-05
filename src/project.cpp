@@ -635,12 +635,19 @@ std::vector<std::filesystem::path> packageSources(const std::string& source) {
   std::vector<std::filesystem::path> result;
   const auto tokens = packageTokens(source);
   std::size_t i = 0;
+  const bool application = std::any_of(tokens.begin(), tokens.end(), [](const PackageToken& token) {
+    return token.kind == PackageToken::Kind::Identifier && (lower(token.text) == "program" || lower(token.text) == "library");
+  });
   while (i < tokens.size() && !(tokens[i].kind == PackageToken::Kind::Identifier &&
-                                lower(tokens[i].text) == "contains")) ++i;
+                                lower(tokens[i].text) == (application ? "uses" : "contains"))) ++i;
   if (i == tokens.size()) return result;
   for (++i; i < tokens.size() && tokens[i].text != ";";) {
     if (tokens[i].kind != PackageToken::Kind::Identifier) { ++i; continue; }
-    const auto unitName = tokens[i++].text;
+    auto unitName = tokens[i++].text;
+    while (i + 1 < tokens.size() && tokens[i].text == "." && tokens[i + 1].kind == PackageToken::Kind::Identifier) {
+      unitName += "." + tokens[i + 1].text;
+      i += 2;
+    }
     if (i + 1 < tokens.size() && tokens[i].kind == PackageToken::Kind::Identifier &&
         lower(tokens[i].text) == "in" && tokens[i + 1].kind == PackageToken::Kind::String) {
       result.push_back(delphiPath(tokens[i + 1].text));
@@ -941,6 +948,16 @@ static std::vector<IndexedUnit> parseSymbolIndex(std::istream& input) {
           if (parts.size() >= 6) declaration.isOverride = lower(decode(parts[5])) == "override";
           if (parts.size() >= 7) declaration.reintroduced = lower(decode(parts[6])) == "reintroduce";
           if (parts.size() >= 8) declaration.deprecated = lower(decode(parts[7])) == "deprecated";
+          if (parts.size() >= 9) declaration.stringMode = decode(parts[8]);
+          if (parts.size() >= 10) declaration.rttiMode = decode(parts[9]);
+          if (parts.size() >= 11) declaration.typedConstantMode = decode(parts[10]);
+          if (parts.size() >= 12) declaration.typedAddressMode = decode(parts[11]);
+          if (parts.size() >= 13) declaration.variantPropertySetterMode = decode(parts[12]);
+          if (parts.size() >= 14) {
+            const auto defaults = splitPreservingEmpty(decode(parts[13]), '|');
+            for (std::size_t n = 0; n < defaults.size() && n < declaration.parameters.size(); ++n)
+              if (defaults[n].starts_with("1:")) declaration.parameters[n].defaultValue = decode(defaults[n].substr(2));
+          }
           const auto ownerSeparator = declaration.name.find_last_of('.');
           if (ownerSeparator != std::string::npos) declaration.ownerType = declaration.name.substr(0, ownerSeparator);
           unit.declarations.push_back(std::move(declaration));
@@ -1301,6 +1318,25 @@ std::string createSymbolIndex(const std::vector<std::filesystem::path>& sources,
 IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sources,
                                   const IndexBuildOptions& options) {
   IndexBuildResult result;
+  auto preprocessing = options.projectOptions;
+  std::vector<std::string> configurationDiagnostics;
+  const bool configured = !preprocessing.dprojFile.empty();
+  if (configured) {
+    if (!std::filesystem::is_regular_file(preprocessing.dprojFile))
+      throw std::runtime_error("Index DPROJ not found: " + pathToUtf8(preprocessing.dprojFile));
+    loadDproj(preprocessing.dprojFile, preprocessing, configurationDiagnostics);
+    preprocessing.defines.push_back(preprocessing.configuration);
+    if (lower(preprocessing.platform) == "win32") {
+      preprocessing.defines.insert(preprocessing.defines.end(), {"MSWINDOWS", "WIN32", "CPUX86"});
+    } else if (lower(preprocessing.platform) == "win64") {
+      preprocessing.defines.insert(preprocessing.defines.end(), {"MSWINDOWS", "WIN64", "CPUX64"});
+    }
+    for (const auto& message : configurationDiagnostics) {
+      result.diagnostics.push_back({preprocessing.dprojFile, "configuration_incomplete", "dproj_configuration_unresolved", "error", message});
+      result.hasBlockingErrors = true;
+    }
+  }
+  result.resolvedProjectOptions = preprocessing;
   const auto severityPolicy = loadValidationPolicy(options.validationPolicy);
   const auto severity = [&](std::string_view code, std::string_view fallback) {
     const auto found = severityPolicy.severities.find(lower(std::string(code)));
@@ -1312,7 +1348,31 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
   auto allSources = sources;
   allSources.insert(allSources.end(), options.sourceRoots.begin(), options.sourceRoots.end());
   for (const auto& source : allSources) {
-    if (std::filesystem::is_regular_file(source)) files.push_back(source);
+    if (std::filesystem::is_regular_file(source)) {
+      if (lower(pathToUtf8(source.extension())) == ".dpk") {
+        packages.push_back(source);
+        for (auto member : packageSources(readFile(source))) {
+          if (member.is_relative()) member = source.parent_path() / member;
+          if (lower(pathToUtf8(member.extension())) == ".pas") {
+            if (!std::filesystem::is_regular_file(member) && member.parent_path() == source.parent_path()) {
+              std::vector<std::filesystem::path> candidates;
+              for (const auto& directory : preprocessing.searchPaths) {
+                const auto candidate = directory / member.filename();
+                if (std::filesystem::is_regular_file(candidate)) candidates.push_back(std::filesystem::absolute(candidate).lexically_normal());
+              }
+              std::sort(candidates.begin(), candidates.end());
+              candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+              if (candidates.size() == 1) member = candidates.front();
+              else if (candidates.size() > 1) {
+                result.hasBlockingErrors = true;
+                result.diagnostics.push_back({member, "ambiguous_source", "package_source_ambiguous", "error", "Multiple explicit search paths contain package unit."});
+              }
+            }
+            files.push_back(member);
+          }
+        }
+      } else files.push_back(source);
+    }
     else if (std::filesystem::is_directory(source)) {
       std::error_code iteratorError;
       std::filesystem::recursive_directory_iterator iterator(
@@ -1409,7 +1469,51 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
       result.diagnostics.push_back({file, "read_failed", "file_read_error", level, error.what()});
       continue;
     }
-    try { ast = parseUnit(file, sourceText); }
+    const auto originalHash = sourceFingerprint(sourceText);
+    result.sourceFingerprints.emplace_back(file, originalHash);
+    if (options.interfaceOnly) {
+      const auto concrete = tokenizeConcrete(sourceText);
+      const auto implementation = std::find_if(concrete.tokens.begin(), concrete.tokens.end(), [](const ConcreteToken& token) {
+        return lower(token.bytes) == "implementation";
+      });
+      if (!concrete.complete || implementation == concrete.tokens.end()) {
+        result.hasBlockingErrors = true;
+        result.diagnostics.push_back({file, "interface_boundary_missing", "interface_boundary_missing", "error", "No lossless implementation boundary found."});
+        continue;
+      }
+      sourceText = sourceText.substr(0, implementation->range.begin.offset) + "implementation\nend.\n";
+      result.diagnostics.push_back({file, "interface_only", "implementation_not_indexed", "warning", "Only original interface declarations are indexed; implementation and runtime semantics are excluded."});
+    }
+    try {
+      if (configured) {
+        Analyzer sourceAnalyzer;
+        sourceAnalyzer.setPreprocessor(preprocessing.defines, preprocessing.includePaths, preprocessing.compilerVersion);
+        sourceAnalyzer.setBuildContext(preprocessing.configuration, preprocessing.platform);
+        sourceAnalyzer.addSource(file, sourceText);
+        auto analysis = sourceAnalyzer.analyze();
+        const auto includeEvidence = preprocess(file, sourceText, {preprocessing.defines, preprocessing.includePaths, 64, preprocessing.compilerVersion});
+        for (const auto& included : includeEvidence.includedSources) {
+          auto known = std::find_if(result.includeFingerprints.begin(), result.includeFingerprints.end(),
+              [&](const auto& entry) { return entry.first == included.file; });
+          const auto includeHash = sourceFingerprint(readFile(included.file));
+          if (known == result.includeFingerprints.end())
+            result.includeFingerprints.emplace_back(included.file, includeHash);
+          else if (known->second != includeHash) {
+            result.hasBlockingErrors = true;
+            result.diagnostics.push_back({included.file, "identity_changed", "include_changed_during_index", "error", "Include bytes changed during indexing."});
+          }
+        }
+        ast = std::move(analysis.units.front().ast);
+        if (!analysis.preprocessorComplete) {
+          result.hasBlockingErrors = true;
+          std::string details = "Index preprocessing incomplete; no authoritative exports generated.";
+          for (const auto& reason : includeEvidence.reasons) details += " " + reason;
+          result.diagnostics.push_back({file, "preprocessing_incomplete", "index_preprocessing_unresolved", "error", details});
+          continue;
+        }
+      } else ast = parseUnit(file, sourceText);
+      ast.sourceHash = originalHash;
+    }
     catch (const std::exception& error) {
       ++result.statistics.filesParseFailed;
       const auto level = severity("parse_failure", "error");
@@ -1530,7 +1634,8 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
     bool flag = false;
     if (unit.hasInitialization) { output << "initialization"; flag = true; }
     if (unit.hasFinalization) { if (flag) output << ','; output << "finalization"; }
-    if (!unit.complete) { if (flag) output << ','; output << "partial"; }
+    if (flag || unit.hasFinalization) output << ',';
+    output << (unit.complete ? "complete" : "partial");
     output << '|';
     auto declarations = unit.declarations;
     for (const auto& exported : unit.exports) {
@@ -1568,9 +1673,27 @@ IndexBuildResult buildSymbolIndex(const std::vector<std::filesystem::path>& sour
              << (declaration.isOverride ? "override" : "") << ','
              << (declaration.reintroduced ? "reintroduce" : "") << ','
              << (declaration.deprecated ? "deprecated" : "");
+      output << ',' << encode(declaration.stringMode) << ',' << encode(declaration.rttiMode)
+             << ',' << encode(declaration.typedConstantMode) << ',' << encode(declaration.typedAddressMode)
+             << ',' << encode(declaration.variantPropertySetterMode);
+      std::string defaults;
+      for (std::size_t p = 0; p < declaration.parameters.size(); ++p) {
+        if (p) defaults += '|';
+        defaults += declaration.parameters[p].defaultValue ? "1:" + encode(*declaration.parameters[p].defaultValue) : "0:";
+      }
+      output << ',' << encode(defaults);
     }
     output << "|source=" << encode(genericPathToUtf8(unit.file)) << ";version=" << encode(options.version)
             << ";origin=" << encode(options.origin);
+    if (options.interfaceOnly) output << ";coverage=interface_only;implementation=not_indexed";
+    if (configured) {
+      output << ";configuration=" << encode(preprocessing.configuration)
+             << ";platform=" << encode(preprocessing.platform)
+             << ";configuration_project=" << encode(genericPathToUtf8(preprocessing.dprojFile))
+             << ";configuration_sha256=" << encode(sourceFingerprint(readFile(preprocessing.dprojFile)))
+             << ";source_sha256=" << encode(unit.sourceHash);
+      if (preprocessing.compilerVersion) output << ";compiler_version=" << *preprocessing.compilerVersion;
+    }
     if (!unit.complete) output << ";confidence=low;diagnostics=incomplete_unit";
     if (const auto metadata = packageByFile.find(lower(pathToUtf8(std::filesystem::absolute(unit.file).lexically_normal())));
         metadata != packageByFile.end()) {
@@ -1628,7 +1751,26 @@ std::string indexBuildResultJson(const IndexBuildResult& result, const std::file
     else if (diagnostic.severity == "warning") ++warnings;
     else ++infos;
   }
-  output << "{\"schema_version\":\"1.0\",\"index\":\"" << escape(genericPathToUtf8(outputPath))
+  output << "{\"schema_version\":\"1.0\",\"provenance\":{\"configuration\":\""
+         << escape(result.resolvedProjectOptions.configuration) << "\",\"platform\":\""
+         << escape(result.resolvedProjectOptions.platform) << "\",\"project\":\""
+         << escape(genericPathToUtf8(result.resolvedProjectOptions.dprojFile)) << "\",\"defines\":[";
+  for (std::size_t n = 0; n < result.resolvedProjectOptions.defines.size(); ++n) {
+    if (n) output << ',';
+    output << '"' << escape(result.resolvedProjectOptions.defines[n]) << '"';
+  }
+  output << "],\"sources\":[";
+  const auto fingerprints = [&](const auto& entries) {
+    for (std::size_t n = 0; n < entries.size(); ++n) {
+      if (n) output << ',';
+      output << "{\"file\":\"" << escape(genericPathToUtf8(entries[n].first))
+             << "\",\"sha256\":\"" << escape(entries[n].second) << "\"}";
+    }
+  };
+  fingerprints(result.sourceFingerprints);
+  output << "],\"includes\":[";
+  fingerprints(result.includeFingerprints);
+  output << "]},\"index\":\"" << escape(genericPathToUtf8(outputPath))
          << "\",\"validation\":{\"has_blocking_errors\":" << (result.hasBlockingErrors ? "true" : "false")
          << ",\"error_count\":" << errors << ",\"warning_count\":" << warnings
          << ",\"info_count\":" << infos << ",\"blocking_errors\":[";
@@ -1695,7 +1837,7 @@ ProjectLoadResult loadPackage(const std::filesystem::path& packageFile, ProjectO
   addDefine(result.options.configuration);
   if (lower(result.options.platform) == "win32") { addDefine("MSWINDOWS"); addDefine("WIN32"); addDefine("CPUX86"); }
   else if (lower(result.options.platform) == "win64") { addDefine("MSWINDOWS"); addDefine("WIN64"); addDefine("CPUX64"); }
-  result.analyzer.setPreprocessor(result.options.defines, result.options.includePaths);
+  result.analyzer.setPreprocessor(result.options.defines, result.options.includePaths, result.options.compilerVersion);
   result.analyzer.setBuildContext(result.options.configuration, result.options.platform);
   if (!result.options.unitMappingCatalog.empty()) {
     try {
@@ -1732,14 +1874,24 @@ ProjectLoadResult loadPackage(const std::filesystem::path& packageFile, ProjectO
   }
 
   const auto dpkSource = readFile(package);
+  const auto extension = lower(pathToUtf8(package.extension()));
+  if (extension == ".dpr")
+    result.diagnostics.push_back("application_entrypoint_not_semantically_analyzed: " + pathToUtf8(package));
   std::vector<std::filesystem::path> pending;
   for (auto relative : packageSources(dpkSource)) {
     if (relative.is_relative()) relative = packageDir / relative;
     pending.push_back(relative.lexically_normal());
   }
-  if (pending.empty()) result.diagnostics.push_back("No source units found in package contains clause");
+  if (extension == ".dpr" && std::filesystem::is_regular_file(dproj)) {
+    for (auto relative : dprojSources(readFile(dproj))) {
+      if (relative.is_relative()) relative = dproj.parent_path() / relative;
+      pending.push_back(relative.lexically_normal());
+    }
+  }
+  if (pending.empty()) result.diagnostics.push_back("No source units found in project declaration");
 
   std::unordered_set<std::string> loaded;
+  std::unordered_map<std::string, std::optional<FoundUnit>> unitLookupCache;
   while (!pending.empty()) {
     auto path = std::filesystem::absolute(pending.back()).lexically_normal();
     pending.pop_back();
@@ -1750,18 +1902,26 @@ ProjectLoadResult loadPackage(const std::filesystem::path& packageFile, ProjectO
       continue;
     }
     const auto source = readFile(path);
-    const auto preprocessed = preprocess(path, source, {result.options.defines, result.options.includePaths, 64});
+    const auto preprocessed = preprocess(path, source, {result.options.defines, result.options.includePaths, 64, result.options.compilerVersion});
     const auto ast = parseUnit(path, preprocessed.source);
     result.analyzer.addSource(path, source);
     result.sourceFiles.push_back(path);
     loaded.insert(key);
+    if (result.options.noSourceDependencies) continue;
     for (const auto& use : ast.uses) {
-      if (const auto found = findUnit(use.name, result.options.searchPaths, result.options.namespaces)) {
+      const auto useKey = lower(use.name);
+      if (!unitLookupCache.contains(useKey))
+        unitLookupCache.emplace(useKey, findUnit(use.name, result.options.searchPaths, result.options.namespaces));
+      if (const auto& found = unitLookupCache.at(useKey)) {
         if (lower(found->candidateName) != lower(use.name)) result.analyzer.addUnitAlias(use.name, found->candidateName);
         if (!loaded.contains(lower(pathToUtf8(std::filesystem::absolute(found->path).lexically_normal()))))
           pending.push_back(found->path);
       }
     }
+  }
+  if (result.options.noSourceDependencies) {
+    result.analyzer.setEnvironmentComplete(false);
+    result.diagnostics.push_back("source_dependency_scan_disabled: dependency evidence limited to supplied indexes");
   }
   for (const auto& diagnostic : result.diagnostics) result.analyzer.addDiagnostic(diagnostic);
   return result;

@@ -246,6 +246,17 @@ std::string queryTimeoutJson(std::string_view schema, std::string_view command,
 }
 
 std::filesystem::path packageFromDproj(const std::filesystem::path& dproj) {
+  std::ifstream input(dproj, std::ios::binary);
+  if (!input) throw std::runtime_error("Cannot read DPROJ: " + dproj.string());
+  const std::string text{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+  std::smatch mainSource;
+  if (std::regex_search(text, mainSource, std::regex(R"(<MainSource>\s*([^<]+?)\s*</MainSource>)", std::regex::icase))) {
+    auto value = mainSource[1].str();
+    std::replace(value.begin(), value.end(), '\\', '/');
+    auto source = std::filesystem::path(value);
+    if (source.is_relative()) source = dproj.parent_path() / source;
+    return source.lexically_normal();
+  }
   auto package = dproj;
   package.replace_extension(".dpk");
   return package;
@@ -301,6 +312,11 @@ SYMBOL QUERY FILTERS
   --class <name>            Class to inspect in a hierarchy query.
 
 INDEX OPTIONS
+  --dproj <file.dproj>      Apply explicit project defines/includes before indexing.
+  --config <name>          Index project configuration (default Release).
+  --platform <name>        Index target platform (default Win32).
+  --include-path <dir>     Additional include directory for configured indexing.
+  --interface-only        Index original interface declarations; exclude implementation.
   --source <path>           Pascal file or source tree. May be repeated.
   --version <v500|v600>     Catalog version persisted in the JDI.
   --left-index <file.jdi>   Legacy side of compare-symbol.
@@ -760,6 +776,8 @@ int main(int argc, char** argv) {
     std::vector<std::filesystem::path> sourceRoots, packageRoots;
     std::filesystem::path validationPolicy;
     bool jsonOutput = false;
+    bool interfaceOnly = false;
+    jdelphiast::ProjectOptions indexProjectOptions;
     for (int i = 2; i < argc; ++i) {
       const std::string argument = argv[i];
       if (argument == "--format") {
@@ -768,17 +786,35 @@ int main(int argc, char** argv) {
         continue;
       }
       if ((argument == "--source" || argument == "--output" || argument == "--version" || argument == "--origin" ||
-           argument == "--source-root" || argument == "--package-root" || argument == "--validation-policy") && i + 1 >= argc) {
+            argument == "--source-root" || argument == "--package-root" || argument == "--validation-policy" ||
+            argument == "--dproj" || argument == "--config" || argument == "--platform" || argument == "--search-path" || argument == "--include-path" || argument == "--compiler-version") && i + 1 >= argc) {
         std::cerr << "Missing value for " << argument << '\n';
         return 2;
       }
-      if (argument == "--source") sources.emplace_back(argv[++i]);
+       if (argument == "--interface-only") interfaceOnly = true;
+       else if (argument == "--source") sources.emplace_back(argv[++i]);
+       else if (argument == "--source-list") {
+         if (++i >= argc) return 2;
+         std::ifstream list(argv[i]);
+         if (!list) { std::cerr << "Cannot read source list\n"; return 2; }
+         std::string path;
+         while (std::getline(list, path)) {
+           if (!path.empty() && path.back() == '\r') path.pop_back();
+           if (!path.empty()) sources.emplace_back(path);
+         }
+       }
       else if (argument == "--output") indexOutput = argv[++i];
       else if (argument == "--version") indexVersion = argv[++i];
       else if (argument == "--origin") origin = argv[++i];
       else if (argument == "--source-root") sourceRoots.emplace_back(argv[++i]);
       else if (argument == "--package-root") packageRoots.emplace_back(argv[++i]);
       else if (argument == "--validation-policy") validationPolicy = argv[++i];
+      else if (argument == "--dproj") indexProjectOptions.dprojFile = argv[++i];
+      else if (argument == "--config") indexProjectOptions.configuration = argv[++i];
+      else if (argument == "--platform") indexProjectOptions.platform = argv[++i];
+      else if (argument == "--include-path") indexProjectOptions.includePaths.emplace_back(argv[++i]);
+      else if (argument == "--search-path") indexProjectOptions.searchPaths.emplace_back(argv[++i]);
+      else if (argument == "--compiler-version") indexProjectOptions.compilerVersion = std::stod(argv[++i]);
       else { std::cerr << "Unknown index option: " << argument << '\n'; return 2; }
     }
     if ((sources.empty() && sourceRoots.empty()) || indexOutput.empty()) {
@@ -787,11 +823,13 @@ int main(int argc, char** argv) {
     }
     try {
       jdelphiast::IndexBuildOptions options;
+      options.interfaceOnly = interfaceOnly;
       options.version = indexVersion;
       options.origin = origin;
       options.sourceRoots = sourceRoots;
       options.packageRoots = packageRoots;
       options.validationPolicy = validationPolicy;
+      options.projectOptions = indexProjectOptions;
       const auto result = jdelphiast::buildSymbolIndex(sources, options);
       if (jsonOutput) std::cout << jdelphiast::indexBuildResultJson(result, indexOutput) << '\n';
       if (result.hasBlockingErrors) {
@@ -932,6 +970,10 @@ int main(int argc, char** argv) {
     }
     if (argument == "--dproj") {
       projectOptions.dprojFile = argv[++i];
+      continue;
+    }
+    if (argument == "--no-source-dependencies") {
+      projectOptions.noSourceDependencies = true;
       continue;
     }
     if (argument == "--unit-map") {

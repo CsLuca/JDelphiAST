@@ -64,6 +64,17 @@ ConcreteSyntax tokenizeConcrete(std::string_view source) {
       if (terminated) for (unsigned n = 0; n < (brace ? 1u : 2u); ++n) advance();
     } else if (source[at] == '\'') {
       kind = "string";
+      std::size_t quoteCount = 0;
+      while (at + quoteCount < source.size() && source[at + quoteCount] == '\'') ++quoteCount;
+      const bool multiline = quoteCount >= 3 && quoteCount % 2 == 1 && at + quoteCount < source.size() &&
+          (source[at + quoteCount] == '\r' || source[at + quoteCount] == '\n');
+      if (multiline) {
+        for (std::size_t n = 0; n < quoteCount; ++n) advance();
+        const auto closing = source.find(std::string(quoteCount, '\''), position.offset);
+        terminated = closing != std::string_view::npos;
+        const auto end = terminated ? closing + quoteCount : source.size();
+        while (position.offset < end) advance();
+      } else {
       advance(); terminated = false;
       while (position.offset < source.size()) {
         if (source[position.offset] == '\'') {
@@ -72,6 +83,7 @@ ConcreteSyntax tokenizeConcrete(std::string_view source) {
           else { terminated = true; break; }
         } else if (source[position.offset] == '\r' || source[position.offset] == '\n') break;
         else advance();
+      }
       }
     } else if (std::isalpha(static_cast<unsigned char>(source[at])) || source[at] == '_') {
       kind = "identifier";

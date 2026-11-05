@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <optional>
 
 namespace jdelphiast {
 
@@ -13,6 +14,7 @@ struct PreprocessorOptions {
   std::vector<std::string> defines;
   std::vector<std::filesystem::path> includePaths;
   std::size_t maxIncludeDepth{64};
+  std::optional<double> compilerVersion;
 };
 
 struct PreprocessResult {

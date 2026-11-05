@@ -45,6 +45,37 @@ int main() {
   const auto root = std::filesystem::temp_directory_path() / ("jdelphiast-project-" + std::to_string(stamp));
   const auto sourceDir = root / "src";
   const auto sharedDir = root / "shared";
+  write(root / "Application.dpr", "program Application; uses App.Unit in 'App.Unit.pas'; begin end.");
+  write(root / "Application.dproj", "<Project><PropertyGroup><MainSource>Application.dpr</MainSource></PropertyGroup></Project>");
+  write(root / "App.Unit.pas", "unit App.Unit; interface implementation end.");
+  jdelphiast::ProjectOptions applicationOptions;
+  applicationOptions.dprojFile = root / "Application.dproj";
+  const auto applicationProject = jdelphiast::loadPackage(root / "Application.dpr", applicationOptions);
+  require(applicationProject.sourceFiles.size() == 1 && applicationProject.sourceFiles.front().filename() == "App.Unit.pas",
+          "application uses list loads qualified source unit without inventing DPK");
+  write(root / "Direct.dpk", "package Direct; contains DirectUnit in 'DirectUnit.pas'; end.");
+  write(root / "DirectUnit.pas", "unit DirectUnit; interface uses DependencyUnit; implementation end.");
+  write(root / "DependencyUnit.pas", "unit DependencyUnit; interface implementation end.");
+  jdelphiast::ProjectOptions boundedOptions;
+  boundedOptions.noSourceDependencies = true;
+  const auto boundedProject = jdelphiast::loadPackage(root / "Direct.dpk", boundedOptions);
+  require(boundedProject.sourceFiles.size() == 1 && !boundedProject.analyzer.analyze().preprocessorComplete,
+          "bounded project analysis excludes external source scan and marks environment incomplete");
+  const auto interfaceSource = root / "InterfaceOnly.pas";
+  const std::string interfaceBytes = "unit InterfaceOnly; interface type TList = class public property Count: NativeInt read GetCount; end; implementation {$IF UnsupportedExpression} X {$ENDIF} end.";
+  write(interfaceSource, interfaceBytes);
+  jdelphiast::IndexBuildOptions interfaceOptions;
+  interfaceOptions.interfaceOnly = true;
+  const auto interfaceIndex = jdelphiast::buildSymbolIndex({interfaceSource}, interfaceOptions);
+  require(!interfaceIndex.hasBlockingErrors && interfaceIndex.statistics.unitsIndexed == 1,
+          "interface-only index excludes implementation explicitly");
+  require(interfaceIndex.content.find("coverage=interface_only") != std::string::npos && interfaceIndex.content.find("|complete|") != std::string::npos,
+          "interface coverage and complete declaration flag are serialized");
+  require(interfaceIndex.sourceFingerprints.front().second == jdelphiast::sourceFingerprint(interfaceBytes),
+          "interface-only provenance hashes original full file");
+  write(root / "InterfaceOnly.jdi", interfaceIndex.content);
+  require(jdelphiast::loadSymbolIndex(root / "InterfaceOnly.jdi").front().complete,
+          "complete declaration coverage survives JDI reload");
 
   write(root / "Demo.dpk", R"(package Demo;
 requires rtl;

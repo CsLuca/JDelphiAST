@@ -2,6 +2,7 @@
 #include "jdelphiast/preprocessor.hpp"
 
 #include <algorithm>
+#include <regex>
 #include <array>
 #include <cctype>
 #include <cstdint>
@@ -123,6 +124,16 @@ class Lexer {
   Token readString() {
     const auto begin = position();
     const auto start = offset_;
+    std::size_t quoteCount = 0;
+    while (start + quoteCount < source_.size() && source_[start + quoteCount] == '\'') ++quoteCount;
+    if (quoteCount >= 3 && quoteCount % 2 == 1 && start + quoteCount < source_.size() &&
+        (source_[start + quoteCount] == '\r' || source_[start + quoteCount] == '\n')) {
+      for (std::size_t n = 0; n < quoteCount; ++n) advance();
+      const auto closing = source_.find(std::string(quoteCount, '\''), offset_);
+      const auto end = closing == std::string_view::npos ? source_.size() : closing + quoteCount;
+      while (offset_ < end) advance();
+      return {TokenKind::String, std::string(source_.substr(start, offset_ - start)), {begin, position()}};
+    }
     advance();
     while (offset_ < source_.size()) {
       if (source_[offset_] != '\'') {
@@ -237,6 +248,47 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
   ast.range = {{0, 1, 1}, tokens.back().range.end};
   ast.complete = !hasDirective;
   const auto concrete = tokenizeConcrete(source);
+  std::vector<std::pair<std::size_t, bool>> scopedEnumStates;
+  struct SwitchState { std::size_t offset; char name; bool enabled; };
+  std::vector<SwitchState> semanticSwitches;
+  bool onlyScopedDirectives = true;
+  for (const auto& token : concrete.tokens) {
+    if (token.kind != "directive") continue;
+    auto setting = canonical(token.bytes);
+    const bool scoped = setting.find("scopedenums") != std::string::npos;
+    const bool on = setting.find(" on") != std::string::npos;
+    const bool off = setting.find(" off") != std::string::npos;
+    if (scoped && (on || off)) scopedEnumStates.emplace_back(token.range.begin.offset, on);
+    else {
+      auto body = setting;
+      if (body.starts_with("{$")) body = body.substr(2, body.size() - 3);
+      else if (body.starts_with("(*$")) body = body.substr(3, body.size() - 5);
+      body.erase(std::remove_if(body.begin(), body.end(), [](unsigned char c) { return std::isspace(c); }), body.end());
+      const auto namedState = [&](const std::string& directive, char key) {
+        if (body == directive + "on" || body == directive + "off") {
+          semanticSwitches.push_back({token.range.begin.offset, key, body == directive + "on"});
+          return true;
+        }
+        return false;
+      };
+      if (namedState("typedaddress", 't') || namedState("writeableconst", 'j') || namedState("varpropsetter", 'v')) continue;
+      bool supported = !body.empty();
+      std::size_t start = 0;
+      while (start < body.size()) {
+        auto end = body.find(',', start);
+        if (end == std::string::npos) end = body.size();
+        const auto part = body.substr(start, end - start);
+        if (part.size() == 2 && (part[1] == '+' || part[1] == '-') &&
+            (part[0] == 'h' || part[0] == 'm' || part[0] == 'j'))
+          semanticSwitches.push_back({token.range.begin.offset, part[0], part[1] == '+'});
+        else if (part.size() < 2 || !std::isalpha(static_cast<unsigned char>(part[0])) ||
+                 !(part[1] == '+' || part[1] == '-' || std::isdigit(static_cast<unsigned char>(part[1])))) supported = false;
+        start = end + 1;
+      }
+      if (!supported) onlyScopedDirectives = false;
+    }
+  }
+  if (hasDirective && onlyScopedDirectives) ast.complete = true;
   if (!concrete.complete) {
     ast.complete = false;
     ast.preprocessorReasons.insert(ast.preprocessorReasons.end(), concrete.diagnostics.begin(), concrete.diagnostics.end());
@@ -292,6 +344,13 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
     header.visibility = "public";
     header.range = {tokens[t].range.begin, tokens[equal + 1].range.end};
     std::size_t body = equal + 2;
+    if (word(tokens[equal + 1], "class") && word(tokens[body], "of")) {
+      header.kind = "type";
+      header.type = tokens[body + 1].text;
+      header.signature = sourceSlice(source, {tokens[t].range.begin, tokens[body + 1].range.end});
+      ast.declarations.push_back(header);
+      continue; // metaclass reference has no class body
+    }
     if (word(tokens[body], "helper")) {
       header.kind += "Helper";
       while (body < tokens.size() && !word(tokens[body], "for") && tokens[body].text != ";") ++body;
@@ -301,8 +360,18 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
       }
     }
     header.signature = sourceSlice(source, {tokens[t].range.begin, tokens[body].range.begin});
+    std::size_t afterBase = body;
+    if (tokens[afterBase].text == "(") {
+      int baseDepth = 1;
+      while (tokens[++afterBase].kind != TokenKind::End && baseDepth) {
+        if (tokens[afterBase].text == "(") ++baseDepth;
+        else if (tokens[afterBase].text == ")") --baseDepth;
+      }
+    }
+    const bool noBody = tokens[body].text == ";" || tokens[afterBase].text == ";";
+    header.forwardDeclaration = tokens[body].text == ";";
     ast.declarations.push_back(header);
-    if (tokens[body].text == ";") continue; // forward declaration
+    if (noBody) continue; // forward or empty ancestor-only class declaration
     int depth = 1;
     for (std::size_t n = body; n < tokens.size() && tokens[n].kind != TokenKind::End; ++n) {
       typeBodyTokens.insert(n);
@@ -332,6 +401,18 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
   std::unordered_set<std::string> lexicalNames;
   std::unordered_map<std::string, std::string> variableTypes;
   std::string currentRoutine;
+  std::unordered_set<std::size_t> routineHeaderTokens;
+  for (std::size_t r = 0; tokens[r].kind != TokenKind::End; ++r) {
+    if (!(word(tokens[r], "procedure") || word(tokens[r], "function") ||
+          word(tokens[r], "constructor") || word(tokens[r], "destructor"))) continue;
+    int parentheses = 0;
+    for (std::size_t n = r; tokens[n].kind != TokenKind::End; ++n) {
+      routineHeaderTokens.insert(n);
+      if (tokens[n].text == "(") ++parentheses;
+      else if (tokens[n].text == ")") --parentheses;
+      else if (tokens[n].text == ";" && parentheses == 0) break;
+    }
+  }
 
   for (i = 0; tokens[i].kind != TokenKind::End; ++i) {
     if (word(tokens[i], "interface") && (i == 0 || tokens[i - 1].text != "=")) {
@@ -425,7 +506,28 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
             if (tokens[n].text == ":" && n + 1 < tokens.size() && tokens[n + 1].kind == TokenKind::Identifier) {
               std::size_t typeIndex = n + 1;
               SourceRange typeRange;
-              const auto parameterType = qualifiedName(tokens, typeIndex, &typeRange);
+              auto parameterType = qualifiedName(tokens, typeIndex, &typeRange);
+              if (word(tokens[n + 1], "array") && word(tokens[typeIndex], "of")) {
+                ++typeIndex;
+                if (tokens[typeIndex].kind == TokenKind::Identifier) {
+                  parameterType += " of " + tokens[typeIndex].text;
+                  typeRange.end = tokens[typeIndex++].range.end;
+                }
+              }
+              std::size_t defaultEnd = typeIndex;
+              std::optional<std::string> defaultValue;
+              if (tokens[defaultEnd].text == "=") {
+                const auto first = ++defaultEnd;
+                int depth = 0;
+                while (tokens[defaultEnd].kind != TokenKind::End) {
+                  const auto& value = tokens[defaultEnd].text;
+                  if (!depth && (value == ";" || value == ")")) break;
+                  if (value == "(" || value == "[") ++depth;
+                  else if (value == ")" || value == "]") --depth;
+                  ++defaultEnd;
+                }
+                if (defaultEnd > first) defaultValue = sourceSlice(source, {tokens[first].range.begin, tokens[defaultEnd - 1].range.end});
+              }
               std::size_t groupStart = n;
               while (groupStart > open + 1 && tokens[groupStart - 1].text != ";") --groupStart;
               std::string modifier;
@@ -439,10 +541,11 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
                 AstParameter parameter{tokens[parameterIndex].text, parameterType,
                                        {tokens[parameterIndex].range.begin, typeRange.end}, modifier};
                 declaration.parameters.push_back(parameter);
+                declaration.parameters.back().defaultValue = defaultValue;
                 variableTypes[canonical(parameter.name)] = parameter.type;
                 lexicalNames.insert(canonical(parameter.name));
               }
-              n = typeIndex - 1;
+              n = defaultEnd - 1;
             }
             ++n;
           }
@@ -469,21 +572,43 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
     if (inInterface && word(tokens[i], "type")) {
       std::size_t n = i + 1;
       while (tokens[n].kind != TokenKind::End && !word(tokens[n], "implementation") &&
-             !word(tokens[n], "const") && !word(tokens[n], "var") && !word(tokens[n], "uses")) {
-        if (tokens[n].kind == TokenKind::Identifier && tokens[n + 1].text == "=") {
+             (typeBodyTokens.contains(n) || routineHeaderTokens.contains(n) ||
+              (!word(tokens[n], "const") && !word(tokens[n], "var") && !word(tokens[n], "uses")))) {
+        if (!typeBodyTokens.contains(n) && !routineHeaderTokens.contains(n) &&
+            tokens[n].kind == TokenKind::Identifier && tokens[n + 1].text == "=") {
           std::string kind = "type";
-          if (word(tokens[n + 2], "class")) kind = "class";
+          if (word(tokens[n + 2], "class") && !word(tokens[n + 3], "of")) kind = "class";
           else if (word(tokens[n + 2], "interface")) kind = "interface";
           else if (word(tokens[n + 2], "record")) kind = "record";
           else if (tokens[n + 2].text == "(") kind = "enum";
           ast.exports.push_back({tokens[n].text, kind, tokens[n].range});
+          if (kind == "enum") {
+            bool scoped = false;
+            for (const auto& state : scopedEnumStates)
+              if (state.first < tokens[n].range.begin.offset) scoped = state.second;
+            bool expectValue = true;
+            for (std::size_t value = n + 3; tokens[value].kind != TokenKind::End && tokens[value].text != ")"; ++value) {
+              if (tokens[value].text == ",") { expectValue = true; continue; }
+              if (!expectValue || tokens[value].kind != TokenKind::Identifier || isKeyword(tokens[value].text)) continue;
+              AstDeclaration enumerator;
+              enumerator.name = tokens[n].text + "." + tokens[value].text;
+              enumerator.kind = "enumValue";
+              enumerator.type = tokens[n].text;
+              enumerator.visibility = "public";
+              enumerator.range = tokens[value].range;
+              ast.declarations.push_back(enumerator);
+              if (!scoped) ast.exports.push_back({tokens[value].text, "enumValue", tokens[value].range});
+              expectValue = false;
+            }
+          }
           ownNames.insert(canonical(tokens[n].text));
           excluded.insert(n);
         }
         ++n;
       }
     }
-    if (inInterface && (word(tokens[i], "const") || word(tokens[i], "resourcestring")) &&
+    if (inInterface && !typeBodyTokens.contains(i) && !routineHeaderTokens.contains(i) &&
+        (word(tokens[i], "const") || word(tokens[i], "resourcestring")) &&
         (i == 0 || tokens[i - 1].text == ";" || word(tokens[i - 1], "interface"))) {
       std::size_t n = i + 1;
       while (tokens[n].kind != TokenKind::End && !word(tokens[n], "implementation") &&
@@ -498,7 +623,8 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
         ++n;
       }
     }
-    if (inInterface && (word(tokens[i], "var") || word(tokens[i], "threadvar"))) {
+    if (inInterface && !typeBodyTokens.contains(i) && !routineHeaderTokens.contains(i) &&
+        (word(tokens[i], "var") || word(tokens[i], "threadvar"))) {
       std::size_t n = i + 1;
       while (tokens[n].kind != TokenKind::End && !word(tokens[n], "implementation") &&
              !word(tokens[n], "type") && !word(tokens[n], "const") && !word(tokens[n], "uses") &&
@@ -532,6 +658,9 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
     if ((word(tokens[i], "procedure") || word(tokens[i], "function") || word(tokens[i], "constructor") ||
          word(tokens[i], "destructor")) && tokens[i + 1].kind == TokenKind::Identifier) {
       excluded.insert(i + 1);
+      std::size_t declarationEnd = i + 1;
+      qualifiedName(tokens, declarationEnd);
+      for (std::size_t part = i + 1; part < declarationEnd; ++part) excluded.insert(part);
     }
     if (tokens[i].kind == TokenKind::Identifier && tokens[i + 1].text == ":" &&
         (i == 0 || !word(tokens[i - 1], "on"))) {
@@ -652,7 +781,7 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
       range.end = tokens[end + 1].range.end;
       end += 2;
     }
-    ast.references.push_back({std::move(name), range, section, ResolutionStatus::Unresolved, {}, {}});
+    ast.references.push_back({std::move(name), range, section, ResolutionStatus::Unresolved, {}, {}, {}, {}, {}, {}, {}, {}});
     i = end - 1;
   }
 
@@ -709,7 +838,8 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
     std::string visibility = ownerHeader != ast.declarations.end() && ownerHeader->kind == "interface" ? "public" : "private";
     int depth = 1;
     for (std::size_t n = i; tokens[n].kind != TokenKind::End && depth > 0 && typeOwners.contains(n); ++n) {
-      if (word(tokens[n], "class") || word(tokens[n], "record")) ++depth;
+      if ((word(tokens[n], "class") || word(tokens[n], "record")) &&
+          n > 0 && tokens[n - 1].text == "=") ++depth;
       else if (word(tokens[n], "end")) { --depth; continue; }
       if (depth != 1) continue;
       if (word(tokens[n], "private") || word(tokens[n], "protected") || word(tokens[n], "public") || word(tokens[n], "published")) {
@@ -732,6 +862,20 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
               std::size_t typeCursor = cursor + 1;
               SourceRange typeRange;
               const auto parameterType = qualifiedName(tokens, typeCursor, &typeRange);
+              std::size_t defaultEnd = typeCursor;
+              std::optional<std::string> defaultValue;
+              if (tokens[defaultEnd].text == "=") {
+                const auto first = ++defaultEnd;
+                int depth = 0;
+                while (tokens[defaultEnd].kind != TokenKind::End) {
+                  const auto& value = tokens[defaultEnd].text;
+                  if (!depth && (value == ";" || value == ")")) break;
+                  if (value == "(" || value == "[") ++depth;
+                  else if (value == ")" || value == "]") --depth;
+                  ++defaultEnd;
+                }
+                if (defaultEnd > first) defaultValue = sourceSlice(source, {tokens[first].range.begin, tokens[defaultEnd - 1].range.end});
+              }
               std::size_t groupStart = cursor;
               while (groupStart > open + 1 && tokens[groupStart - 1].text != ";") --groupStart;
               std::string modifier;
@@ -739,10 +883,12 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
                 modifier = canonical(tokens[groupStart].text); ++groupStart;
               }
               for (std::size_t p = groupStart; p < cursor; ++p)
-                if (tokens[p].kind == TokenKind::Identifier && !isKeyword(tokens[p].text))
+                if (tokens[p].kind == TokenKind::Identifier && !isKeyword(tokens[p].text)) {
                   declaration.parameters.push_back({tokens[p].text, parameterType,
                                                      {tokens[p].range.begin, typeRange.end}, modifier});
-              cursor = typeCursor - 1;
+                  declaration.parameters.back().defaultValue = defaultValue;
+                }
+              cursor = defaultEnd - 1;
             }
             ++cursor;
           }
@@ -768,7 +914,18 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
         declaration.ownerType = owner;
         declaration.visibility = visibility;
         declaration.range = {tokens[n].range.begin, tokens[n + 1].range.end};
-        if (tokens[n + 2].text == ":" && tokens[n + 3].kind == TokenKind::Identifier) declaration.type = tokens[n + 3].text;
+        std::size_t propertyType = n + 2;
+        if (tokens[propertyType].text == "[") {
+          int brackets = 1;
+          while (tokens[++propertyType].kind != TokenKind::End && brackets) {
+            if (tokens[propertyType].text == "[") ++brackets;
+            else if (tokens[propertyType].text == "]") --brackets;
+          }
+        }
+        if (tokens[propertyType].text == ":" && tokens[propertyType + 1].kind == TokenKind::Identifier) {
+          ++propertyType;
+          declaration.type = qualifiedName(tokens, propertyType);
+        }
         ast.declarations.push_back(std::move(declaration));
         // Property names/types/accessors are not separate field declarations.
         while (tokens[n].kind != TokenKind::End && tokens[n].text != ";") ++n;
@@ -955,7 +1112,16 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
         word(tokens[n - 1], "to")) continue;
     if (!(word(tokens[n + 1], "begin") || tokens[n + 1].text == "(" || tokens[n + 1].text == ":")) continue;
     std::size_t body = n + 1;
-    while (body < tokens.size() && tokens[body].kind != TokenKind::End && !word(tokens[body], "begin")) ++body;
+    int headerParentheses = 0;
+    while (body < tokens.size() && tokens[body].kind != TokenKind::End && !word(tokens[body], "begin")) {
+      if (tokens[body].text == "(") ++headerParentheses;
+      else if (tokens[body].text == ")") --headerParentheses;
+      if (tokens[body].text == ";" && headerParentheses == 0) break;
+      ++body;
+    }
+    // A procedural type ends its signature with a semicolon and has no
+    // executable body. Do not scan into unrelated later routines for a begin.
+    if (body < tokens.size() && tokens[body].text == ";") continue;
     if (body >= tokens.size() || tokens[body].kind == TokenKind::End) { ast.complete = false; continue; }
     int depth = 1;
     std::size_t end = body;
@@ -963,7 +1129,7 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
       if (word(tokens[end], "begin") || word(tokens[end], "try") || word(tokens[end], "case")) ++depth;
       else if (word(tokens[end], "end")) --depth;
     }
-    if (depth) { ast.complete = false; continue; }
+    if (depth) { ast.complete = false; ast.parseDiagnostics.push_back({"anonymous_body_incomplete", "Anonymous method body has no matching end", tokens[n].range.begin}); continue; }
     AstDeclaration declaration;
     declaration.name = "<anonymous@" + std::to_string(tokens[n].range.begin.offset) + ">";
     declaration.kind = "anonymousMethod"; declaration.anonymous = true;
@@ -976,6 +1142,58 @@ UnitAst parseSource(const std::filesystem::path& path, const std::string& source
           routine.range.begin.offset < tokens[n].range.begin.offset)
         declaration.enclosingRoutine = routine.name;
     ast.declarations.push_back(std::move(declaration));
+  }
+  for (auto& declaration : ast.declarations) {
+    declaration.stringMode = "PROJECT_DEFAULT_UNRESOLVED";
+    declaration.rttiMode = "PROJECT_DEFAULT_UNRESOLVED";
+    declaration.typedConstantMode = "PROJECT_DEFAULT_UNRESOLVED";
+    declaration.typedAddressMode = "PROJECT_DEFAULT_UNRESOLVED";
+    declaration.variantPropertySetterMode = "PROJECT_DEFAULT_UNRESOLVED";
+    for (const auto& state : semanticSwitches) {
+      if (state.offset > declaration.range.begin.offset) continue;
+      if (state.name == 'h') declaration.stringMode = state.enabled ? "LONGSTRING" : "SHORTSTRING";
+      if (state.name == 'm') declaration.rttiMode = state.enabled ? "ENABLED" : "DISABLED";
+      if (state.name == 'j') declaration.typedConstantMode = state.enabled ? "WRITABLE" : "READONLY";
+      if (state.name == 't') declaration.typedAddressMode = state.enabled ? "TYPED" : "UNTYPED";
+      if (state.name == 'v') declaration.variantPropertySetterMode = state.enabled ? "ENABLED" : "DISABLED";
+    }
+    if (declaration.stringMode == "SHORTSTRING") {
+      if (canonical(declaration.type) == "string") declaration.type = "ShortString";
+      for (auto& parameter : declaration.parameters)
+        if (canonical(parameter.type) == "string") parameter.type = "ShortString";
+    }
+  }
+  std::unordered_set<std::string> definedTypes;
+  for (const auto& d : ast.declarations)
+    if (!d.forwardDeclaration) definedTypes.insert(canonical(d.name) + ":" + d.kind);
+  // A matching full definition supersedes its forward header.
+  ast.declarations.erase(std::remove_if(ast.declarations.begin(), ast.declarations.end(), [&](const AstDeclaration& d) {
+    return d.forwardDeclaration && definedTypes.contains(canonical(d.name) + ":" + d.kind);
+  }), ast.declarations.end());
+  // Keep dotted local/class expressions as evidence. Dropping the receiver
+  // can expose a method suffix as an unrelated imported symbol.
+  for (std::size_t n = 0; n + 2 < tokens.size(); ++n) {
+    if (tokens[n].kind != TokenKind::Identifier || tokens[n + 1].text != "." ||
+        tokens[n + 2].kind != TokenKind::Identifier || (n && tokens[n - 1].text == ".")) continue;
+    const auto inBody = std::any_of(ast.declarations.begin(), ast.declarations.end(), [&](const AstDeclaration& routine) {
+      return routine.bodyRange.end.offset > routine.bodyRange.begin.offset &&
+             tokens[n].range.begin.offset >= routine.bodyRange.begin.offset &&
+             tokens[n].range.end.offset <= routine.bodyRange.end.offset;
+    });
+    if (!inBody) continue;
+    const auto local = std::any_of(lexicalScopes.begin(), lexicalScopes.end(), [&](const LexicalScope& scope) {
+      return tokens[n].range.begin.offset >= scope.begin && tokens[n].range.begin.offset < scope.end &&
+             scope.names.contains(canonical(tokens[n].text));
+    });
+    if (!local && !ownNames.contains(canonical(tokens[n].text))) continue;
+    std::size_t end = n;
+    SourceRange range;
+    const auto name = qualifiedName(tokens, end, &range);
+    ast.references.erase(std::remove_if(ast.references.begin(), ast.references.end(), [&](const SymbolReference& ref) {
+      return ref.range.begin.offset >= range.begin.offset && ref.range.end.offset <= range.end.offset;
+    }), ast.references.end());
+    ast.references.push_back({name, range, UsesSection::Implementation, ResolutionStatus::Unresolved, {}, {}, {}, {}, {}, {}, {}, {}});
+    n = end - 1;
   }
   return ast;
 }
@@ -1019,7 +1237,8 @@ void Analyzer::addUnitAlias(std::string alias, std::string declaredName) {
 void Analyzer::setEnvironmentComplete(bool complete) { environmentComplete_ = complete; }
 
 void Analyzer::setPreprocessor(std::vector<std::string> defines,
-                               std::vector<std::filesystem::path> includePaths) {
+                              std::vector<std::filesystem::path> includePaths, std::optional<double> compilerVersion) {
+  compilerVersion_ = compilerVersion;
   defines_ = std::move(defines);
   includePaths_ = std::move(includePaths);
 }
@@ -1041,6 +1260,10 @@ UnitAst parseUnit(std::filesystem::path path, const std::string& source) {
   return parseSource(path, source);
 }
 
+std::string sourceFingerprint(std::string_view bytes) {
+  return sha256(std::string(bytes));
+}
+
 AnalysisResult Analyzer::analyze() const {
   AnalysisResult result;
   result.preprocessorComplete = environmentComplete_;
@@ -1052,7 +1275,7 @@ AnalysisResult Analyzer::analyze() const {
   result.unitMappingCatalogValid = unitMappingCatalogValid_;
   result.unitMappings = unitMappings_;
   result.units.reserve(inputs_.size());
-  const PreprocessorOptions preprocessorOptions{defines_, includePaths_, 64};
+  const PreprocessorOptions preprocessorOptions{defines_, includePaths_, 64, compilerVersion_};
   std::vector<PreprocessResult> sourceMaps;
   for (const auto& input : inputs_) {
     const auto preprocessed = preprocess(input.path, input.source, preprocessorOptions);
@@ -1092,6 +1315,9 @@ AnalysisResult Analyzer::analyze() const {
     for (const auto& symbol : indexed.symbols)
       ast.exports.push_back({symbol, "indexed", {}});
     ast.declarations = indexed.declarations;
+    ast.inheritance = indexed.inheritance;
+    for (const auto& dependency : indexed.dependencies)
+      ast.uses.push_back({dependency, UsesSection::Interface, {}});
     result.units.push_back({std::move(ast), {}});
   }
 
@@ -1105,9 +1331,290 @@ AnalysisResult Analyzer::analyze() const {
       symbols[canonical(symbol.name)].push_back({i, &symbol});
   }
 
+  struct TypeLocation { std::size_t unit; const AstDeclaration* declaration; };
+  struct MemberLocation { std::size_t unit; const AstDeclaration* declaration; };
+  auto leafName = [](const std::string& name) { return name.substr(name.find_last_of('.') == std::string::npos ? 0 : name.find_last_of('.') + 1); };
+  std::unordered_map<std::string, std::vector<TypeLocation>> types;
+  std::unordered_map<std::string, std::vector<MemberLocation>> members;
+  for (std::size_t u = 0; u < result.units.size(); ++u) {
+    for (const auto& d : result.units[u].ast.declarations) {
+      if (d.ownerType.empty() && (d.kind == "class" || d.kind == "interface" || d.kind == "record"))
+        types[canonical(d.name)].push_back({u, &d});
+      if (!d.ownerType.empty())
+        members[std::to_string(u) + ":" + canonical(d.ownerType) + ":" + canonical(leafName(d.name))].push_back({u, &d});
+    }
+  }
+  auto locateType = [&](std::size_t context, const std::string& name, UsesSection section) -> std::optional<TypeLocation> {
+    std::string typeName = name, explicitUnit;
+    for (const auto& [unitName, index] : units) {
+      const auto prefix = unitName + ".";
+      if (canonical(name).starts_with(prefix) && unitName.size() > explicitUnit.size()) {
+        explicitUnit = unitName;
+        typeName = name.substr(prefix.size());
+      }
+    }
+    const auto found = types.find(canonical(typeName));
+    if (found == types.end()) return {};
+    std::vector<TypeLocation> visible;
+    for (const auto& t : found->second) {
+      const auto& candidate = result.units[t.unit].ast;
+      if (duplicateUnits.contains(canonical(candidate.name)) || t.declaration->forwardDeclaration) continue;
+      if (!explicitUnit.empty() && canonical(candidate.name) != explicitUnit) continue;
+      if (t.unit == context && explicitUnit.empty()) return t;
+      const auto used = std::any_of(result.units[context].ast.uses.begin(), result.units[context].ast.uses.end(), [&](const UsesItem& use) {
+        auto unitName = canonical(use.name);
+        if (const auto alias = unitAliases_.find(unitName); alias != unitAliases_.end()) unitName = alias->second;
+        return unitName == canonical(candidate.name) && !(section == UsesSection::Interface && use.section == UsesSection::Implementation);
+      });
+      // System is implicitly visible, but members still require real unique
+      // declarations in the loaded candidate index.
+      if (used || canonical(candidate.name) == "system" || (t.unit == context && !explicitUnit.empty())) visible.push_back(t);
+    }
+    return visible.size() == 1 ? std::optional<TypeLocation>(visible.front()) : std::nullopt;
+  };
+  auto lookupMember = [&](auto&& self, TypeLocation type, const std::string& name,
+                          std::unordered_set<std::string>& visited) -> std::vector<MemberLocation> {
+    const auto key = std::to_string(type.unit) + ":" + canonical(type.declaration->name);
+    if (!visited.insert(key).second) return {};
+    if (const auto found = members.find(key + ":" + canonical(name)); found != members.end()) return found->second;
+    std::vector<MemberLocation> inherited;
+    for (const auto& base : result.units[type.unit].ast.inheritance) {
+      if (canonical(base.type) != canonical(type.declaration->name) || base.baseType.empty()) continue;
+      const auto target = locateType(type.unit, base.baseType, UsesSection::Interface);
+      if (!target) return {};
+      auto matches = self(self, *target, name, visited);
+      inherited.insert(inherited.end(), matches.begin(), matches.end());
+    }
+    return inherited;
+  };
+  for (std::size_t u = 0; u < inputs_.size(); ++u) {
+    auto& ast = result.units[u].ast;
+    if (!ast.complete) continue;
+    for (auto& ref : ast.references) {
+      const auto dot = ref.name.find('.');
+      if (dot == std::string::npos) continue;
+      const AstDeclaration* routine = nullptr;
+      for (const auto& d : ast.declarations)
+        if (d.bodyRange.end.offset > d.bodyRange.begin.offset && d.bodyRange.begin.offset <= ref.range.begin.offset &&
+            ref.range.end.offset <= d.bodyRange.end.offset && (!routine || d.bodyRange.begin.offset > routine->bodyRange.begin.offset)) routine = &d;
+      if (!routine) continue;
+      const bool hasWith = std::any_of(ast.concreteTokens.begin(), ast.concreteTokens.end(), [&](const ConcreteToken& token) {
+        return canonical(token.bytes) == "with" && token.range.begin.offset >= routine->bodyRange.begin.offset &&
+               token.range.end.offset <= ref.range.begin.offset &&
+               !std::any_of(ast.declarations.begin(), ast.declarations.end(), [&](const AstDeclaration& nested) {
+                 return &nested != routine && nested.bodyRange.begin.offset > routine->bodyRange.begin.offset &&
+                        nested.bodyRange.end.offset <= routine->bodyRange.end.offset &&
+                        nested.bodyRange.begin.offset <= token.range.begin.offset && token.range.end.offset <= nested.bodyRange.end.offset;
+               });
+      });
+      const auto receiver = ref.name.substr(0, dot);
+      std::string receiverDeclaredType;
+      std::size_t typeContext = u;
+      bool bound = false;
+      bool classReceiver = false;
+      std::vector<std::string> localTypes;
+      for (const auto& d : ast.declarations)
+        if (d.kind == "localVariable" && canonical(d.scope) == canonical(routine->name) && canonical(d.name) == canonical(receiver)) {
+          bound = true; localTypes.push_back(d.type);
+        }
+      if (!bound) for (const auto& p : routine->parameters)
+        if (canonical(p.name) == canonical(receiver)) { bound = true; localTypes.push_back(p.type); }
+      if (localTypes.size() == 1) receiverDeclaredType = localTypes.front();
+      const auto ownerDot = routine->name.find_last_of('.');
+      const auto ownerName = ownerDot == std::string::npos ? std::string{} : routine->name.substr(0, ownerDot);
+      if (!bound && !ownerName.empty()) {
+        if (canonical(receiver) == "self") { bound = true; receiverDeclaredType = ownerName; }
+        else if (const auto owner = locateType(u, ownerName, ref.section)) {
+          std::unordered_set<std::string> visited;
+          auto found = lookupMember(lookupMember, *owner, receiver, visited);
+          if (!found.empty()) {
+            bound = true;
+            if (found.size() == 1 && (found.front().declaration->kind == "field" || found.front().declaration->kind == "property")) {
+              receiverDeclaredType = found.front().declaration->type;
+              typeContext = found.front().unit;
+              ref.receiverDeclaration = result.units[typeContext].ast.name + "." + found.front().declaration->name;
+            }
+          }
+        }
+      }
+      if (!bound) for (const auto& d : ast.declarations)
+        if (d.kind == "variable" && canonical(d.name) == canonical(receiver)) {
+          bound = true; receiverDeclaredType = d.type; break;
+        }
+      if (!bound && locateType(u, receiver, ref.section)) {
+        bound = true; classReceiver = true; receiverDeclaredType = receiver;
+      }
+      if (!bound) continue;
+      ref.resolutionMethod = "scoped_member_unresolved";
+      ref.receiverType = receiverDeclaredType;
+      // A later with cannot shadow this expression; any earlier with requires
+      // a dedicated scope model before inferring member ownership.
+      if (hasWith || receiverDeclaredType.empty()) continue;
+      auto type = locateType(typeContext, receiverDeclaredType, ref.section);
+      if (!type) continue;
+      std::size_t begin = dot + 1;
+      while (begin < ref.name.size()) {
+        const auto end = ref.name.find('.', begin);
+        std::unordered_set<std::string> visited;
+        auto found = lookupMember(lookupMember, *type, ref.name.substr(begin, end == std::string::npos ? end : end - begin), visited);
+        if (found.empty()) break;
+        if (end == std::string::npos) {
+          const auto& first = found.front();
+          if (!result.units[first.unit].ast.complete) break;
+          if (classReceiver && first.declaration->kind != "constructor") break;
+          if (std::any_of(found.begin(), found.end(), [&](const MemberLocation& member) {
+            return member.unit != first.unit || canonical(member.declaration->name) != canonical(first.declaration->name);
+          })) break;
+          if ((first.declaration->visibility == "private" || first.declaration->visibility == "protected") && first.unit != u) break;
+          ref.status = ResolutionStatus::Resolved;
+          ref.declaringUnit = result.units[first.unit].ast.name;
+          ref.resolvedDeclaration = first.declaration->name;
+          ref.resolvedKind = first.declaration->kind;
+          ref.memberType = found.size() == 1 ? first.declaration->type : std::string{};
+          ref.resolutionMethod = found.size() == 1 ? "scoped_member" : "scoped_member_overload_set";
+          break;
+        }
+        if (found.size() != 1 || (found.front().declaration->kind != "field" && found.front().declaration->kind != "property")) break;
+        if (!result.units[found.front().unit].ast.complete ||
+            ((found.front().declaration->visibility == "private" || found.front().declaration->visibility == "protected") && found.front().unit != u)) break;
+        type = locateType(found.front().unit, found.front().declaration->type, UsesSection::Interface);
+        if (!type) break;
+        begin = end + 1;
+      }
+    }
+  }
+
   for (auto& analyzed : result.units) {
     if (analyzed.ast.indexOnly) continue;
+    const auto context = static_cast<std::size_t>(&analyzed - result.units.data());
     for (auto& call : analyzed.ast.calls) {
+      if (call.name.find('.') != std::string::npos) {
+        call.resolvedReturnType.clear();
+        call.signatureStatus = "MEMBER_UNRESOLVED";
+        const auto ref = std::find_if(analyzed.ast.references.begin(), analyzed.ast.references.end(), [&](const SymbolReference& r) {
+          return canonical(r.name) == canonical(call.name) && r.range.begin.offset == call.range.begin.offset &&
+                 r.status == ResolutionStatus::Resolved && !r.resolvedDeclaration.empty();
+        });
+        if (ref == analyzed.ast.references.end()) continue;
+        call.qualifiedMember = ref->declaringUnit + "." + ref->resolvedDeclaration;
+        const auto owner = units.find(canonical(ref->declaringUnit));
+        if (owner == units.end() || duplicateUnits.contains(owner->first)) continue;
+        std::vector<const AstDeclaration*> declarations;
+        for (const auto& d : result.units[owner->second].ast.declarations)
+          if (canonical(d.name) == canonical(ref->resolvedDeclaration) &&
+              (d.kind == "function" || d.kind == "procedure" || d.kind == "constructor")) declarations.push_back(&d);
+        // Reconstruct argument evidence in the enclosing routine. The parser's
+        // unit-wide variable map is not sufficient for overload selection.
+        const AstDeclaration* routine = nullptr;
+        for (const auto& d : analyzed.ast.declarations)
+          if (d.bodyRange.end.offset > d.bodyRange.begin.offset && d.bodyRange.begin.offset <= call.range.begin.offset &&
+              call.range.end.offset <= d.bodyRange.end.offset && (!routine || d.bodyRange.begin.offset > routine->bodyRange.begin.offset)) routine = &d;
+        std::vector<bool> lvalues;
+        std::vector<std::size_t> argumentContexts;
+        for (auto& arg : call.arguments) {
+          arg.resolvedType.clear();
+          bool lvalue = false;
+          auto argumentContext = context;
+          if (std::regex_match(arg.text, std::regex(R"([A-Za-z_][A-Za-z0-9_]*)")) && routine) {
+            std::vector<std::string> evidence;
+            for (const auto& d : analyzed.ast.declarations)
+              if (d.kind == "localVariable" && canonical(d.scope) == canonical(routine->name) && canonical(d.name) == canonical(arg.text))
+                evidence.push_back(d.type);
+            if (evidence.empty()) for (const auto& p : routine->parameters)
+              if (canonical(p.name) == canonical(arg.text)) evidence.push_back(p.type);
+            if (evidence.size() == 1) {
+              arg.resolvedType = evidence.front(); lvalue = true;
+              for (const auto& p : routine->parameters)
+                if (canonical(p.name) == canonical(arg.text) && p.modifier == "const") lvalue = false;
+            }
+          } else {
+            const auto argumentRef = std::find_if(analyzed.ast.references.begin(), analyzed.ast.references.end(), [&](const SymbolReference& r) {
+              return r.range.begin.offset == arg.range.begin.offset && r.range.end.offset == arg.range.end.offset &&
+                     r.status == ResolutionStatus::Resolved && !r.memberType.empty();
+            });
+            if (argumentRef != analyzed.ast.references.end()) {
+              arg.resolvedType = argumentRef->memberType;
+              const auto declaring = units.find(canonical(argumentRef->declaringUnit));
+              if (declaring != units.end()) argumentContext = declaring->second;
+            }
+          }
+          lvalues.push_back(lvalue);
+          argumentContexts.push_back(argumentContext);
+        }
+        std::vector<const AstDeclaration*> exact;
+        const auto signatureText = [](const AstDeclaration& d) {
+          if (!d.signature.empty()) return d.signature;
+          std::string signature = d.kind + " " + d.name + "(";
+          for (std::size_t p = 0; p < d.parameters.size(); ++p) {
+            if (p) signature += "; ";
+            if (!d.parameters[p].modifier.empty()) signature += d.parameters[p].modifier + " ";
+            signature += d.parameters[p].name + ": " + d.parameters[p].type;
+            if (d.parameters[p].defaultValue) signature += " = " + *d.parameters[p].defaultValue;
+          }
+          signature += ")";
+          if (!d.type.empty()) signature += ": " + d.type;
+          return signature;
+        };
+        bool uncertain = false;
+        bool usedInheritance = false;
+        const auto derivedFrom = [&](TypeLocation actual, TypeLocation expected) {
+          std::unordered_set<std::string> visited;
+          while (true) {
+            if (actual.unit == expected.unit && actual.declaration == expected.declaration) return true;
+            if (actual.declaration->kind != "class" || expected.declaration->kind != "class") return false;
+            if (!result.units[actual.unit].ast.complete || !result.units[expected.unit].ast.complete) return false;
+            const auto key = std::to_string(actual.unit) + ":" + canonical(actual.declaration->name);
+            if (!visited.insert(key).second) return false;
+            std::vector<TypeLocation> bases;
+            for (const auto& relation : result.units[actual.unit].ast.inheritance) {
+              if (canonical(relation.type) != canonical(actual.declaration->name) || relation.baseType.empty()) continue;
+              const auto base = locateType(actual.unit, relation.baseType, UsesSection::Interface);
+              if (!base) return false;
+              if (std::none_of(bases.begin(), bases.end(), [&](const TypeLocation& b) {
+                return b.unit == base->unit && b.declaration == base->declaration;
+              })) bases.push_back(*base);
+            }
+            if (bases.size() != 1) return false;
+            actual = bases.front();
+          }
+        };
+        std::size_t arityCandidates = 0;
+        for (const auto* d : declarations) {
+          if (call.arguments.size() > d->parameters.size()) continue;
+          if (std::any_of(d->parameters.begin() + call.arguments.size(), d->parameters.end(), [](const AstParameter& p) { return !p.defaultValue; })) continue;
+          ++arityCandidates;
+          call.candidateSignatures.push_back(signatureText(*d));
+          bool compatible = true;
+          for (std::size_t a = 0; a < call.arguments.size(); ++a) {
+            const auto& arg = call.arguments[a]; const auto& parameter = d->parameters[a];
+            if (arg.resolvedType.empty() || ((parameter.modifier == "var" || parameter.modifier == "out") && !lvalues[a])) {
+              uncertain = true; compatible = false; continue;
+            }
+            // Only exact, unit-qualified class identity and exact scalar
+            // identity are supported; Delphi conversions/aliases stay review.
+            const auto actual = locateType(argumentContexts[a], arg.resolvedType, UsesSection::Implementation);
+            const auto expected = locateType(owner->second, parameter.type, UsesSection::Interface);
+            const bool scalar = !actual && !expected && canonical(arg.resolvedType) == canonical(parameter.type) &&
+                (canonical(parameter.type) == "integer" || canonical(parameter.type) == "boolean" ||
+                 canonical(parameter.type) == "nativeint" || canonical(parameter.type) == "int64");
+            const bool identical = actual && expected && actual->unit == expected->unit && actual->declaration == expected->declaration;
+            const bool inherited = actual && expected && !identical && parameter.modifier != "var" && parameter.modifier != "out" && derivedFrom(*actual, *expected);
+            if (inherited) usedInheritance = true;
+            if (!scalar && !identical && !inherited) {
+              uncertain = true; compatible = false;
+            }
+          }
+          if (compatible) exact.push_back(d);
+        }
+        call.signatureStatus = arityCandidates == 0 ? "ARITY_MISMATCH_OR_NONCALLABLE" : "ARGUMENT_COMPATIBILITY_REVIEW";
+        if (exact.size() == 1 && !uncertain) {
+          call.signatureSelected = true;
+          call.selectedSignature = signatureText(*exact.front());
+          call.signatureStatus = usedInheritance ? "DECLARED_CLASS_ASSIGNABLE" : "EXACT_DECLARED_TYPES";
+          call.resolvedReturnType = exact.front()->kind == "constructor" ? ref->receiverType : exact.front()->type;
+        } else if (exact.size() > 1) call.signatureStatus = "OVERLOAD_AMBIGUOUS";
+        continue;
+      }
       if (!call.resolvedReturnType.empty()) continue;
       auto simple = call.name.substr(call.name.find_last_of('.') == std::string::npos
                                          ? 0 : call.name.find_last_of('.') + 1);
@@ -1143,6 +1650,9 @@ AnalysisResult Analyzer::analyze() const {
 
   for (std::size_t sourceIndex = 0; sourceIndex < result.units.size(); ++sourceIndex) {
     auto& analyzed = result.units[sourceIndex];
+    if (analyzed.ast.indexOnly) continue;
+    std::unordered_map<std::string, std::unordered_set<std::string>> inheritedMemberCache;
+    std::unordered_map<std::size_t, bool> localBindingCache;
     for (const auto& item : analyzed.ast.uses) {
       Dependency dependency{item.name, item.section, DependencyStatus::Unknown, Confidence::Low, {}, {}};
       auto targetName = canonical(item.name);
@@ -1165,6 +1675,21 @@ AnalysisResult Analyzer::analyze() const {
       const auto targetIndex = targetIt->second;
       std::vector<std::string> unresolvedReferences;
       for (auto& reference : analyzed.ast.references) {
+        if (!reference.resolutionMethod.empty()) {
+          if (reference.status == ResolutionStatus::Resolved && canonical(reference.declaringUnit) == canonical(item.name))
+            dependency.references.push_back(reference);
+          else if (const auto receiver = locateType(sourceIndex, reference.receiverType, reference.section);
+                   receiver && receiver->unit == targetIndex) {
+            auto typeReference = reference;
+            typeReference.name = reference.receiverType;
+            typeReference.status = ResolutionStatus::Resolved;
+            typeReference.declaringUnit = item.name;
+            typeReference.resolvedDeclaration = receiver->declaration->name;
+            typeReference.resolutionMethod = "scoped_receiver_type_only";
+            dependency.references.push_back(std::move(typeReference));
+          }
+          continue;
+        }
         if (reference.section == UsesSection::Interface && item.section == UsesSection::Implementation) continue;
         auto simple = reference.name;
         std::string explicitUnit;
@@ -1180,6 +1705,52 @@ AnalysisResult Analyzer::analyze() const {
         if (explicitUnit.empty()) {
           const auto dot = simple.find('.');
           if (dot != std::string::npos) simple.resize(dot);
+          if (dot != std::string::npos && !localBindingCache.contains(reference.range.begin.offset)) {
+          localBindingCache[reference.range.begin.offset] = std::any_of(analyzed.ast.declarations.begin(), analyzed.ast.declarations.end(), [&](const AstDeclaration& d) {
+            const auto leaf = d.name.substr(d.name.find_last_of('.') == std::string::npos ? 0 : d.name.find_last_of('.') + 1);
+            const auto inRoutine = [&](const std::string& scope) {
+              return std::any_of(analyzed.ast.declarations.begin(), analyzed.ast.declarations.end(), [&](const AstDeclaration& routine) {
+                return routine.name == scope && routine.bodyRange.begin.offset <= reference.range.begin.offset &&
+                       reference.range.end.offset <= routine.bodyRange.end.offset && routine.bodyRange.end.offset > routine.bodyRange.begin.offset;
+              });
+            };
+            const bool ownMember = (d.kind == "field" || d.kind == "property") &&
+                std::any_of(analyzed.ast.declarations.begin(), analyzed.ast.declarations.end(), [&](const AstDeclaration& routine) {
+                  return routine.name.starts_with(d.ownerType + ".") && inRoutine(routine.name);
+                });
+            return ((d.kind == "variable" || ownMember || (d.kind == "localVariable" && inRoutine(d.scope))) && canonical(leaf) == canonical(simple)) ||
+                (inRoutine(d.name) && std::any_of(d.parameters.begin(), d.parameters.end(), [&](const AstParameter& p) { return canonical(p.name) == canonical(simple); }));
+          });
+          }
+          const bool locallyBound = dot != std::string::npos && localBindingCache[reference.range.begin.offset];
+          if (locallyBound) {
+            // A source receiver cannot be resolved as a foreign unit's exported
+            // same-named variable/type. Its member needs scoped type lookup.
+            unresolvedReferences.push_back(reference.name);
+            continue;
+          }
+          if (dot != std::string::npos) {
+            std::string currentOwner;
+            for (const auto& routine : analyzed.ast.declarations)
+              if (routine.bodyRange.begin.offset <= reference.range.begin.offset && reference.range.end.offset <= routine.bodyRange.end.offset &&
+                  routine.bodyRange.end.offset > routine.bodyRange.begin.offset && routine.name.find('.') != std::string::npos)
+                currentOwner = canonical(routine.name.substr(0, routine.name.find_last_of('.')));
+            if (!currentOwner.empty() && !inheritedMemberCache.contains(currentOwner)) {
+            std::unordered_set<std::string> ancestors;
+            ancestors.insert(currentOwner);
+            bool changed = true;
+            while (changed) {
+              changed = false;
+              for (const auto& unit : result.units) for (const auto& relation : unit.ast.inheritance)
+                if (ancestors.contains(canonical(relation.type)) && !relation.baseType.empty() && ancestors.insert(canonical(relation.baseType)).second) changed = true;
+            }
+            auto& names = inheritedMemberCache[currentOwner];
+            for (const auto& unit : result.units) for (const auto& member : unit.ast.declarations)
+              if ((member.kind == "property" || member.kind == "field") && ancestors.contains(canonical(member.ownerType)))
+                names.insert(canonical(member.name.substr(member.name.find_last_of('.') + 1)));
+            }
+            if (!currentOwner.empty() && inheritedMemberCache[currentOwner].contains(canonical(simple))) { unresolvedReferences.push_back(reference.name); continue; }
+          }
         }
         if (isBuiltin(simple)) {
           reference.status = ResolutionStatus::Builtin;
@@ -1483,12 +2054,20 @@ std::string toProjectJson(const AnalysisResult& result, std::string_view plugin,
         writePosition(output, declaration.bodyRange);
         output << ",\"source_file\":\"" << jsonEscape(declaration.bodyRange.sourceFile.generic_string()) << "\",\"offset_unit\":\"byte\"}";
       }
+      output << ",\"compiler_switches\":{\"string_mode\":\"" << declaration.stringMode
+             << "\",\"rtti_mode\":\"" << declaration.rttiMode
+             << "\",\"typed_constant_mode\":\"" << declaration.typedConstantMode
+             << "\",\"typed_address_mode\":\"" << declaration.typedAddressMode
+             << "\",\"variant_property_setter_mode\":\"" << declaration.variantPropertySetterMode << "\"}";
       output << ",\"parameters\":[";
       for (std::size_t p = 0; p < declaration.parameters.size(); ++p) {
         if (p) output << ',';
         const auto& parameter = declaration.parameters[p];
         output << "{\"name\":\"" << jsonEscape(parameter.name) << "\",\"type\":\""
                << jsonEscape(parameter.type) << "\",";
+        output << "\"has_default\":" << (parameter.defaultValue ? "true" : "false") << ",\"default_value\":";
+        if (parameter.defaultValue) output << '"' << jsonEscape(*parameter.defaultValue) << '"'; else output << "null";
+        output << ',';
         writePosition(output, parameter.range);
         output << '}';
       }
@@ -1536,6 +2115,17 @@ std::string toProjectJson(const AnalysisResult& result, std::string_view plugin,
       } else output << ",\"assignmentTarget\":null";
       if (!call.resolvedReturnType.empty())
         output << ",\"resolvedReturnType\":\"" << jsonEscape(call.resolvedReturnType) << "\"";
+      if (!call.signatureStatus.empty()) {
+        output << ",\"qualified_member\":\"" << jsonEscape(call.qualifiedMember)
+               << "\",\"signature_status\":\"" << jsonEscape(call.signatureStatus)
+               << "\",\"signature_selected\":" << (call.signatureSelected ? "true" : "false")
+               << ",\"selected_signature\":\"" << jsonEscape(call.selectedSignature) << "\",\"candidate_signatures\":[";
+        for (std::size_t s = 0; s < call.candidateSignatures.size(); ++s) {
+          if (s) output << ',';
+          output << '"' << jsonEscape(call.candidateSignatures[s]) << '"';
+        }
+        output << ']';
+      }
       output << '}';
     }
     output << "],\"assignments\":[";
@@ -1677,8 +2267,8 @@ std::string toProjectJson(const AnalysisResult& result, std::string_view plugin,
              << jsonEscape(unit.ast.name) << "\",\"line\":" << reference.range.begin.line << ",\"column\":"
              << reference.range.begin.column << ",\"symbol\":\"" << jsonEscape(reference.name)
              << "\",\"qualified_name\":";
-      if (resolved) output << '"' << jsonEscape(reference.declaringUnit + "." + reference.name) << '"'; else output << "null";
-      output << ",\"kind\":\"" << jsonEscape(resolvedKind) << "\",\"usage\":\"" << usage << "\",\"declared_in_unit\":";
+      if (resolved) output << '"' << jsonEscape(reference.declaringUnit + "." + (reference.resolvedDeclaration.empty() ? reference.name : reference.resolvedDeclaration)) << '"'; else output << "null";
+      output << ",\"kind\":\"" << jsonEscape(reference.resolvedKind.empty() ? resolvedKind : reference.resolvedKind) << "\",\"usage\":\"" << usage << "\",\"declared_in_unit\":";
       if (resolved) output << '"' << jsonEscape(reference.declaringUnit) << '"'; else output << "null";
       output << ",\"declared_in_file\":";
       if (owner == result.units.end() || owner->ast.file == "<index>") output << "null";
@@ -1686,6 +2276,11 @@ std::string toProjectJson(const AnalysisResult& result, std::string_view plugin,
       output << ",\"resolved\":" << (resolved ? "true" : "false")
              << ",\"confidence\":\"" << (resolved ? "high" : "low") << "\",\"source_index\":\""
              << (resolved ? (owner != result.units.end() ? owner->ast.sourceIndex : "project") : "unknown") << "\"";
+      if (!reference.resolutionMethod.empty())
+        output << ",\"resolution_method\":\"" << jsonEscape(reference.resolutionMethod)
+               << "\",\"receiver_type\":\"" << jsonEscape(reference.receiverType)
+               << "\",\"receiver_declaration\":\"" << jsonEscape(reference.receiverDeclaration)
+               << "\",\"member_type\":\"" << jsonEscape(reference.memberType) << "\",\"signature_selected\":false";
       if (!resolved) {
         output << ",\"diagnostic\":\"" << (reference.status == ResolutionStatus::Ambiguous ? "ambiguous_symbol" : "unresolved_symbol")
                << "\",\"candidates\":[";

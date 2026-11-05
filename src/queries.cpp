@@ -65,6 +65,7 @@ std::string signature(const AstDeclaration& declaration) {
       if (i) output << "; ";
       if (!declaration.parameters[i].modifier.empty()) output << declaration.parameters[i].modifier << ' ';
       output << declaration.parameters[i].name << ": " << declaration.parameters[i].type;
+      if (declaration.parameters[i].defaultValue) output << " = " << *declaration.parameters[i].defaultValue;
     }
     output << ')';
   }
@@ -93,13 +94,21 @@ void writeDeclaration(std::ostringstream& output, const IndexedUnit& unit,
          << ",\"return_type\":";
   if (declaration.type.empty()) output << "null";
   else output << '"' << escape(declaration.type) << '"';
-  output << ",\"parameters\":[";
+  output << ",\"compiler_switches\":{\"string_mode\":\"" << escape(declaration.stringMode)
+         << "\",\"rtti_mode\":\"" << escape(declaration.rttiMode)
+         << "\",\"typed_constant_mode\":\"" << escape(declaration.typedConstantMode)
+         << "\",\"typed_address_mode\":\"" << escape(declaration.typedAddressMode)
+         << "\",\"variant_property_setter_mode\":\"" << escape(declaration.variantPropertySetterMode) << "\"}";
+   output << ",\"parameters\":[";
   for (std::size_t i = 0; i < declaration.parameters.size(); ++i) {
     if (i) output << ',';
     const auto& parameter = declaration.parameters[i];
     output << "{\"position\":" << i + 1 << ",\"name\":\"" << escape(parameter.name)
            << "\",\"type\":\"" << escape(parameter.type) << "\",\"modifier\":\""
-           << escape(parameter.modifier) << "\"}";
+            << escape(parameter.modifier) << "\",\"has_default\":" << (parameter.defaultValue ? "true" : "false")
+            << ",\"default_value\":";
+     if (parameter.defaultValue) output << '"' << escape(*parameter.defaultValue) << '"'; else output << "null";
+     output << '}';
   }
   output << "],\"overload\":" << (declaration.overload ? "true" : "false")
          << ",\"reintroduced\":" << (declaration.reintroduced ? "true" : "false")
@@ -119,7 +128,9 @@ std::vector<const AstDeclaration*> matchingDeclarations(const IndexedUnit& unit,
   for (const auto& declaration : unit.declarations) {
     const auto simple = declaration.name.substr(declaration.name.find_last_of('.') == std::string::npos
                                                     ? 0 : declaration.name.find_last_of('.') + 1);
-    if (lower(simple) == key && (kind.empty() || lower(declaration.kind) == lower(std::string(kind))))
+    const bool nameMatch = declaration.kind == "enumValue" && declaration.name.find('.') != std::string::npos
+        ? lower(declaration.name) == key : (lower(simple) == key || lower(declaration.name) == key);
+    if (nameMatch && (kind.empty() || lower(declaration.kind) == lower(std::string(kind))))
       result.push_back(&declaration);
   }
   return result;
@@ -401,6 +412,7 @@ std::string symbolJson(const SymbolQuery& query, const std::vector<IndexedUnit>&
   output << "{\"schema_version\":\"2.1\",\"query\":{\"name\":\"" << escape(query.name) << "\"},\"matches\":[";
   bool first = true;
   std::size_t matchCount = 0;
+  std::set<std::string> owners;
   for (const auto& unit : index) {
     if (!query.unit.empty() && lower(unit.name) != lower(query.unit)) continue;
     for (const auto* declaration : matchingDeclarations(unit, query.name, query.kind)) {
@@ -409,6 +421,7 @@ std::string symbolJson(const SymbolQuery& query, const std::vector<IndexedUnit>&
       if (!first) output << ',';
       first = false;
       ++matchCount;
+      owners.insert(lower(unit.name) + "|" + lower(unit.sourceFile.generic_string()));
       writeDeclaration(output, unit, *declaration);
     }
     if (matchingDeclarations(unit, query.name, query.kind).empty() &&
@@ -422,6 +435,7 @@ std::string symbolJson(const SymbolQuery& query, const std::vector<IndexedUnit>&
       if (!first) output << ',';
       first = false;
       ++matchCount;
+      owners.insert(lower(unit.name) + "|" + lower(unit.sourceFile.generic_string()));
       writeDeclaration(output, unit, declaration);
     }
   }
@@ -445,7 +459,8 @@ std::string symbolJson(const SymbolQuery& query, const std::vector<IndexedUnit>&
     output << '"' << escape(sourceEvidence[i]) << '"';
   }
   output << "],\"classification\":";
-  if (matchCount > 1 || !sourceEvidence.empty()) output << "\"ambiguous\",\"recommended_action\":\"review_required\",\"reason\":\"symbol_exists_in_v600_but_owner_unit_is_ambiguous\"";
+  if (owners.size() > 1 || !sourceEvidence.empty()) output << "\"ambiguous\",\"recommended_action\":\"review_required\",\"reason\":\"symbol_exists_in_v600_but_owner_unit_is_ambiguous\"";
+  else if (matchCount > 1) output << "\"overload_set\",\"recommended_action\":\"review_required\",\"reason\":\"provider_resolved_overload_selection_required\"";
   else if (matchCount == 1) output << "\"provider_resolved\",\"recommended_action\":\"none\",\"reason\":null";
   else output << "null,\"recommended_action\":\"none\",\"reason\":null";
   output << ",\"diagnostics\":[";

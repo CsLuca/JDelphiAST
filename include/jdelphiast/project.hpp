@@ -10,8 +10,10 @@
 #include <vector>
 
 namespace jdelphiast {
+[[nodiscard]] std::string sourceFingerprint(std::string_view bytes);
 
 struct ProjectOptions {
+  bool noSourceDependencies{};
   std::vector<std::filesystem::path> searchPaths;
   std::vector<std::filesystem::path> includePaths;
   std::vector<std::string> namespaces;
@@ -21,6 +23,7 @@ struct ProjectOptions {
   std::string platform{"Win32"};
   std::filesystem::path dprojFile;
   std::filesystem::path unitMappingCatalog;
+  std::optional<double> compilerVersion;
 };
 
 struct ProjectLoadResult {
@@ -87,6 +90,8 @@ struct IndexStatistics {
 };
 
 struct IndexBuildOptions {
+  bool interfaceOnly{};
+  ProjectOptions projectOptions;
   std::string version{"unknown"};
   std::string origin;
   std::vector<std::filesystem::path> sourceRoots;
@@ -95,6 +100,9 @@ struct IndexBuildOptions {
 };
 
 struct IndexBuildResult {
+  std::vector<std::pair<std::filesystem::path, std::string>> sourceFingerprints;
+  std::vector<std::pair<std::filesystem::path, std::string>> includeFingerprints;
+  ProjectOptions resolvedProjectOptions;
   std::string content;
   IndexStatistics statistics;
   std::vector<IndexDiagnostic> diagnostics;

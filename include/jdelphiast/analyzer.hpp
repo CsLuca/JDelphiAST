@@ -1,4 +1,5 @@
 #pragma once
+#include <optional>
 
 #include <cstddef>
 #include <filesystem>
@@ -67,6 +68,7 @@ struct AstParameter {
   std::string type;
   SourceRange range;
   std::string modifier;
+  std::optional<std::string> defaultValue;
 };
 
 struct AstDeclaration {
@@ -87,6 +89,12 @@ struct AstDeclaration {
   bool anonymous{};
   std::string enclosingRoutine;
   SourceRange bodyRange;
+  std::string stringMode;
+  std::string rttiMode;
+  std::string typedConstantMode;
+  std::string typedAddressMode;
+  std::string variantPropertySetterMode;
+  bool forwardDeclaration{};
 };
 
 struct InheritanceRelation {
@@ -115,6 +123,11 @@ struct AstCall {
   std::vector<CallArgument> arguments;
   AssignmentTarget assignmentTarget;
   std::string resolvedReturnType;
+  std::string qualifiedMember;
+  std::string signatureStatus;
+  std::string selectedSignature;
+  bool signatureSelected{};
+  std::vector<std::string> candidateSignatures;
 };
 
 struct AstAssignment {
@@ -134,6 +147,12 @@ struct SymbolReference {
   ResolutionStatus status{ResolutionStatus::Unresolved};
   std::string declaringUnit;
   std::vector<std::string> candidates;
+  std::string resolvedDeclaration;
+  std::string receiverType;
+  std::string memberType;
+  std::string resolutionMethod;
+  std::string resolvedKind;
+  std::string receiverDeclaration;
 };
 
 struct UnitAst {
@@ -245,7 +264,8 @@ class Analyzer {
   void addUnitAlias(std::string alias, std::string declaredName);
   void setEnvironmentComplete(bool complete);
   void setPreprocessor(std::vector<std::string> defines,
-                       std::vector<std::filesystem::path> includePaths);
+                        std::vector<std::filesystem::path> includePaths,
+                        std::optional<double> compilerVersion = std::nullopt);
   void setBuildContext(std::string configuration, std::string platform);
   void addDiagnostic(std::string diagnostic);
   void setUnitMappingCatalog(std::filesystem::path catalog, bool valid,
@@ -263,6 +283,7 @@ class Analyzer {
   bool environmentComplete_{true};
   std::vector<std::string> defines_;
   std::vector<std::filesystem::path> includePaths_;
+  std::optional<double> compilerVersion_;
   std::string configuration_;
   std::string platform_;
   std::vector<std::string> diagnostics_;
